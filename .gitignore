@@ -9,4 +9,4 @@ build/
 .secall-opencode.json
 exports/
 generated/
-
+.frontend-git-backup/
