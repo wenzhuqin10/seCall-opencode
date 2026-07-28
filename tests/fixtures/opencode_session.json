@@ -1,0 +1,53 @@
+{
+  "info": {
+    "id": "ses_test_001",
+    "title": "修复 Scheduler HARQ timeout",
+    "directory": "D:/workspace/wireless-baseband",
+    "time": {
+      "created": 1785196800000,
+      "updated": 1785196860000
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1785196800000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Scheduler 出现 HARQ timeout，请定位。"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "modelID": "glm-5.1",
+        "time": {
+          "created": 1785196810000
+        }
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "先检查 HARQ 状态是否在重传结束后清零。"
+        },
+        {
+          "type": "tool",
+          "tool": "grep",
+          "state": {
+            "status": "completed",
+            "input": {
+              "pattern": "harq_state"
+            },
+            "output": "src/mac/scheduler.c:320"
+          }
+        }
+      ]
+    }
+  ]
+}

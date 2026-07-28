@@ -1,0 +1,4 @@
+interface:
+  display_name: "seCall OpenCode Adapter"
+  short_description: "Convert OpenCode sessions into seCall knowledge"
+  default_prompt: "Use $secall-opencode to inspect, convert, generate, and index OpenCode sessions safely."
