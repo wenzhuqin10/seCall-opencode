@@ -4,12 +4,12 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $frontendRoot = Join-Path $repoRoot "frontend"
 $stateFile = Join-Path $env:TEMP "secall-opencode-local.json"
 
-$adapter = (Get-Command secall-opencode -ErrorAction Stop).Source
+$python = (Get-Command python.exe -ErrorAction Stop).Source
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 
 $apiProcess = Start-Process `
-    -FilePath $adapter `
-    -ArgumentList @("serve", "--host", "127.0.0.1", "--port", "8765") `
+    -FilePath $python `
+    -ArgumentList @("-m", "secall_opencode.cli", "serve", "--host", "127.0.0.1", "--port", "8765") `
     -WorkingDirectory $repoRoot `
     -WindowStyle Hidden `
     -PassThru

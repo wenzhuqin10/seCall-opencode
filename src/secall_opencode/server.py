@@ -24,6 +24,39 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:5173",
 }
 
+DISPLAY_TRANSLATIONS = {
+    "세션": "会话",
+    "턴": "轮",
+    "프로젝트": "项目",
+    "사용자": "用户",
+    "어시스턴트": "助手",
+    "도구": "工具",
+    "요약": "摘要",
+    "알 수 없음": "未知",
+    "벡터 검색 비활성화": "向量检索已禁用",
+}
+
+
+def localize_display_text(value: str) -> str:
+    """Translate known legacy seCall Korean labels for the Chinese UI."""
+    result = value
+    for source, target in DISPLAY_TRANSLATIONS.items():
+        result = result.replace(source, target)
+    labels = {
+        "codex": "Codex",
+        "opencode": "OpenCode",
+        "chatgpt": "ChatGPT",
+        "claude": "Claude",
+        "gemini": "Gemini",
+    }
+    for source, label in labels.items():
+        result = re.sub(
+            rf"(?i)^{source}\s+会话\s*[:：]\s*",
+            f"{label} 会话：",
+            result,
+        )
+    return result
+
 
 def _frontmatter(markdown: str) -> Dict[str, str]:
     if not markdown.startswith("---"):
@@ -60,12 +93,11 @@ def list_vault_sessions(config: Config, limit: int = 200) -> List[Dict[str, Any]
         text = path.read_text(encoding="utf-8", errors="replace")
         meta = _frontmatter(text)
         title_match = re.search(r"(?m)^#\s+(.+)$", text)
+        raw_title = title_match.group(1) if title_match else path.stem
         result.append(
             {
                 "id": meta.get("session_id") or path.stem,
-                "title": (title_match.group(1) if title_match else path.stem).replace(
-                    "OpenCode 会话：", ""
-                ).replace("ChatGPT 会话：", "").replace("Chatgpt 会话：", ""),
+                "title": localize_display_text(raw_title),
                 "project": meta.get("project") or "unknown",
                 "source": meta.get("source") or meta.get("agent") or "unknown",
                 "model": meta.get("model") or "unknown",
