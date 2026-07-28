@@ -13,7 +13,17 @@ from .chatgpt import inspect_export, parse_export
 from .config import Config
 from .converter import convert_export
 from .knowledge import store_knowledge
+from .knowledge_store import (
+    atomic_write_text,
+    delete_knowledge_document,
+    list_knowledge_documents,
+    list_knowledge_trash,
+    read_knowledge_document,
+    restore_knowledge_document,
+    update_knowledge_document,
+)
 from .opencode_client import OpenCodeClient, Runner
+from .search import HybridSearchService, build_search_service
 
 
 MAX_BODY_BYTES = 100 * 1024 * 1024
@@ -112,37 +122,7 @@ def list_vault_sessions(config: Config, limit: int = 200) -> List[Dict[str, Any]
 
 
 def list_knowledge(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
-    root = config.vault / config.knowledge_dir
-    if not root.exists():
-        return []
-    result: List[Dict[str, Any]] = []
-    files = sorted(root.glob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for path in files[: max(1, min(limit, 1000))]:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        meta = _frontmatter(text)
-        paragraph = next(
-            (
-                line.strip()
-                for line in text.splitlines()
-                if line.strip()
-                and not line.startswith(("#", "---", "title:", "type:", "source_", "project:", "confidence:", "review_"))
-            ),
-            "",
-        )
-        result.append(
-            {
-                "id": path.stem,
-                "title": meta.get("title") or path.stem,
-                "project": meta.get("project") or "unknown",
-                "source_session": meta.get("source_session") or "",
-                "confidence": meta.get("confidence") or "unknown",
-                "review_status": meta.get("review_status") or "pending",
-                "summary": paragraph[:240],
-                "path": str(path),
-                "updated": int(path.stat().st_mtime * 1000),
-            }
-        )
-    return result
+    return list_knowledge_documents(config, limit)
 
 
 def read_qa(config: Config) -> List[Dict[str, Any]]:
@@ -164,7 +144,7 @@ def write_qa(config: Config, items: List[Dict[str, Any]]) -> None:
     path = config.vault / config.qa_file
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
-    path.write_text(payload, encoding="utf-8")
+    atomic_write_text(path, payload)
 
 
 def import_chatgpt(
@@ -231,11 +211,15 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.2"
+    server_version = "seCallOpenCodeLocal/0.3"
 
     @property
     def config(self) -> Config:
         return self.server.config  # type: ignore[attr-defined]
+
+    @property
+    def search(self) -> HybridSearchService:
+        return self.server.search  # type: ignore[attr-defined]
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"[local-api] {self.address_string()} {fmt % args}")
@@ -249,7 +233,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Methods",
+                "GET, POST, PUT, DELETE, OPTIONS",
+            )
 
     def _send(self, status: int, payload: Dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -312,7 +299,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(
                     {
                         "ready": True,
-                        "api_version": "0.2.0",
+                        "api_version": "0.3.0",
                         "vault": str(self.config.vault),
                         "opencode_version": opencode_version,
                         "models": models,
@@ -327,10 +314,28 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(list_vault_sessions(self.config, limit))
             elif parsed.path == "/api/knowledge":
                 self._ok(list_knowledge(self.config, limit))
+            elif parsed.path == "/api/knowledge/trash":
+                self._ok(list_knowledge_trash(self.config))
+            elif parsed.path.startswith("/api/knowledge/"):
+                knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+                self._ok(read_knowledge_document(self.config, knowledge_id))
             elif parsed.path == "/api/qa":
                 self._ok(read_qa(self.config)[: max(1, min(limit, 1000))])
+            elif parsed.path == "/api/search":
+                self._ok(
+                    self.search.search(
+                        str(query.get("q", [""])[0]),
+                        scope=str(query.get("scope", ["all"])[0]),
+                        mode=str(query.get("mode", ["keyword"])[0]),
+                        limit=limit,
+                    )
+                )
+            elif parsed.path == "/api/search/status":
+                self._ok(self.search.semantic.status())
             else:
                 self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
+        except FileNotFoundError as exc:
+            self._fail(exc, HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self._fail(exc, HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -357,8 +362,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED,
                 )
             elif parsed.path == "/api/pipeline":
-                self._ok(
-                    run_session_pipeline(
+                result = run_session_pipeline(
                         self.config,
                         str(body.get("session_id") or ""),
                         model=str(body["model"]) if body.get("model") else None,
@@ -366,12 +370,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         overwrite=bool(body.get("overwrite")),
                         timeout=int(body.get("timeout") or 1800),
                     )
-                )
+                self.search.keyword.rebuild()
+                self._ok(result)
             elif parsed.path == "/api/index":
                 result = Runner(self.config.secall_command).run(
                     "reindex", "--from-vault", timeout=600
                 )
-                self._ok({"indexed": True, "output": result.stdout.strip()})
+                search_result = self.search.keyword.rebuild()
+                self._ok(
+                    {
+                        "indexed": True,
+                        "output": result.stdout.strip(),
+                        "search": search_result,
+                    }
+                )
             elif parsed.path == "/api/qa/review":
                 qa_id = str(body.get("id") or "")
                 status = str(body.get("status") or "")
@@ -387,9 +399,56 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if not matched:
                     raise FileNotFoundError(f"QA 不存在：{qa_id}")
                 write_qa(self.config, items)
+                self.search.keyword.rebuild()
                 self._ok({"id": qa_id, "review_status": status})
+            elif (
+                parsed.path.startswith("/api/knowledge/trash/")
+                and parsed.path.endswith("/restore")
+            ):
+                trash_id = parsed.path.removeprefix("/api/knowledge/trash/").removesuffix(
+                    "/restore"
+                )
+                restored = restore_knowledge_document(
+                    self.config,
+                    trash_id.rstrip("/"),
+                )
+                self.search.keyword.rebuild()
+                self._ok(restored)
             else:
                 self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
+        except FileNotFoundError as exc:
+            self._fail(exc, HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            self._fail(exc)
+
+    def do_PUT(self) -> None:  # noqa: N802
+        try:
+            parsed = urlparse(self.path)
+            body = self._json_body()
+            if not isinstance(body, dict):
+                raise ValueError("请求体必须是 JSON 对象。")
+            if not parsed.path.startswith("/api/knowledge/"):
+                raise FileNotFoundError("接口不存在。")
+            knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+            updated = update_knowledge_document(self.config, knowledge_id, body)
+            self.search.keyword.rebuild()
+            self._ok(updated)
+        except FileNotFoundError as exc:
+            self._fail(exc, HTTPStatus.NOT_FOUND)
+        except RuntimeError as exc:
+            self._fail(exc, HTTPStatus.CONFLICT)
+        except Exception as exc:
+            self._fail(exc)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        try:
+            parsed = urlparse(self.path)
+            if not parsed.path.startswith("/api/knowledge/"):
+                raise FileNotFoundError("接口不存在。")
+            knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+            deleted = delete_knowledge_document(self.config, knowledge_id)
+            self.search.keyword.rebuild()
+            self._ok(deleted)
         except FileNotFoundError as exc:
             self._fail(exc, HTTPStatus.NOT_FOUND)
         except Exception as exc:
@@ -402,6 +461,7 @@ class LocalAPIServer(ThreadingHTTPServer):
     def __init__(self, address: Tuple[str, int], config: Config):
         super().__init__(address, LocalAPIHandler)
         self.config = config
+        self.search = build_search_service(config)
 
 
 def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:

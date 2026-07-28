@@ -16,6 +16,24 @@ type KnowledgeItem = {
   id: string; title: string; project: string; summary: string;
   confidence: string; source_session: string; review_status: string;
 };
+type KnowledgeSection = { heading: string; content: string };
+type KnowledgeDetail = KnowledgeItem & {
+  heading: string; type: string; intro: string; sections: KnowledgeSection[];
+  markdown: string; version: string; updated: number;
+};
+type TrashItem = {
+  trash_id: string; knowledge_id: string; title: string; project: string;
+  source_session: string; deleted_at: string; qa_count: number;
+};
+type SearchResult = {
+  id: string; scope: "session" | "knowledge" | "qa"; title: string;
+  snippet: string; project: string; source_session: string; score: number;
+  match_type: string; review_status: string;
+};
+type SearchResponse = {
+  requested_mode: string; effective_mode: string; semantic_available: boolean;
+  fallback_reason?: string; count: number; results: SearchResult[];
+};
 type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
@@ -82,6 +100,12 @@ function MiniBars() {
 export default function Home() {
   const [active, setActive] = useState<View>("overview");
   const [query, setQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<"keyword" | "semantic" | "hybrid">("keyword");
+  const [searchScope, setSearchScope] = useState<"all" | "session" | "knowledge" | "qa">("all");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [searchFallback, setSearchFallback] = useState("");
   const [modal, setModal] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [pipelineRunning, setPipelineRunning] = useState(false);
@@ -95,6 +119,12 @@ export default function Home() {
   const [importProject, setImportProject] = useState("chatgpt-import");
   const [selectedSession, setSelectedSession] = useState("ses_0598ac");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null);
+  const [editingKnowledge, setEditingKnowledge] = useState(false);
+  const [savingKnowledge, setSavingKnowledge] = useState(false);
+  const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
+  const [showTrash, setShowTrash] = useState(false);
 
   const refreshData = async () => {
     const [healthResult, sessionResult, qaResult, knowledgeResult] = await Promise.all([
@@ -136,9 +166,61 @@ export default function Home() {
   };
 
   useEffect(() => {
-    refreshData().catch(() => setApiConnected(false));
+    const timer = window.setTimeout(() => {
+      void refreshData().catch(() => setApiConnected(false));
+    }, 0);
     // The selected session is intentionally reconciled inside refreshData.
+    return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const notify = (title: string, detail: string) => {
+    setToast({ title, detail });
+    window.setTimeout(() => setToast(null), 3200);
+  };
+
+  const runSearch = async () => {
+    const normalized = query.trim();
+    if (normalized.length < 2) {
+      setSearchResults([]);
+      setSearchOpen(false);
+      return;
+    }
+    setSearching(true);
+    try {
+      const params = new URLSearchParams({
+        q: normalized,
+        scope: searchScope,
+        mode: searchMode,
+        limit: "20",
+      });
+      const result = await apiRequest<SearchResponse>(`/api/search?${params}`);
+      setSearchResults(result.results);
+      setSearchFallback(result.fallback_reason ?? "");
+      setSearchOpen(true);
+    } catch (error) {
+      notify("搜索失败", error instanceof Error ? error.message : "请检查本地服务");
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void runSearch(); }, 320);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, searchMode, searchScope]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+      }
+      if (event.key === "Escape") setSearchOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   const filteredSessions = useMemo(
@@ -147,9 +229,96 @@ export default function Home() {
   );
   const currentSession = sessionItems.find((item) => item.id === selectedSession) ?? sessionItems[0];
 
-  const notify = (title: string, detail: string) => {
-    setToast({ title, detail });
-    window.setTimeout(() => setToast(null), 3200);
+  const openKnowledge = async (id: string) => {
+    try {
+      const detail = await apiRequest<KnowledgeDetail>(`/api/knowledge/${encodeURIComponent(id)}`);
+      setKnowledgeDetail(detail);
+      setEditingKnowledge(false);
+      setSearchOpen(false);
+    } catch (error) {
+      notify("无法打开知识卡片", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const saveKnowledge = async () => {
+    if (!knowledgeDetail) return;
+    setSavingKnowledge(true);
+    try {
+      const updated = await apiRequest<KnowledgeDetail>(
+        `/api/knowledge/${encodeURIComponent(knowledgeDetail.id)}`,
+        { method: "PUT", body: JSON.stringify(knowledgeDetail) },
+      );
+      setKnowledgeDetail(updated);
+      setEditingKnowledge(false);
+      await refreshData();
+      notify("知识卡片已保存", "关键词索引已同步更新");
+    } catch (error) {
+      notify("保存失败", error instanceof Error ? error.message : "请刷新后重试");
+    } finally {
+      setSavingKnowledge(false);
+    }
+  };
+
+  const deleteKnowledge = async () => {
+    if (!knowledgeDetail) return;
+    if (!window.confirm(`将“${knowledgeDetail.title}”和关联 QA 移入回收站？`)) return;
+    try {
+      await apiRequest(`/api/knowledge/${encodeURIComponent(knowledgeDetail.id)}`, { method: "DELETE" });
+      setKnowledgeDetail(null);
+      await refreshData();
+      notify("已移入回收站", "知识卡片和关联 QA 均可恢复");
+    } catch (error) {
+      notify("删除失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const loadTrash = async () => {
+    try {
+      const items = await apiRequest<TrashItem[]>("/api/knowledge/trash");
+      setTrashItems(items);
+      setShowTrash(true);
+    } catch (error) {
+      notify("无法打开回收站", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const restoreKnowledge = async (trashId: string) => {
+    try {
+      await apiRequest(`/api/knowledge/trash/${encodeURIComponent(trashId)}/restore`, {
+        method: "POST",
+        body: "{}",
+      });
+      await Promise.all([refreshData(), loadTrash()]);
+      notify("知识卡片已恢复", "关联 QA 和关键词索引已恢复");
+    } catch (error) {
+      notify("恢复失败", error instanceof Error ? error.message : "可能存在同名知识卡片");
+    }
+  };
+
+  const refreshIndex = async () => {
+    try {
+      const result = await apiRequest<{ search: { indexed: number } }>("/api/index", {
+        method: "POST",
+        body: "{}",
+      });
+      notify("索引已刷新", `已同步 ${result.search.indexed} 份知识与审核通过的 QA`);
+    } catch (error) {
+      notify("索引刷新失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const openSearchResult = (item: SearchResult) => {
+    if (item.scope === "session") {
+      setSelectedSession(item.id);
+      setActive("sessions");
+      setSearchOpen(false);
+    } else if (item.scope === "knowledge") {
+      setActive("knowledge");
+      void openKnowledge(item.id);
+    } else {
+      setActive("qa");
+      setSearchOpen(false);
+    }
   };
 
   const startPipeline = async () => {
@@ -258,11 +427,47 @@ export default function Home() {
       <section className="content">
         <header className="topbar">
           <div className="mobile-brand">seCall</div>
-          <label className="global-search">
-            <span>⌕</span>
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索会话、知识或错误信息…" />
-            <kbd>⌘ K</kbd>
-          </label>
+          <div className="search-shell">
+            <label className="global-search">
+              <span>⌕</span>
+              <input
+                ref={searchInputRef}
+                value={query}
+                onFocus={() => { if (query.trim().length >= 2) setSearchOpen(true); }}
+                onKeyDown={(event) => { if (event.key === "Enter") void runSearch(); }}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="搜索会话、知识或错误信息…"
+              />
+              <kbd>Ctrl K</kbd>
+            </label>
+            {searchOpen && (
+              <section className="search-popover" aria-label="搜索结果">
+                <div className="search-controls">
+                  <div>{(["all", "session", "knowledge", "qa"] as const).map((scope) => (
+                    <button className={searchScope === scope ? "active" : ""} key={scope} onClick={() => setSearchScope(scope)}>
+                      {{ all: "全部", session: "会话", knowledge: "知识", qa: "QA" }[scope]}
+                    </button>
+                  ))}</div>
+                  <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as typeof searchMode)} aria-label="检索模式">
+                    <option value="keyword">关键词</option>
+                    <option value="semantic">语义（暂不可用）</option>
+                    <option value="hybrid">混合（暂不可用）</option>
+                  </select>
+                </div>
+                {searchFallback && <p className="search-fallback">◇ {searchFallback}</p>}
+                <div className="search-results">
+                  {searching ? <p className="search-empty">正在检索…</p> : searchResults.length ? searchResults.map((item) => (
+                    <button key={`${item.scope}-${item.id}`} onClick={() => openSearchResult(item)}>
+                      <span className={`result-icon ${item.scope}`}>{item.scope === "session" ? "会" : item.scope === "knowledge" ? "知" : "问"}</span>
+                      <span><strong>{item.title}</strong><small>{item.snippet || "匹配到相关内容"}</small><em>{item.project} · {item.match_type === "keyword" ? "关键词匹配" : item.match_type}</em></span>
+                      <b>›</b>
+                    </button>
+                  )) : <p className="search-empty">没有找到匹配内容</p>}
+                </div>
+                <div className="search-footer"><span>Enter 搜索</span><button onClick={() => setSearchOpen(false)}>关闭</button></div>
+              </section>
+            )}
+          </div>
           <div className="top-actions">
             <button className="icon-button" aria-label="通知">◌<i /></button>
             <button className="primary-button" onClick={() => setModal(true)}><span>＋</span>新建流水线</button>
@@ -388,21 +593,36 @@ export default function Home() {
 
           {active === "knowledge" && (
             <section className="subpage">
-              <div className="subpage-heading"><div><p className="eyebrow">KNOWLEDGE VAULT</p><h1>知识库</h1><p>可追溯的 Issue Card、运行手册与工程决策。</p></div><button className="secondary-button" onClick={() => notify("索引已刷新", "186 个会话与 94 份知识卡片已同步")}>↻ 刷新索引</button></div>
-              <div className="knowledge-grid">
+              <div className="subpage-heading">
+                <div><p className="eyebrow">KNOWLEDGE VAULT</p><h1>{showTrash ? "知识回收站" : "知识库"}</h1><p>{showTrash ? "恢复误删的知识卡片及其关联 QA。" : "可查看、修改、删除和检索的本地工程知识。"}</p></div>
+                <div className="heading-actions">
+                  {showTrash ? <button className="secondary-button" onClick={() => setShowTrash(false)}>← 返回知识库</button> : <button className="secondary-button" onClick={() => void loadTrash()}>♲ 回收站</button>}
+                  {!showTrash && <button className="secondary-button" onClick={() => void refreshIndex()}>↻ 刷新索引</button>}
+                </div>
+              </div>
+              {showTrash ? (
+                <div className="trash-list">
+                  {trashItems.length ? trashItems.map((item) => (
+                    <article key={item.trash_id}>
+                      <span>♲</span><div><strong>{item.title}</strong><small>{item.project} · 删除于 {formatUpdated(new Date(item.deleted_at).getTime())} · {item.qa_count} 条关联 QA</small></div>
+                      <button onClick={() => void restoreKnowledge(item.trash_id)}>恢复</button>
+                    </article>
+                  )) : <div className="empty-state">回收站为空</div>}
+                </div>
+              ) : <div className="knowledge-grid">
                 {(knowledgeItems.length ? knowledgeItems : [
                   { id: "demo-k1", title: "HARQ timeout 问题定位", project: "Scheduler", summary: "定位 HARQ 状态异常路径并记录验证方法。", confidence: "high", source_session: "ses_demo", review_status: "pending" },
                   { id: "demo-k2", title: "Wiki 页面未生成排查手册", project: "seCall", summary: "从 Session 导出、Vault 写入到索引重建的诊断流程。", confidence: "medium", source_session: "ses_demo", review_status: "pending" },
                 ]).map((item) => {
                   const score = ({ high: 96, medium: 82, low: 58 } as Record<string, number>)[item.confidence] ?? 75;
                   return (
-                  <article className="knowledge-card" key={item.id}>
-                    <div className="knowledge-top"><span>◇</span><em>{item.project}</em><button>•••</button></div><h3>{item.title}</h3><p>{item.summary || "该知识卡片已写入本地 Vault。"}</p>
+                  <article className="knowledge-card" key={item.id} tabIndex={0} onClick={() => { if (!item.id.startsWith("demo-")) void openKnowledge(item.id); }} onKeyDown={(event) => { if (event.key === "Enter" && !item.id.startsWith("demo-")) void openKnowledge(item.id); }}>
+                    <div className="knowledge-top"><span>◇</span><em>{item.project}</em><button aria-label={`查看 ${item.title}`}>查看</button></div><h3>{item.title}</h3><p>{item.summary || "该知识卡片已写入本地 Vault。"}</p>
                     <div className="knowledge-meta"><span><i style={{ width: `${score}%` }} /></span><b>{score}% 置信度</b><small>{item.source_session}</small></div>
                   </article>
                   );
                 })}
-              </div>
+              </div>}
             </section>
           )}
 
@@ -456,6 +676,57 @@ export default function Home() {
             <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" defaultChecked aria-label="完成后重建索引" /></div>
             <div className="modal-actions"><button onClick={() => setModal(false)}>取消</button><button className="primary-button" onClick={startPipeline}>启动流水线 <span>→</span></button></div>
           </section>
+        </div>
+      )}
+
+      {knowledgeDetail && (
+        <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setKnowledgeDetail(null); }}>
+          <aside className="knowledge-drawer" role="dialog" aria-modal="true" aria-labelledby="knowledge-detail-title">
+            <header>
+              <div><p className="eyebrow">KNOWLEDGE DETAIL</p><h2 id="knowledge-detail-title">{editingKnowledge ? "编辑知识卡片" : knowledgeDetail.title}</h2><small>来源会话 {knowledgeDetail.source_session}</small></div>
+              <button onClick={() => setKnowledgeDetail(null)} aria-label="关闭知识详情">×</button>
+            </header>
+            {editingKnowledge ? (
+              <div className="knowledge-editor">
+                <div className="editor-meta">
+                  <label>标题<input value={knowledgeDetail.title} onChange={(event) => setKnowledgeDetail({ ...knowledgeDetail, title: event.target.value })} /></label>
+                  <label>项目<input value={knowledgeDetail.project} onChange={(event) => setKnowledgeDetail({ ...knowledgeDetail, project: event.target.value })} /></label>
+                  <label>置信度<select value={knowledgeDetail.confidence} onChange={(event) => setKnowledgeDetail({ ...knowledgeDetail, confidence: event.target.value })}><option value="high">高</option><option value="medium">中</option><option value="low">低</option><option value="unknown">未知</option></select></label>
+                  <label>状态<select value={knowledgeDetail.review_status} onChange={(event) => setKnowledgeDetail({ ...knowledgeDetail, review_status: event.target.value })}><option value="pending">待审核</option><option value="approved">已通过</option><option value="rejected">已退回</option></select></label>
+                </div>
+                {knowledgeDetail.sections.map((section, index) => (
+                  <label className="section-editor" key={`${section.heading}-${index}`}>
+                    <input
+                      aria-label={`第 ${index + 1} 个章节标题`}
+                      value={section.heading}
+                      onChange={(event) => setKnowledgeDetail({
+                        ...knowledgeDetail,
+                        sections: knowledgeDetail.sections.map((item, current) => current === index ? { ...item, heading: event.target.value } : item),
+                      })}
+                    />
+                    <textarea
+                      aria-label={`${section.heading}内容`}
+                      value={section.content}
+                      onChange={(event) => setKnowledgeDetail({
+                        ...knowledgeDetail,
+                        sections: knowledgeDetail.sections.map((item, current) => current === index ? { ...item, content: event.target.value } : item),
+                      })}
+                    />
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <div className="knowledge-preview">
+                <div className="detail-badges"><span>{knowledgeDetail.project}</span><span>{knowledgeDetail.confidence === "high" ? "高置信度" : knowledgeDetail.confidence === "medium" ? "中置信度" : "低置信度"}</span><span>{knowledgeDetail.review_status === "approved" ? "已通过" : "待审核"}</span></div>
+                {knowledgeDetail.sections.map((section, index) => <section key={`${section.heading}-${index}`}><h3>{section.heading}</h3><p>{section.content || "暂无内容"}</p></section>)}
+              </div>
+            )}
+            <footer>
+              <button className="danger-button" onClick={() => void deleteKnowledge()}>删除</button>
+              <span />
+              {editingKnowledge ? <><button onClick={() => void openKnowledge(knowledgeDetail.id)}>取消</button><button className="primary-button" disabled={savingKnowledge} onClick={() => void saveKnowledge()}>{savingKnowledge ? "正在保存…" : "保存修改"}</button></> : <button className="primary-button" onClick={() => setEditingKnowledge(true)}>编辑知识</button>}
+            </footer>
+          </aside>
         </div>
       )}
 

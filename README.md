@@ -99,6 +99,37 @@ secall-opencode --json chatgpt import conversations.json --project my-project
 secall-opencode serve
 ```
 
+本地工作台支持：
+
+- 统一搜索会话、知识卡片和审核通过的 QA；
+- FTS5/BM25 关键词检索与中文字符二元组匹配；
+- 知识卡片详情、结构化修改、软删除和回收站恢复；
+- `keyword`、`semantic`、`hybrid` 三种稳定搜索接口。模型未就绪时，
+  后两种模式会明确降级为关键词检索。
+
+搜索接口示例：
+
+```text
+GET /api/search?q=断点续传&scope=all&mode=keyword&limit=20
+```
+
+语义检索配置已预留在配置文件的 `semantic` 节中：
+
+```json
+{
+  "semantic": {
+    "backend": "none",
+    "model_dir": "C:/Users/USER/.cache/secall/models/bge-m3-onnx",
+    "batch_size": 8,
+    "chunk_size": 1200,
+    "chunk_overlap": 160
+  }
+}
+```
+
+第一阶段不加载 ONNX 运行库。BGE-M3 下载完成后可在不修改前端接口的
+情况下接入 `OnnxSemanticBackend`。
+
 执行完整流水线：
 
 ```powershell

@@ -16,6 +16,11 @@ class Config:
     timezone: str = "Asia/Shanghai"
     knowledge_dir: str = "wiki/issues"
     qa_file: str = "knowledge/qa/candidates.jsonl"
+    semantic_backend: str = "none"
+    semantic_model_dir: Optional[Path] = None
+    semantic_batch_size: int = 8
+    semantic_chunk_size: int = 1200
+    semantic_chunk_overlap: int = 160
 
 
 def default_config_path() -> Path:
@@ -55,6 +60,8 @@ def load_config(
             "尚未配置 seCall Vault。先运行 `secall-opencode init --vault <路径>`，"
             "或设置 SECALL_VAULT。"
         )
+    semantic = raw.get("semantic") if isinstance(raw.get("semantic"), dict) else {}
+    model_dir_value = semantic.get("model_dir")
     return Config(
         vault=Path(vault_value).expanduser().resolve(),
         opencode_command=os.environ.get("OPENCODE_COMMAND")
@@ -65,6 +72,15 @@ def load_config(
         timezone=str(raw.get("timezone") or "Asia/Shanghai"),
         knowledge_dir=str(raw.get("knowledge_dir") or "wiki/issues"),
         qa_file=str(raw.get("qa_file") or "knowledge/qa/candidates.jsonl"),
+        semantic_backend=str(semantic.get("backend") or "none"),
+        semantic_model_dir=(
+            Path(str(model_dir_value)).expanduser().resolve()
+            if model_dir_value
+            else Path.home() / ".cache" / "secall" / "models" / "bge-m3-onnx"
+        ),
+        semantic_batch_size=max(1, int(semantic.get("batch_size") or 8)),
+        semantic_chunk_size=max(200, int(semantic.get("chunk_size") or 1200)),
+        semantic_chunk_overlap=max(0, int(semantic.get("chunk_overlap") or 160)),
     )
 
 
@@ -75,6 +91,13 @@ def save_config(config: Config, path: Optional[Path] = None, force: bool = False
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(config)
     payload["vault"] = str(config.vault)
+    payload["semantic"] = {
+        "backend": payload.pop("semantic_backend"),
+        "model_dir": str(payload.pop("semantic_model_dir") or ""),
+        "batch_size": payload.pop("semantic_batch_size"),
+        "chunk_size": payload.pop("semantic_chunk_size"),
+        "chunk_overlap": payload.pop("semantic_chunk_overlap"),
+    }
     destination.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
