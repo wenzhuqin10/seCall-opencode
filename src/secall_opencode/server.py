@@ -1,0 +1,386 @@
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
+
+from .chatgpt import inspect_export, parse_export
+from .config import Config
+from .converter import convert_export
+from .knowledge import store_knowledge
+from .opencode_client import OpenCodeClient, Runner
+
+
+MAX_BODY_BYTES = 100 * 1024 * 1024
+ALLOWED_ORIGINS = {
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+}
+
+
+def _frontmatter(markdown: str) -> Dict[str, str]:
+    if not markdown.startswith("---"):
+        return {}
+    end = markdown.find("\n---", 3)
+    if end < 0:
+        return {}
+    result: Dict[str, str] = {}
+    for line in markdown[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        result[key.strip()] = value.strip().strip("\"'")
+    return result
+
+
+def _safe_vault_path(vault: Path, path: Path) -> Path:
+    root = vault.resolve()
+    candidate = path.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("请求路径不在配置的 seCall Vault 内。") from exc
+    return candidate
+
+
+def list_vault_sessions(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
+    root = config.vault / "raw" / ".sessions"
+    if not root.exists():
+        return []
+    result: List[Dict[str, Any]] = []
+    files = sorted(root.rglob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for path in files[: max(1, min(limit, 1000))]:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        meta = _frontmatter(text)
+        title_match = re.search(r"(?m)^#\s+(.+)$", text)
+        result.append(
+            {
+                "id": meta.get("session_id") or path.stem,
+                "title": (title_match.group(1) if title_match else path.stem).replace(
+                    "OpenCode 会话：", ""
+                ).replace("ChatGPT 会话：", "").replace("Chatgpt 会话：", ""),
+                "project": meta.get("project") or "unknown",
+                "source": meta.get("source") or meta.get("agent") or "unknown",
+                "model": meta.get("model") or "unknown",
+                "turns": int(meta.get("turns") or 0),
+                "status": "ready",
+                "date": meta.get("date") or "",
+                "path": str(path),
+                "updated": int(path.stat().st_mtime * 1000),
+            }
+        )
+    return result
+
+
+def list_knowledge(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
+    root = config.vault / config.knowledge_dir
+    if not root.exists():
+        return []
+    result: List[Dict[str, Any]] = []
+    files = sorted(root.glob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for path in files[: max(1, min(limit, 1000))]:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        meta = _frontmatter(text)
+        paragraph = next(
+            (
+                line.strip()
+                for line in text.splitlines()
+                if line.strip()
+                and not line.startswith(("#", "---", "title:", "type:", "source_", "project:", "confidence:", "review_"))
+            ),
+            "",
+        )
+        result.append(
+            {
+                "id": path.stem,
+                "title": meta.get("title") or path.stem,
+                "project": meta.get("project") or "unknown",
+                "source_session": meta.get("source_session") or "",
+                "confidence": meta.get("confidence") or "unknown",
+                "review_status": meta.get("review_status") or "pending",
+                "summary": paragraph[:240],
+                "path": str(path),
+                "updated": int(path.stat().st_mtime * 1000),
+            }
+        )
+    return result
+
+
+def read_qa(config: Config) -> List[Dict[str, Any]]:
+    path = config.vault / config.qa_file
+    if not path.exists():
+        return []
+    result: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            result.append(item)
+    return result
+
+
+def write_qa(config: Config, items: List[Dict[str, Any]]) -> None:
+    path = config.vault / config.qa_file
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
+    path.write_text(payload, encoding="utf-8")
+
+
+def import_chatgpt(
+    config: Config,
+    payload: Any,
+    project: str,
+    limit: Optional[int] = None,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    conversations = parse_export(payload, limit=limit)
+    results: List[Dict[str, Any]] = []
+    for conversation in conversations:
+        converted = convert_export(
+            conversation.as_export(project),
+            config.vault,
+            overwrite=overwrite,
+        )
+        results.append(converted.as_dict())
+    return {
+        "imported": len(results),
+        "project": project,
+        "sessions": results,
+    }
+
+
+def run_session_pipeline(
+    config: Config,
+    session_id: str,
+    model: Optional[str] = None,
+    reindex: bool = True,
+    overwrite: bool = False,
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    sessions = list_vault_sessions(config, limit=1000)
+    match = next((item for item in sessions if item["id"] == session_id), None)
+    if not match:
+        raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+    session_path = _safe_vault_path(config.vault, Path(match["path"]))
+    prompt = Path(__file__).parent / "prompts" / "issue-card.md"
+    generated = OpenCodeClient(config.opencode_command).run_generation(
+        session_path,
+        prompt,
+        config.vault,
+        model=model or config.model,
+        timeout=timeout,
+    )
+    knowledge = store_knowledge(
+        generated,
+        session_path.read_text(encoding="utf-8"),
+        config.vault,
+        config.knowledge_dir,
+        config.qa_file,
+        overwrite=overwrite,
+    )
+    indexed = False
+    if reindex:
+        Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
+        indexed = True
+    return {
+        "session_id": session_id,
+        "knowledge": knowledge.as_dict(),
+        "indexed": indexed,
+    }
+
+
+class LocalAPIHandler(BaseHTTPRequestHandler):
+    server_version = "seCallOpenCodeLocal/0.2"
+
+    @property
+    def config(self) -> Config:
+        return self.server.config  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print(f"[local-api] {self.address_string()} {fmt % args}")
+
+    def _origin(self) -> Optional[str]:
+        return self.headers.get("Origin")
+
+    def _cors(self) -> None:
+        origin = self._origin()
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+    def _send(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _ok(self, result: Any, status: int = HTTPStatus.OK) -> None:
+        self._send(status, {"ok": True, "result": result})
+
+    def _fail(self, exc: Exception, status: int = HTTPStatus.BAD_REQUEST) -> None:
+        self._send(
+            status,
+            {
+                "ok": False,
+                "error": {
+                    "type": exc.__class__.__name__,
+                    "message": str(exc),
+                },
+            },
+        )
+
+    def _json_body(self) -> Any:
+        raw_length = self.headers.get("Content-Length")
+        if not raw_length:
+            raise ValueError("请求缺少 JSON 内容。")
+        length = int(raw_length)
+        if length <= 0 or length > MAX_BODY_BYTES:
+            raise ValueError("请求内容为空或超过 100 MB 限制。")
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"请求不是有效 JSON：{exc}") from exc
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        if self._origin() not in ALLOWED_ORIGINS:
+            self._send(HTTPStatus.FORBIDDEN, {"ok": False, "error": {"message": "不允许的来源。"}})
+            return
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self) -> None:  # noqa: N802
+        try:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            limit = int(query.get("limit", ["200"])[0])
+            if parsed.path == "/api/health":
+                client = OpenCodeClient(self.config.opencode_command)
+                opencode_version = client.version()
+                models = client.models()
+                sessions = list_vault_sessions(self.config, limit=1000)
+                knowledge = list_knowledge(self.config, limit=1000)
+                qa = read_qa(self.config)
+                self._ok(
+                    {
+                        "ready": True,
+                        "api_version": "0.2.0",
+                        "vault": str(self.config.vault),
+                        "opencode_version": opencode_version,
+                        "models": models,
+                        "configured_model": self.config.model,
+                        "sessions": len(sessions),
+                        "knowledge": len(knowledge),
+                        "qa": len(qa),
+                        "pending_qa": sum(item.get("review_status") == "pending" for item in qa),
+                    }
+                )
+            elif parsed.path == "/api/sessions":
+                self._ok(list_vault_sessions(self.config, limit))
+            elif parsed.path == "/api/knowledge":
+                self._ok(list_knowledge(self.config, limit))
+            elif parsed.path == "/api/qa":
+                self._ok(read_qa(self.config)[: max(1, min(limit, 1000))])
+            else:
+                self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            self._fail(exc, HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            parsed = urlparse(self.path)
+            body = self._json_body()
+            if not isinstance(body, dict):
+                raise ValueError("请求体必须是 JSON 对象。")
+            if parsed.path == "/api/chatgpt/inspect":
+                self._ok(inspect_export(body.get("payload"), int(body.get("limit") or 20)))
+            elif parsed.path == "/api/chatgpt/import":
+                project = str(body.get("project") or "chatgpt-import").strip()
+                if not project:
+                    raise ValueError("project 不能为空。")
+                self._ok(
+                    import_chatgpt(
+                        self.config,
+                        body.get("payload"),
+                        project,
+                        limit=int(body["limit"]) if body.get("limit") is not None else None,
+                        overwrite=bool(body.get("overwrite")),
+                    ),
+                    HTTPStatus.CREATED,
+                )
+            elif parsed.path == "/api/pipeline":
+                self._ok(
+                    run_session_pipeline(
+                        self.config,
+                        str(body.get("session_id") or ""),
+                        model=str(body["model"]) if body.get("model") else None,
+                        reindex=bool(body.get("reindex", True)),
+                        overwrite=bool(body.get("overwrite")),
+                        timeout=int(body.get("timeout") or 1800),
+                    )
+                )
+            elif parsed.path == "/api/index":
+                result = Runner(self.config.secall_command).run(
+                    "reindex", "--from-vault", timeout=600
+                )
+                self._ok({"indexed": True, "output": result.stdout.strip()})
+            elif parsed.path == "/api/qa/review":
+                qa_id = str(body.get("id") or "")
+                status = str(body.get("status") or "")
+                if status not in {"approved", "rejected", "pending"}:
+                    raise ValueError("status 必须是 approved、rejected 或 pending。")
+                items = read_qa(self.config)
+                matched = False
+                for item in items:
+                    if str(item.get("id")) == qa_id:
+                        item["review_status"] = status
+                        matched = True
+                        break
+                if not matched:
+                    raise FileNotFoundError(f"QA 不存在：{qa_id}")
+                write_qa(self.config, items)
+                self._ok({"id": qa_id, "review_status": status})
+            else:
+                self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
+        except FileNotFoundError as exc:
+            self._fail(exc, HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            self._fail(exc)
+
+
+class LocalAPIServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address: Tuple[str, int], config: Config):
+        super().__init__(address, LocalAPIHandler)
+        self.config = config
+
+
+def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("本地 API 默认只允许绑定回环地址。")
+    server = LocalAPIServer((host, port), config)
+    print(f"seCall OpenCode Local API: http://{host}:{port}")
+    print("按 Ctrl+C 停止服务。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

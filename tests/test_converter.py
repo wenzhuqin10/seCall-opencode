@@ -19,7 +19,7 @@ class ConverterTests(unittest.TestCase):
 
             self.assertTrue(first.created)
             self.assertFalse(second.created)
-            self.assertIn("source: opencode", content)
+            self.assertIn('source: "opencode"', content)
             self.assertIn('model: "glm-5.1"', content)
             self.assertIn("ses_test_001", content)
             self.assertIn("HARQ timeout", content)

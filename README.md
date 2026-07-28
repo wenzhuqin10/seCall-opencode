@@ -1,7 +1,27 @@
 # seCall OpenCode Adapter
 
-将 OpenCode Session 转换为 seCall 可索引的 Markdown，并通过本机
-OpenCode + GLM 生成中文 Issue Card 与候选 QA。框架不要求独立的 LLM API。
+将 OpenCode 与 ChatGPT Session 转换为 seCall 可索引的 Markdown，并通过本机
+OpenCode 模型生成中文 Issue Card 与候选 QA。框架不要求独立的 LLM API。
+
+## 一键启动本地前后端
+
+首次安装后执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1
+```
+
+浏览器会打开 `http://localhost:3000`。本地 API 仅监听
+`127.0.0.1:8765`，不会向局域网开放。
+
+停止服务：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
+```
+
+在“研发会话”页面输入项目名称并选择 ChatGPT 官方导出的
+`conversations.json`，即可预览并导入所有有效会话。
 
 ## 工作流程
 
@@ -12,6 +32,17 @@ OpenCode Session
   → OpenCode/GLM 知识抽取
   → Issue Card + QA JSONL
   → seCall 重建索引
+```
+
+ChatGPT 导入流程：
+
+```text
+ChatGPT conversations.json
+  → 恢复 current_node 对应的有效对话分支
+  → 统一 Session 事件格式
+  → seCall Session Markdown
+  → OpenCode 模型生成 Issue Card / QA
+  → 人工审核与索引
 ```
 
 原始 Session 与生成知识分别写入：
@@ -52,6 +83,20 @@ GLM-5.1，可在初始化时加入 `--model <provider>/glm-5.1`，也可以在
 
 ```powershell
 secall-opencode sessions list
+```
+
+检查与导入 ChatGPT 导出：
+
+```powershell
+secall-opencode --json chatgpt inspect conversations.json
+secall-opencode --json chatgpt import conversations.json --project my-project --dry-run
+secall-opencode --json chatgpt import conversations.json --project my-project
+```
+
+仅启动本地 API：
+
+```powershell
+secall-opencode serve
 ```
 
 执行完整流水线：
@@ -98,6 +143,9 @@ secall-opencode --json raw db "SELECT id, title FROM session ORDER BY time_updat
 - 原始 Session 只写入本地 Vault；调用模型时仍遵循 OpenCode 自己的
   provider 与数据策略。
 - 数据库查询只允许 `SELECT` 和 `PRAGMA`。
+- 本地 API 默认仅绑定 `127.0.0.1`，并限制浏览器来源。
+- ChatGPT 文件由浏览器读取后直接发送到本机 API，不经过云端站点。
+- 解析 ChatGPT 分支时以 `current_node` 为准，避免把废弃回答分支混入知识库。
 - 知识抽取提示词要求仅使用 Session 中的证据。
 - 所有 QA 初始状态均为 `pending`，需人工审核后再用于正式知识库。
 - 转换具有幂等性；内容冲突时必须显式使用 `--overwrite`。

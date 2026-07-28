@@ -1,6 +1,6 @@
 ---
 name: secall-opencode
-description: Convert local OpenCode sessions into seCall-compatible Markdown, generate grounded Chinese Issue Cards and QA candidates through the model configured in OpenCode, diagnose the local integration, and rebuild the seCall index. Use when importing OpenCode history into a seCall Vault, troubleshooting missing seCall knowledge pages, or running the Session-to-knowledge pipeline without a direct LLM API.
+description: Convert local OpenCode and ChatGPT sessions into seCall-compatible Markdown, generate grounded Chinese Issue Cards and QA candidates through the model configured in OpenCode, run the local frontend/API, diagnose the integration, review QA, and rebuild the seCall index. Use when importing OpenCode history or ChatGPT conversations.json into a seCall Vault, troubleshooting missing knowledge pages, operating the local Studio, or running the Session-to-knowledge pipeline without a direct LLM API.
 ---
 
 # seCall OpenCode Adapter
@@ -11,12 +11,15 @@ generated QA as review candidates rather than verified facts.
 ## Workflow
 
 1. Run `secall-opencode doctor` and fix any failed required check.
-2. Run `secall-opencode sessions list` to discover the exact Session ID.
-3. Preview with `secall-opencode pipeline --session <session-id> --dry-run` when the target
+2. For OpenCode, run `secall-opencode sessions list`. For ChatGPT, first run
+   `secall-opencode chatgpt inspect <conversations.json>`.
+3. Import ChatGPT with
+   `secall-opencode chatgpt import <conversations.json> --project <name>`.
+4. Preview with `secall-opencode pipeline --session <session-id> --dry-run` when the target
    Vault or generated files are uncertain.
-4. Run `secall-opencode pipeline --session <session-id>` to export, convert, generate, and
+5. Run `secall-opencode pipeline --session <session-id>` to export, convert, generate, and
    reindex.
-5. Report the generated Session Markdown, Issue Card, number of new QA candidates,
+6. Report the generated Session Markdown, Issue Card, number of new QA candidates,
    and index result.
 
 ## Individual Operations
@@ -29,6 +32,10 @@ generated QA as review candidates rather than verified facts.
   `secall-opencode generate <session.md>`.
 - Rebuild only the index:
   `secall-opencode index`.
+- Start the local frontend API:
+  `secall-opencode serve`.
+- Start the full local Studio from the repository:
+  `powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1`.
 - Use `--json` before the subcommand when output will be consumed by another tool.
 
 ## Safety Rules
@@ -43,6 +50,8 @@ generated QA as review candidates rather than verified facts.
   `review_status: pending`.
 - If generation parsing fails, preserve the raw Session and stop before indexing
   incomplete knowledge.
+- Keep the API bound to `127.0.0.1`; do not expose imported ChatGPT data on a
+  LAN or public host without explicit authorization.
 
 ## Missing Knowledge Diagnosis
 

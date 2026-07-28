@@ -9,10 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
+from .chatgpt import inspect_export as inspect_chatgpt_export
+from .chatgpt import load_chatgpt_export, parse_export as parse_chatgpt_export
 from .config import Config, default_config_path, load_config, save_config
 from .converter import convert_export, render_markdown, validate_export
 from .knowledge import store_knowledge
 from .opencode_client import OpenCodeClient, Runner
+from .server import import_chatgpt, serve
 
 
 def _configure_stdio() -> None:
@@ -180,6 +183,40 @@ def command_convert(args: argparse.Namespace) -> Dict[str, Any]:
         overwrite=args.overwrite,
     )
     return result.as_dict(include_markdown=args.dry_run)
+
+
+def command_chatgpt_inspect(args: argparse.Namespace) -> Dict[str, Any]:
+    path = Path(args.export).expanduser().resolve()
+    conversations = load_chatgpt_export(path)
+    return inspect_chatgpt_export(conversations, args.limit)
+
+
+def command_chatgpt_import(args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = _config(args)
+    path = Path(args.export).expanduser().resolve()
+    conversations = load_chatgpt_export(path)
+    if args.dry_run:
+        parsed = parse_chatgpt_export(conversations, limit=args.limit)
+        return {
+            "dry_run": True,
+            "project": args.project,
+            "conversations": len(parsed),
+            "session_ids": [item.id for item in parsed],
+            "vault": str(cfg.vault),
+        }
+    return import_chatgpt(
+        cfg,
+        conversations,
+        args.project,
+        limit=args.limit,
+        overwrite=args.overwrite,
+    )
+
+
+def command_serve(args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = _config(args)
+    serve(cfg, host=args.host, port=args.port)
+    return {"stopped": True}
 
 
 def _prompt_path() -> Path:
@@ -391,6 +428,29 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--overwrite", action="store_true")
     convert.set_defaults(func=command_convert)
 
+    chatgpt = sub.add_parser(
+        "chatgpt",
+        help="检查或导入 ChatGPT conversations.json。",
+    )
+    chatgpt_sub = chatgpt.add_subparsers(dest="chatgpt_command", required=True)
+    chatgpt_inspect = chatgpt_sub.add_parser(
+        "inspect",
+        help="预览 ChatGPT 导出中的会话与消息数量，不写文件。",
+    )
+    chatgpt_inspect.add_argument("export")
+    chatgpt_inspect.add_argument("--limit", type=int, default=20)
+    chatgpt_inspect.set_defaults(func=command_chatgpt_inspect)
+    chatgpt_import = chatgpt_sub.add_parser(
+        "import",
+        help="将 ChatGPT 导出转换并写入 seCall Vault。",
+    )
+    chatgpt_import.add_argument("export")
+    chatgpt_import.add_argument("--project", required=True)
+    chatgpt_import.add_argument("--limit", type=int)
+    chatgpt_import.add_argument("--dry-run", action="store_true")
+    chatgpt_import.add_argument("--overwrite", action="store_true")
+    chatgpt_import.set_defaults(func=command_chatgpt_import)
+
     inspect = sub.add_parser("inspect", help="检查导出结构，不写入任何文件。")
     inspect.add_argument("export")
     inspect.set_defaults(func=command_inspect)
@@ -408,6 +468,14 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--timeout", type=int, default=600)
     index.add_argument("--dry-run", action="store_true")
     index.set_defaults(func=command_index)
+
+    local_server = sub.add_parser(
+        "serve",
+        help="启动仅绑定本机回环地址的前端 API。",
+    )
+    local_server.add_argument("--host", default="127.0.0.1")
+    local_server.add_argument("--port", type=int, default=8765)
+    local_server.set_defaults(func=command_serve)
 
     pipeline = sub.add_parser("pipeline", help="串联导出、转换、生成和索引。")
     source = pipeline.add_mutually_exclusive_group(required=True)

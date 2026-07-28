@@ -62,6 +62,7 @@ code, kbd { font-family: var(--font-geist-mono), "SFMono-Regular", Consolas, mon
 .sidebar-bottom { display: grid; gap: 12px; }
 .local-card { background: #202027; border-radius: 12px; padding: 12px; display: flex; gap: 10px; align-items: center; }
 .pulse-dot { width: 8px; height: 8px; background: #50d68a; border-radius: 50%; box-shadow: 0 0 0 4px #50d68a17; }
+.pulse-dot.offline { background: #e06464; box-shadow: 0 0 0 4px #e0646417; }
 .local-card strong, .local-card small { display: block; }
 .local-card strong { font-size: 10px; }
 .local-card small { color: #787682; font-size: 9px; margin-top: 3px; }
@@ -86,6 +87,7 @@ code, kbd { font-family: var(--font-geist-mono), "SFMono-Regular", Consolas, mon
 .primary-button, .secondary-button { border-radius: 10px; border: 0; min-height: 38px; padding: 0 15px; font-size: 11px; font-weight: 650; display: inline-flex; align-items: center; justify-content: center; gap: 7px; transition: .2s; }
 .primary-button { color: white; background: var(--purple); box-shadow: 0 7px 18px #7158e828; }
 .primary-button:hover { background: var(--purple-dark); transform: translateY(-1px); }
+.primary-button:disabled { opacity: .55; cursor: wait; transform: none; }
 .secondary-button { color: #53486f; background: #eae6fa; }
 .mobile-brand { display: none; }
 .page-body { padding: 34px clamp(24px, 3.1vw, 48px) 54px; max-width: 1600px; margin: 0 auto; }
@@ -198,12 +200,16 @@ code, kbd { font-family: var(--font-geist-mono), "SFMono-Regular", Consolas, mon
 .system-row strong { flex: 1; font-size: 8px; }
 .system-row small { display: block; color: #9a97a0; font-size: 7px; margin-top: 3px; }
 .system-row > i { width: 6px; height: 6px; border-radius: 50%; background: #50cb84; box-shadow: 0 0 0 4px #50cb8413; }
+.system-row > i.offline { background: #dd6464; box-shadow: 0 0 0 4px #dd646414; }
 .ghost-button { width: calc(100% - 30px); margin: 11px 15px 0; border: 1px solid #e5e2e9; background: white; color: #676370; height: 34px; border-radius: 9px; display: flex; justify-content: space-between; align-items: center; padding: 0 11px; font-size: 8px; }
 .ghost-button span { color: var(--purple); }
 
 .subpage { animation: enter .3s ease; }
 @keyframes enter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 .subpage-heading { min-height: 102px; display: flex; align-items: flex-start; justify-content: space-between; }
+.import-actions { display: flex; align-items: center; gap: 8px; }
+.import-actions input { width: 150px; height: 38px; border: 1px solid #dfdce3; border-radius: 10px; background: white; color: var(--ink); padding: 0 11px; font-size: 9px; outline: none; }
+.import-actions input:focus { border-color: #8b77e9; box-shadow: 0 0 0 3px #7158e812; }
 .filter-bar { min-height: 48px; display: flex; align-items: center; gap: 7px; margin-bottom: 14px; }
 .filter-bar button { border: 0; color: #89858f; background: transparent; padding: 8px 11px; border-radius: 9px; font-size: 9px; }
 .filter-bar button.active { color: #4d3ca8; background: #eae6fa; font-weight: 700; }
@@ -324,6 +330,7 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .toast strong { font-size: 9px; }
 .toast small { color: #99959f; font-size: 7px; margin-top: 4px; }
 .toast button { color: #817e87; background: transparent; border: 0; font-size: 15px; }
+.file-input { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
 
 @media (max-width: 1180px) {
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
@@ -361,6 +368,8 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .stepper small { font-size: 6px; }
   .subpage-heading { min-height: 120px; gap: 12px; }
   .subpage-heading .primary-button, .subpage-heading .secondary-button { white-space: nowrap; padding-inline: 10px; }
+  .import-actions { align-items: flex-end; flex-direction: column; }
+  .import-actions input { width: 132px; }
   .pipeline-hero { display: block; }
   .hero-metrics { margin-top: 18px; }
   .hero-metrics span:first-child { border-left: 0; padding-left: 0; }

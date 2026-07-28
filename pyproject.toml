@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "secall-opencode"
-version = "0.1.0"
-description = "Convert OpenCode sessions into seCall Vault sessions, Issue Cards, and grounded QA candidates."
+version = "0.2.0"
+description = "Convert OpenCode and ChatGPT sessions into seCall Vault sessions, Issue Cards, and grounded QA candidates."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }

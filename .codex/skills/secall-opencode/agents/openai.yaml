@@ -1,4 +1,4 @@
 interface:
   display_name: "seCall OpenCode Adapter"
-  short_description: "Convert OpenCode sessions into seCall knowledge"
-  default_prompt: "Use $secall-opencode to inspect, convert, generate, and index OpenCode sessions safely."
+  short_description: "Import OpenCode or ChatGPT sessions into seCall"
+  default_prompt: "Use $secall-opencode to import OpenCode or ChatGPT sessions, run the local Studio, generate grounded knowledge, review QA, and rebuild the index safely."

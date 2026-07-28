@@ -98,6 +98,8 @@ def _tool_parts(parts: Iterable[Any]) -> List[Dict[str, str]]:
 def render_markdown(data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     validate_export(data)
     info = _dict(data["info"])
+    source = str(info.get("source") or info.get("agent") or "opencode").lower()
+    agent = str(info.get("agent") or source)
     session_id = str(info["id"])
     directory = str(info.get("directory") or "")
     project = Path(directory).name if directory else str(info.get("title") or "unknown")
@@ -176,12 +178,21 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     summary = re.sub(r"\s+", " ", first_user).strip()[:240] or title
     tokens_in = int(info.get("tokens_input") or info.get("tokensIn") or 0)
     tokens_out = int(info.get("tokens_output") or info.get("tokensOut") or 0)
+    source_format = str(
+        info.get("source_format")
+        or f"{source}-export-v{info.get('version') or 'unknown'}"
+    )
+    source_label = {
+        "opencode": "OpenCode",
+        "chatgpt": "ChatGPT",
+        "codex": "Codex",
+    }.get(source, source.capitalize())
 
     frontmatter = [
         "---",
         "type: session",
-        "agent: opencode",
-        "source: opencode",
+        f"agent: {_yaml_string(agent)}",
+        f"source: {_yaml_string(source)}",
     ]
     if model:
         frontmatter.append(f"model: {_yaml_string(model)}")
@@ -206,10 +217,10 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
             f"summary: {_yaml_string(summary)}",
             "status: raw",
             "session_type: interactive",
-            f"source_format: opencode-export-v{info.get('version') or 'unknown'}",
+            f"source_format: {_yaml_string(source_format)}",
             "---",
             "",
-            f"# OpenCode 会话：{title}",
+            f"# {source_label} 会话：{title}",
             "",
             f"> **项目**：{project} | **时间**：{start.strftime('%Y-%m-%d %H:%M')}",
             "",
@@ -238,8 +249,10 @@ def convert_export(
     overwrite: bool = False,
 ) -> ConversionResult:
     markdown, meta = render_markdown(data)
+    info = _dict(data.get("info"))
+    source = _safe_name(str(info.get("source") or info.get("agent") or "opencode"))
     short_id = _safe_name(meta["session_id"])[:16]
-    filename = f"opencode_{_safe_name(meta['project'])}_{short_id}.md"
+    filename = f"{source}_{_safe_name(meta['project'])}_{short_id}.md"
     output_path = vault / "raw" / ".sessions" / meta["date"] / filename
     exists = output_path.exists()
     if exists and not overwrite:

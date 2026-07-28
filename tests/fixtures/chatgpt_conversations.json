@@ -1,0 +1,74 @@
+[
+  {
+    "id": "conv_test_001",
+    "title": "HARQ timeout 问题定位",
+    "create_time": 1785196800,
+    "update_time": 1785196860,
+    "current_node": "node_assistant_2",
+    "mapping": {
+      "node_root": {
+        "id": "node_root",
+        "message": null,
+        "parent": null,
+        "children": ["node_user"]
+      },
+      "node_user": {
+        "id": "node_user",
+        "message": {
+          "id": "msg_user",
+          "author": {"role": "user"},
+          "create_time": 1785196800,
+          "content": {
+            "content_type": "text",
+            "parts": ["Scheduler 出现 HARQ timeout，如何定位？"]
+          }
+        },
+        "parent": "node_root",
+        "children": ["node_assistant", "node_abandoned"]
+      },
+      "node_assistant": {
+        "id": "node_assistant",
+        "message": {
+          "id": "msg_assistant",
+          "author": {"role": "assistant"},
+          "create_time": 1785196810,
+          "content": {
+            "content_type": "text",
+            "parts": ["先检查 HARQ 状态是否在重传结束后清零。"]
+          },
+          "metadata": {"model_slug": "gpt-5"}
+        },
+        "parent": "node_user",
+        "children": ["node_assistant_2"]
+      },
+      "node_assistant_2": {
+        "id": "node_assistant_2",
+        "message": {
+          "id": "msg_assistant_2",
+          "author": {"role": "assistant"},
+          "create_time": 1785196860,
+          "content": {
+            "content_type": "text",
+            "parts": ["相关代码位于 src/mac/scheduler.c。"]
+          }
+        },
+        "parent": "node_assistant",
+        "children": []
+      },
+      "node_abandoned": {
+        "id": "node_abandoned",
+        "message": {
+          "id": "msg_abandoned",
+          "author": {"role": "assistant"},
+          "create_time": 1785196820,
+          "content": {
+            "content_type": "text",
+            "parts": ["这条分支不应导入。"]
+          }
+        },
+        "parent": "node_user",
+        "children": []
+      }
+    }
+  }
+]
