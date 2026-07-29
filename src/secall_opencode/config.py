@@ -18,9 +18,9 @@ class Config:
     qa_file: str = "knowledge/qa/candidates.jsonl"
     semantic_backend: str = "none"
     semantic_model_dir: Optional[Path] = None
-    semantic_batch_size: int = 8
-    semantic_chunk_size: int = 1200
-    semantic_chunk_overlap: int = 160
+    semantic_batch_size: int = 16
+    semantic_chunk_size: int = 600
+    semantic_chunk_overlap: int = 80
 
 
 def default_config_path() -> Path:
@@ -78,9 +78,9 @@ def load_config(
             if model_dir_value
             else Path.home() / ".cache" / "secall" / "models" / "bge-m3-onnx"
         ),
-        semantic_batch_size=max(1, int(semantic.get("batch_size") or 8)),
-        semantic_chunk_size=max(200, int(semantic.get("chunk_size") or 1200)),
-        semantic_chunk_overlap=max(0, int(semantic.get("chunk_overlap") or 160)),
+        semantic_batch_size=max(1, int(semantic.get("batch_size") or 16)),
+        semantic_chunk_size=max(200, int(semantic.get("chunk_size") or 600)),
+        semantic_chunk_overlap=max(0, int(semantic.get("chunk_overlap") or 80)),
     )
 
 

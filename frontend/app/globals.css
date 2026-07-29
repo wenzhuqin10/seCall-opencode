@@ -335,6 +335,53 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .diagnostic-grid p { color: #89858f; font-size: 8px; }
 .diagnostic-grid code { display: block; color: #77727d; background: #f6f4f8; border-radius: 7px; padding: 7px 8px; margin-top: 14px; font-size: 7px; overflow: hidden; text-overflow: ellipsis; }
 
+.semantic-state { display: flex; align-items: center; gap: 10px; min-width: 170px; padding: 11px 13px; border: 1px solid #e5e1e8; border-radius: 12px; background: white; }
+.semantic-state > i { width: 9px; height: 9px; border-radius: 50%; background: #d0ccd4; box-shadow: 0 0 0 5px #d0ccd425; }
+.semantic-state.ready > i { background: #4bc47c; box-shadow: 0 0 0 5px #4bc47c20; }
+.semantic-state span, .semantic-state strong, .semantic-state small { display: block; }
+.semantic-state strong { font-size: 9px; }
+.semantic-state small { color: #97929c; font-size: 7px; margin-top: 3px; }
+.rag-layout { display: grid; grid-template-columns: minmax(0, 1fr) 230px; gap: 14px; }
+.rag-composer, .rag-index-card, .rag-answer, .rag-thinking { background: white; border: 1px solid var(--line); border-radius: 16px; }
+.rag-composer { padding: 20px; }
+.rag-mode-row { display: flex; gap: 12px; margin-bottom: 17px; }
+.rag-mode-row label { flex: 1; display: grid; gap: 6px; color: #716c77; font-size: 8px; font-weight: 700; }
+.rag-mode-row select { height: 37px; border: 1px solid #dfdbe4; border-radius: 9px; color: #554f5b; background: #fbfafc; padding: 0 10px; outline: none; }
+.rag-question { display: grid; gap: 8px; color: #39353e; font-size: 9px; font-weight: 750; }
+.rag-question textarea { min-height: 145px; resize: vertical; border: 1px solid #ded9e4; border-radius: 12px; padding: 15px; color: var(--ink); background: #fbfafc; font: inherit; font-size: 11px; line-height: 1.7; outline: none; }
+.rag-question textarea:focus { border-color: #8771ea; box-shadow: 0 0 0 4px #7158e810; background: white; }
+.rag-submit { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 13px; }
+.rag-submit small { color: #aaa5af; font-size: 7px; }
+.rag-submit button:disabled { opacity: .65; cursor: wait; }
+.rag-index-card { padding: 20px; background: linear-gradient(145deg, #1c1b22, #292631); color: white; border: 0; }
+.rag-index-card h3 { margin: 5px 0 19px; font-size: 15px; }
+.rag-index-card > div { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #3a3741; }
+.rag-index-card > div span { color: #96919e; font-size: 8px; }
+.rag-index-card > div strong { font-size: 9px; }
+.rag-index-card > button { width: 100%; height: 35px; margin-top: 18px; border: 1px solid #504b59; border-radius: 9px; color: #d8d3df; background: #ffffff08; font-size: 8px; }
+.rag-thinking { display: flex; align-items: center; gap: 14px; margin-top: 14px; padding: 18px 20px; }
+.rag-thinking > span { width: 36px; height: 36px; display: grid; place-items: center; border-radius: 11px; color: white; background: var(--purple); animation: spin 1.8s linear infinite; }
+.rag-thinking strong, .rag-thinking small { display: block; }
+.rag-thinking strong { font-size: 10px; }
+.rag-thinking small { color: #918c97; font-size: 8px; margin-top: 4px; }
+.rag-answer { margin-top: 14px; padding: 23px; }
+.rag-answer > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 15px; border-bottom: 1px solid #ece9ef; padding-bottom: 17px; }
+.rag-answer > header h2 { margin: 4px 0 0; font-size: 16px; }
+.rag-answer > header > span { flex: 0 0 auto; padding: 6px 9px; border-radius: 9px; color: #8c6870; background: #f8eeee; font-size: 8px; }
+.rag-answer > header > span.grounded { color: #2e8555; background: #eaf7ef; }
+.rag-answer-text { padding: 22px 2px; color: #4d4853; font-size: 10px; line-height: 1.9; white-space: pre-wrap; }
+.rag-sources { border-top: 1px solid #ece9ef; padding-top: 18px; }
+.rag-sources h3 { margin: 0 0 10px; font-size: 10px; }
+.rag-sources h3 span { color: #6550cb; background: var(--lilac); border-radius: 8px; padding: 3px 6px; margin-left: 5px; font-size: 7px; }
+.rag-sources > button { width: 100%; display: grid; grid-template-columns: 36px 1fr 12px; gap: 10px; align-items: start; padding: 11px; border: 0; border-radius: 10px; color: inherit; background: transparent; text-align: left; }
+.rag-sources > button:hover { background: #f8f6fb; }
+.rag-sources > button > b { color: #634fc5; font-size: 9px; }
+.rag-sources > button span strong, .rag-sources > button span small, .rag-sources > button span em { display: block; }
+.rag-sources > button span strong { font-size: 9px; }
+.rag-sources > button span small { color: #817c87; font-size: 8px; line-height: 1.55; margin-top: 4px; max-height: 38px; overflow: hidden; }
+.rag-sources > button span em { color: #aaa5af; font-size: 7px; font-style: normal; margin-top: 5px; }
+.rag-sources > button > i { color: #aaa5af; font-style: normal; }
+
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(16,14,23,.54); backdrop-filter: blur(7px); display: grid; place-items: center; padding: 20px; animation: fade .2s ease; }
 @keyframes fade { from { opacity: 0; } }
 .modal { width: min(490px, 100%); background: white; border-radius: 20px; padding: 27px; box-shadow: 0 30px 90px rgba(18,14,32,.3); position: relative; }
@@ -408,6 +455,7 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .profile { justify-content: center; }
   .content { width: calc(100% - 72px); margin-left: 72px; }
   .qa-layout { grid-template-columns: 1fr; }
+  .rag-layout { grid-template-columns: 1fr; }
 }
 @media (max-width: 650px) {
   .sidebar { display: none; }
@@ -441,5 +489,7 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .knowledge-drawer { width: 100vw; }
   .knowledge-drawer > header, .knowledge-preview, .knowledge-editor { padding-left: 18px; padding-right: 18px; }
   .heading-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .rag-mode-row { flex-direction: column; }
+  .semantic-state { display: none; }
   .toast { min-width: 0; right: 14px; left: 14px; bottom: 14px; }
 }

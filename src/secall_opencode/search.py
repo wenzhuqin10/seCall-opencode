@@ -7,7 +7,7 @@ import re
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Protocol, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Protocol, Sequence
 
 from .config import Config
 from .knowledge_store import list_knowledge_documents, read_knowledge_document
@@ -16,6 +16,13 @@ from .opencode_client import Runner
 
 CJK_RUN = re.compile(r"[\u3400-\u9fff]+")
 ASCII_TOKEN = re.compile(r"[0-9a-zA-Z_./:#@+\-]{2,}")
+TITLE_PATTERN = re.compile(r"(?m)^#\s+(.+)$")
+DISPLAY_TRANSLATIONS = {
+    "codex 세션": "Codex 会话",
+    "opencode 세션": "OpenCode 会话",
+    "chatgpt 세션": "ChatGPT 会话",
+    "세션": "会话",
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,23 @@ class SearchResult:
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class SearchDocument:
+    id: str
+    scope: str
+    title: str
+    body: str
+    project: str
+    source_session: str
+    review_status: str
+
+    @property
+    def content_hash(self) -> str:
+        return hashlib.sha256(
+            f"{self.title}\n{self.body}".encode("utf-8")
+        ).hexdigest()
 
 
 class SemanticSearchBackend(Protocol):
@@ -62,6 +86,8 @@ class UnavailableSemanticBackend:
             "available": False,
             "backend": "none",
             "model_dir": str(self.model_dir or ""),
+            "indexed_documents": 0,
+            "indexed_chunks": 0,
             "reason": "本地语义模型尚未就绪，已使用关键词检索。",
         }
 
@@ -75,16 +101,6 @@ class UnavailableSemanticBackend:
         return None
 
 
-class OnnxSemanticBackend(UnavailableSemanticBackend):
-    """Reserved extension point for the phase-two ONNX implementation."""
-
-    def status(self) -> Dict[str, Any]:
-        status = super().status()
-        status["backend"] = "onnx"
-        status["reason"] = "ONNX 接口已预留，模型加载将在第二阶段启用。"
-        return status
-
-
 def _search_db_path(config: Config) -> Path:
     local = os.environ.get("LOCALAPPDATA")
     base = Path(local) if local else Path.home() / ".cache"
@@ -92,28 +108,120 @@ def _search_db_path(config: Config) -> Path:
     return base / "secall-opencode" / f"search-{digest}.sqlite"
 
 
+def _frontmatter(markdown: str) -> Dict[str, str]:
+    if not markdown.startswith("---"):
+        return {}
+    end = markdown.find("\n---", 3)
+    if end < 0:
+        return {}
+    result: Dict[str, str] = {}
+    for line in markdown[3:end].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        result[key.strip()] = value.strip().strip("\"'")
+    return result
+
+
+def _localize_title(title: str) -> str:
+    result = title
+    for source, target in DISPLAY_TRANSLATIONS.items():
+        result = result.replace(source, target)
+    return result
+
+
+def _session_documents(config: Config) -> Iterator[SearchDocument]:
+    root = config.vault / "raw" / ".sessions"
+    if not root.exists():
+        return
+    for path in root.rglob("*.md"):
+        body = path.read_text(encoding="utf-8", errors="replace")
+        meta = _frontmatter(body)
+        title_match = TITLE_PATTERN.search(body)
+        session_id = meta.get("session_id") or path.stem
+        yield SearchDocument(
+            id=session_id,
+            scope="session",
+            title=_localize_title(
+                title_match.group(1).strip() if title_match else path.stem
+            ),
+            body=body,
+            project=meta.get("project") or "unknown",
+            source_session=session_id,
+            review_status="ready",
+        )
+
+
+def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
+    for item in list_knowledge_documents(config, limit=10000):
+        detail = read_knowledge_document(config, item["id"])
+        body = "\n".join(
+            [detail["intro"]]
+            + [
+                f"{section['heading']}\n{section['content']}"
+                for section in detail["sections"]
+            ]
+        )
+        yield SearchDocument(
+            id=item["id"],
+            scope="knowledge",
+            title=item["title"],
+            body=body,
+            project=item["project"],
+            source_session=item["source_session"],
+            review_status=item["review_status"],
+        )
+
+    qa_path = config.vault / config.qa_file
+    if not qa_path.exists():
+        return
+    for line in qa_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, dict) or item.get("review_status") != "approved":
+            continue
+        yield SearchDocument(
+            id=str(item.get("id") or ""),
+            scope="qa",
+            title=str(item.get("question") or "未命名问答"),
+            body=str(item.get("answer") or ""),
+            project=str(item.get("project") or "unknown"),
+            source_session=str(item.get("source_session") or ""),
+            review_status="approved",
+        )
+
+
+def iter_search_documents(
+    config: Config, include_sessions: bool = True
+) -> Iterator[SearchDocument]:
+    if include_sessions:
+        yield from _session_documents(config)
+    yield from _knowledge_and_qa_documents(config)
+
+
 def _tokens(text: str) -> str:
     lowered = text.lower()
     values = set(ASCII_TOKEN.findall(lowered))
     for run in CJK_RUN.findall(lowered):
         values.update(run)
-        values.update(run[index : index + 2] for index in range(max(0, len(run) - 1)))
-        values.update(run)
+        values.update(run[index : index + 2] for index in range(len(run) - 1))
     return " ".join(sorted(value for value in values if value))
 
 
-def _snippet(text: str, query: str, width: int = 220) -> str:
+def _snippet(text: str, query: str, width: int = 260) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     if not compact:
         return ""
     index = compact.lower().find(query.lower())
     if index < 0:
-        return compact[:width]
+        return compact[:width] + ("…" if len(compact) > width else "")
     start = max(0, index - width // 3)
     end = min(len(compact), start + width)
-    prefix = "…" if start else ""
-    suffix = "…" if end < len(compact) else ""
-    return prefix + compact[start:end] + suffix
+    return ("…" if start else "") + compact[start:end] + (
+        "…" if end < len(compact) else ""
+    )
 
 
 class KeywordSearchBackend:
@@ -149,55 +257,11 @@ class KeywordSearchBackend:
         return connection
 
     def rebuild(self) -> Dict[str, Any]:
-        documents: List[Dict[str, str]] = []
-        for item in list_knowledge_documents(self.config, limit=1000):
-            detail = read_knowledge_document(self.config, item["id"])
-            body = "\n".join(
-                [detail["intro"]]
-                + [
-                    f"{section['heading']}\n{section['content']}"
-                    for section in detail["sections"]
-                ]
-            )
-            documents.append(
-                {
-                    "id": item["id"],
-                    "scope": "knowledge",
-                    "title": item["title"],
-                    "body": body,
-                    "project": item["project"],
-                    "source_session": item["source_session"],
-                    "review_status": item["review_status"],
-                }
-            )
-        qa_path = self.config.vault / self.config.qa_file
-        if qa_path.exists():
-            for line in qa_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(item, dict) or item.get("review_status") != "approved":
-                    continue
-                documents.append(
-                    {
-                        "id": str(item.get("id") or ""),
-                        "scope": "qa",
-                        "title": str(item.get("question") or "未命名问答"),
-                        "body": str(item.get("answer") or ""),
-                        "project": str(item.get("project") or "unknown"),
-                        "source_session": str(item.get("source_session") or ""),
-                        "review_status": "approved",
-                    }
-                )
-
+        documents = list(_knowledge_and_qa_documents(self.config))
         with self._connect() as connection:
             connection.execute("DELETE FROM documents")
             connection.execute("DELETE FROM documents_fts")
             for item in documents:
-                digest = hashlib.sha256(
-                    f"{item['title']}\n{item['body']}".encode("utf-8")
-                ).hexdigest()
                 connection.execute(
                     """
                     INSERT INTO documents
@@ -205,14 +269,14 @@ class KeywordSearchBackend:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        item["id"],
-                        item["scope"],
-                        item["title"],
-                        item["body"],
-                        item["project"],
-                        item["source_session"],
-                        item["review_status"],
-                        digest,
+                        item.id,
+                        item.scope,
+                        item.title,
+                        item.body,
+                        item.project,
+                        item.source_session,
+                        item.review_status,
+                        item.content_hash,
                     ),
                 )
                 connection.execute(
@@ -221,10 +285,10 @@ class KeywordSearchBackend:
                     (id, scope, title_tokens, body_tokens) VALUES (?, ?, ?, ?)
                     """,
                     (
-                        item["id"],
-                        item["scope"],
-                        _tokens(item["title"]),
-                        _tokens(item["body"]),
+                        item.id,
+                        item.scope,
+                        _tokens(item.title),
+                        _tokens(item.body),
                     ),
                 )
         return {"indexed": len(documents), "path": str(self.db_path)}
@@ -234,7 +298,9 @@ class KeywordSearchBackend:
             connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
             connection.execute("DELETE FROM documents_fts WHERE id = ?", (document_id,))
 
-    def _knowledge_search(self, query: str, scope: str, limit: int) -> List[SearchResult]:
+    def _knowledge_search(
+        self, query: str, scope: str, limit: int
+    ) -> List[SearchResult]:
         if not self.db_path.exists():
             self.rebuild()
         query_tokens = _tokens(query).split()
@@ -287,19 +353,12 @@ class KeywordSearchBackend:
         try:
             value = json.loads(raw or "[]")
         except json.JSONDecodeError:
-            start = raw.find("[")
-            end = raw.rfind("]")
-            if start >= 0 and end > start:
-                try:
-                    value = json.loads(raw[start : end + 1])
-                except json.JSONDecodeError:
-                    value = []
-            else:
+            start, end = raw.find("["), raw.rfind("]")
+            try:
+                value = json.loads(raw[start : end + 1]) if start >= 0 < end else []
+            except json.JSONDecodeError:
                 value = []
-        sessions = {
-            item["id"]: item
-            for item in _session_catalog(self.config)
-        }
+        sessions = {item.id: item for item in _session_documents(self.config)}
         results: List[SearchResult] = []
         seen = set()
         for item in value if isinstance(value, list) else []:
@@ -310,14 +369,17 @@ class KeywordSearchBackend:
                 continue
             seen.add(session_id)
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-            session = sessions.get(session_id, {})
+            session = sessions.get(session_id)
             results.append(
                 SearchResult(
                     id=session_id,
                     scope="session",
-                    title=str(session.get("title") or f"会话 {session_id[:12]}"),
+                    title=session.title if session else f"会话 {session_id[:12]}",
                     snippet=str(item.get("snippet") or ""),
-                    project=str(metadata.get("project") or session.get("project") or "unknown"),
+                    project=str(
+                        metadata.get("project")
+                        or (session.project if session else "unknown")
+                    ),
                     source_session=session_id,
                     score=float(item.get("score") or 0.0),
                     match_type="keyword",
@@ -342,10 +404,299 @@ class KeywordSearchBackend:
         return result[:limit]
 
 
-def _session_catalog(config: Config) -> Iterable[Dict[str, Any]]:
-    from .server import list_vault_sessions
+def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
+    compact = text.strip()
+    if not compact:
+        return []
+    size = max(200, size)
+    overlap = max(0, min(overlap, size // 2))
+    chunks: List[str] = []
+    start = 0
+    while start < len(compact):
+        end = min(len(compact), start + size)
+        if end < len(compact):
+            break_at = max(
+                compact.rfind("\n", start + size // 2, end),
+                compact.rfind("。", start + size // 2, end),
+            )
+            if break_at > start:
+                end = break_at + 1
+        chunks.append(compact[start:end].strip())
+        if end >= len(compact):
+            break
+        start = max(start + 1, end - overlap)
+    return [chunk for chunk in chunks if chunk]
 
-    return list_vault_sessions(config, limit=1000)
+
+class OnnxSemanticBackend:
+    def __init__(self, config: Config):
+        self.config = config
+        self.model_dir = config.semantic_model_dir
+        self.db_path = _search_db_path(config)
+        self._session: Any = None
+        self._tokenizer: Any = None
+        self._error: str | None = None
+
+    def _model_files(self) -> tuple[Path, Path]:
+        if not self.model_dir:
+            return Path(), Path()
+        onnx_dir = self.model_dir / "onnx"
+        model = onnx_dir / "model.onnx"
+        tokenizer = onnx_dir / "tokenizer.json"
+        if not model.exists():
+            model = self.model_dir / "model.onnx"
+        if not tokenizer.exists():
+            tokenizer = self.model_dir / "tokenizer.json"
+        return model, tokenizer
+
+    def _load(self) -> None:
+        if self._session is not None and self._tokenizer is not None:
+            return
+        model, tokenizer_path = self._model_files()
+        if not model.is_file() or not tokenizer_path.is_file():
+            raise FileNotFoundError(
+                f"BGE-M3 模型不完整：需要 {model} 和 {tokenizer_path}"
+            )
+        try:
+            import onnxruntime as ort
+            from tokenizers import Tokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "缺少语义检索依赖，请安装 onnxruntime、tokenizers 和 numpy。"
+            ) from exc
+        self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
+        self._tokenizer.enable_truncation(max_length=256)
+        self._tokenizer.enable_padding()
+        self._session = ort.InferenceSession(
+            str(model),
+            providers=["CPUExecutionProvider"],
+        )
+
+    @property
+    def available(self) -> bool:
+        try:
+            self._load()
+            return True
+        except Exception as exc:
+            self._error = str(exc)
+            return False
+
+    def supports_scope(self, scope: str) -> bool:
+        return scope in {"all", "knowledge", "qa"}
+
+    def _connect(self) -> sqlite3.Connection:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(self.db_path)
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS semantic_documents (
+                id TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                title TEXT NOT NULL,
+                project TEXT NOT NULL,
+                source_session TEXT NOT NULL,
+                review_status TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                vector BLOB NOT NULL,
+                dimensions INTEGER NOT NULL,
+                PRIMARY KEY (scope, id, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS semantic_scope_idx
+            ON semantic_documents(scope);
+            """
+        )
+        return connection
+
+    def _counts(self) -> tuple[int, int]:
+        if not self.db_path.exists():
+            return 0, 0
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(DISTINCT scope || ':' || id) AS documents,
+                           COUNT(*) AS chunks
+                    FROM semantic_documents
+                    """
+                ).fetchone()
+            return int(row["documents"] or 0), int(row["chunks"] or 0)
+        except sqlite3.Error:
+            return 0, 0
+
+    def status(self) -> Dict[str, Any]:
+        model, tokenizer = self._model_files()
+        documents, chunks = self._counts()
+        ready = self.available
+        return {
+            "available": ready,
+            "backend": "onnx",
+            "model_dir": str(self.model_dir or ""),
+            "model_file": str(model),
+            "tokenizer_file": str(tokenizer),
+            "dimensions": 1024,
+            "indexed_documents": documents,
+            "indexed_chunks": chunks,
+            "indexed_scopes": ["knowledge", "qa"],
+            "reason": None if ready else self._error,
+        }
+
+    def _embed(self, texts: Sequence[str]) -> Any:
+        self._load()
+        import numpy as np
+
+        result: List[Any] = []
+        batch_size = self.config.semantic_batch_size
+        for offset in range(0, len(texts), batch_size):
+            batch = list(texts[offset : offset + batch_size])
+            encoded = self._tokenizer.encode_batch(batch)
+            input_ids = np.asarray([item.ids for item in encoded], dtype=np.int64)
+            attention_mask = np.asarray(
+                [item.attention_mask for item in encoded], dtype=np.int64
+            )
+            vectors = self._session.run(
+                ["sentence_embedding"],
+                {"input_ids": input_ids, "attention_mask": attention_mask},
+            )[0].astype(np.float32)
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            vectors = vectors / np.maximum(norms, 1e-12)
+            result.append(vectors)
+        return np.concatenate(result, axis=0)
+
+    def _write_documents(
+        self,
+        documents: Sequence[SearchDocument],
+        *,
+        replace_all: bool,
+    ) -> Dict[str, Any]:
+        if not self.available:
+            raise RuntimeError(self._error or "ONNX 语义模型不可用。")
+        with self._connect() as connection:
+            existing = {
+                (str(row["scope"]), str(row["id"])): str(row["content_hash"])
+                for row in connection.execute(
+                    """
+                    SELECT scope, id, MAX(content_hash) AS content_hash
+                    FROM semantic_documents GROUP BY scope, id
+                    """
+                ).fetchall()
+            }
+        current = {(item.scope, item.id): item for item in documents}
+        changed = list(documents) if replace_all else [
+            item
+            for key, item in current.items()
+            if existing.get(key) != item.content_hash
+        ]
+        rows: List[tuple[SearchDocument, int, str]] = []
+        for document in changed:
+            text = f"{document.title}\n{document.body}"
+            for index, chunk in enumerate(
+                _chunk_text(
+                    text,
+                    self.config.semantic_chunk_size,
+                    self.config.semantic_chunk_overlap,
+                )
+            ):
+                rows.append((document, index, chunk))
+        vectors = self._embed([row[2] for row in rows]) if rows else []
+        with self._connect() as connection:
+            if replace_all:
+                connection.execute("DELETE FROM semantic_documents")
+            else:
+                for scope, document_id in set(existing) - set(current):
+                    connection.execute(
+                        "DELETE FROM semantic_documents WHERE scope = ? AND id = ?",
+                        (scope, document_id),
+                    )
+                for document in changed:
+                    connection.execute(
+                        "DELETE FROM semantic_documents WHERE scope = ? AND id = ?",
+                        (document.scope, document.id),
+                    )
+            for row, vector in zip(rows, vectors):
+                document, chunk_index, chunk = row
+                connection.execute(
+                    """
+                    INSERT INTO semantic_documents
+                    (id, scope, title, project, source_session, review_status,
+                     content_hash, chunk_index, chunk_text, vector, dimensions)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        document.id,
+                        document.scope,
+                        document.title,
+                        document.project,
+                        document.source_session,
+                        document.review_status,
+                        document.content_hash,
+                        chunk_index,
+                        chunk,
+                        vector.astype("<f4").tobytes(),
+                        int(vector.shape[0]),
+                    ),
+                )
+        return {
+            **self.status(),
+            "indexed_documents": len(documents),
+            "updated_documents": len(changed),
+            "updated_chunks": len(rows),
+        }
+
+    def rebuild(self) -> Dict[str, Any]:
+        documents = list(iter_search_documents(self.config, include_sessions=False))
+        return self._write_documents(documents, replace_all=True)
+
+    def sync(self) -> Dict[str, Any]:
+        documents = list(iter_search_documents(self.config, include_sessions=False))
+        return self._write_documents(documents, replace_all=False)
+
+    def remove(self, document_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM semantic_documents WHERE id = ?", (document_id,)
+            )
+
+    def search(self, query: str, scope: str, limit: int) -> List[SearchResult]:
+        if not self.available:
+            raise RuntimeError(self._error or "ONNX 语义模型不可用。")
+        import numpy as np
+
+        if not self.db_path.exists():
+            self.rebuild()
+        conditions = "" if scope == "all" else "WHERE scope = ?"
+        parameters: tuple[Any, ...] = () if scope == "all" else (scope,)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM semantic_documents {conditions}", parameters
+            ).fetchall()
+        if not rows:
+            return []
+        query_vector = self._embed([query])[0]
+        best: Dict[tuple[str, str], tuple[float, sqlite3.Row]] = {}
+        for row in rows:
+            vector = np.frombuffer(row["vector"], dtype="<f4")
+            score = float(np.dot(query_vector, vector))
+            key = (str(row["scope"]), str(row["id"]))
+            if key not in best or score > best[key][0]:
+                best[key] = (score, row)
+        ranked = sorted(best.values(), key=lambda item: item[0], reverse=True)[:limit]
+        return [
+            SearchResult(
+                id=str(row["id"]),
+                scope=str(row["scope"]),
+                title=str(row["title"]),
+                snippet=str(row["chunk_text"])[:320],
+                project=str(row["project"]),
+                source_session=str(row["source_session"]),
+                score=round(score, 6),
+                match_type="semantic",
+                review_status=str(row["review_status"]),
+            )
+            for score, row in ranked
+        ]
 
 
 class HybridSearchService:
@@ -365,6 +716,8 @@ class HybridSearchService:
         limit: int = 20,
     ) -> Dict[str, Any]:
         query = query.strip()
+        if scope == "sessions":
+            scope = "session"
         if len(query) < 2:
             raise ValueError("搜索内容至少需要两个字符。")
         if scope not in {"all", "session", "knowledge", "qa"}:
@@ -374,9 +727,21 @@ class HybridSearchService:
         limit = max(1, min(limit, 100))
         fallback = None
         effective = mode
-        if mode != "keyword" and not self.semantic.available:
+        supports_scope = getattr(self.semantic, "supports_scope", lambda _scope: True)
+        if (
+            mode != "keyword"
+            and (
+                not self.semantic.available
+                or not bool(supports_scope(scope))
+            )
+        ):
             effective = "keyword"
-            fallback = str(self.semantic.status().get("reason") or "语义检索不可用。")
+            fallback = (
+                "原始 Session 当前使用 seCall/BM25 检索；知识卡片与已审核 QA "
+                "使用 BGE-M3 语义索引。"
+                if self.semantic.available
+                else str(self.semantic.status().get("reason") or "语义检索不可用。")
+            )
         if effective == "keyword":
             results = self.keyword.search(query, scope, limit)
         elif effective == "semantic":
@@ -419,14 +784,16 @@ def _rrf_merge(
                 "match_type": "hybrid",
             }
         )
-        for key, score in sorted(scores.items(), key=lambda pair: pair[1], reverse=True)[:limit]
+        for key, score in sorted(
+            scores.items(), key=lambda pair: pair[1], reverse=True
+        )[:limit]
     ]
 
 
 def build_search_service(config: Config) -> HybridSearchService:
     semantic: SemanticSearchBackend
     if config.semantic_backend == "onnx":
-        semantic = OnnxSemanticBackend(config.semantic_model_dir)
+        semantic = OnnxSemanticBackend(config)
     else:
         semantic = UnavailableSemanticBackend(config.semantic_model_dir)
     return HybridSearchService(KeywordSearchBackend(config), semantic)

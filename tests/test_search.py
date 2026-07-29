@@ -1,10 +1,14 @@
 import json
+import os
 from pathlib import Path
+
+import pytest
 
 from secall_opencode.config import Config
 from secall_opencode.search import (
     HybridSearchService,
     KeywordSearchBackend,
+    OnnxSemanticBackend,
     SearchResult,
     UnavailableSemanticBackend,
 )
@@ -155,3 +159,112 @@ def test_all_scope_keeps_knowledge_when_session_backend_has_no_results(
     results = keyword.search("断点续传", scope="all", limit=10)
 
     assert "download-session-001" in {item.id for item in results}
+
+
+def test_onnx_backend_builds_normalized_semantic_index(
+    tmp_path: Path, monkeypatch
+) -> None:
+    if os.environ.get("RUN_BGE_INTEGRATION") != "1":
+        pytest.skip("set RUN_BGE_INTEGRATION=1 for the 2 GB local model test")
+    model_dir = Path(r"D:\Models\bge-m3")
+    if not (model_dir / "onnx" / "model.onnx").exists():
+        return
+    config = _search_config(tmp_path, monkeypatch)
+    config = Config(
+        **{
+            **config.__dict__,
+            "semantic_backend": "onnx",
+            "semantic_model_dir": model_dir,
+            "semantic_batch_size": 2,
+        }
+    )
+    backend = OnnxSemanticBackend(config)
+
+    rebuilt = backend.rebuild()
+    results = backend.search(
+        "resume an interrupted download",
+        scope="knowledge",
+        limit=3,
+    )
+
+    assert rebuilt["available"] is True
+    assert rebuilt["indexed_documents"] == 2
+    assert rebuilt["indexed_chunks"] >= 2
+    assert results
+    assert results[0].match_type == "semantic"
+    assert -1.0 <= results[0].score <= 1.0
+
+
+def test_session_only_semantic_request_falls_back_to_keyword(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _search_config(tmp_path, monkeypatch)
+    keyword = KeywordSearchBackend(config)
+    monkeypatch.setattr(
+        keyword,
+        "search",
+        lambda query, scope, limit: [
+            SearchResult(
+                id="session-001",
+                scope="session",
+                title="Session",
+                snippet="Evidence",
+                project="demo",
+                source_session="session-001",
+                score=1.0,
+                match_type="keyword",
+                review_status="ready",
+            )
+        ],
+    )
+
+    class KnowledgeOnlySemantic(FakeSemanticBackend):
+        def supports_scope(self, scope: str) -> bool:
+            return scope != "session"
+
+    service = HybridSearchService(keyword, KnowledgeOnlySemantic())
+    result = service.search("download issue", scope="session", mode="semantic")
+
+    assert result["effective_mode"] == "keyword"
+    assert result["results"][0]["scope"] == "session"
+
+
+def test_semantic_sync_only_rebuilds_changed_documents(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import numpy as np
+
+    config = _search_config(tmp_path, monkeypatch)
+
+    class LightweightOnnx(OnnxSemanticBackend):
+        @property
+        def available(self) -> bool:
+            return True
+
+        def _embed(self, texts):
+            vectors = np.zeros((len(texts), 4), dtype=np.float32)
+            vectors[:, 0] = 1.0
+            return vectors
+
+        def status(self):
+            documents, chunks = self._counts()
+            return {
+                "available": True,
+                "backend": "onnx",
+                "indexed_documents": documents,
+                "indexed_chunks": chunks,
+            }
+
+    backend = LightweightOnnx(config)
+    first = backend.rebuild()
+    unchanged = backend.sync()
+    issue = tmp_path / "wiki" / "issues" / "download-session-001.md"
+    issue.write_text(
+        issue.read_text(encoding="utf-8") + "\n新增验证步骤。\n",
+        encoding="utf-8",
+    )
+    changed = backend.sync()
+
+    assert first["updated_documents"] == 2
+    assert unchanged["updated_documents"] == 0
+    assert changed["updated_documents"] == 1

@@ -15,6 +15,7 @@ from .config import Config, default_config_path, load_config, save_config
 from .converter import convert_export, render_markdown, validate_export
 from .knowledge import store_knowledge
 from .opencode_client import OpenCodeClient, Runner
+from .search import build_search_service
 from .server import import_chatgpt, serve
 
 
@@ -268,11 +269,20 @@ def command_index(args: argparse.Namespace) -> Dict[str, Any]:
         }
     runner = Runner(cfg.secall_command)
     reindex = runner.run("reindex", "--from-vault", timeout=args.timeout)
+    search = build_search_service(cfg)
+    keyword = search.keyword.rebuild()
+    semantic = (
+        search.semantic.rebuild()
+        if search.semantic.available
+        else search.semantic.status()
+    )
     status = runner.run("status", timeout=60)
     return {
         "indexed": True,
         "reindex_output": reindex.stdout.strip(),
         "status": status.stdout.strip(),
+        "keyword": keyword,
+        "semantic": semantic,
     }
 
 

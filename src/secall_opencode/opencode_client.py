@@ -114,6 +114,41 @@ class OpenCodeClient:
         raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
         return extract_generation_text(raw)
 
+    def run_rag_answer(
+        self,
+        context_file: Path,
+        prompt_file: Path,
+        workdir: Path,
+        question: str,
+        model: Optional[str] = None,
+        timeout: int = 600,
+    ) -> str:
+        args = [
+            "run",
+            "--format",
+            "json",
+            "--file",
+            str(context_file),
+            "--file",
+            str(prompt_file),
+            "--dir",
+            str(workdir),
+            "--title",
+            f"seCall RAG: {question[:48]}",
+        ]
+        if model:
+            args.extend(["--model", model])
+        args.append(
+            f"用户问题：{question}\n"
+            "请严格依据附件中的检索证据回答，并保留 [S1] 形式的来源编号。"
+        )
+        raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
+        return extract_marked_text(
+            raw,
+            "<!-- SECALL_RAG_START -->",
+            "<!-- SECALL_RAG_END -->",
+        )
+
 
 def _walk_text(value: Any) -> List[str]:
     texts: List[str] = []
@@ -159,3 +194,23 @@ def extract_generation_text(raw: str) -> str:
     if joined.strip():
         return joined.strip()
     raise ValueError("未能从 OpenCode 输出中提取最终文档。")
+
+
+def extract_marked_text(raw: str, start: str, end: str) -> str:
+    candidates: List[str] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            candidates.append(line)
+            continue
+        candidates.extend(_walk_text(event))
+    joined = "\n".join(candidates)
+    if start in joined and end in joined:
+        return joined.split(start, 1)[1].split(end, 1)[0].strip()
+    if joined.strip():
+        return joined.strip()
+    raise ValueError("未能从 OpenCode 输出中提取 RAG 回答。")

@@ -104,8 +104,9 @@ secall-opencode serve
 - 统一搜索会话、知识卡片和审核通过的 QA；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
-- `keyword`、`semantic`、`hybrid` 三种稳定搜索接口。模型未就绪时，
-  后两种模式会明确降级为关键词检索。
+- BGE-M3 ONNX 本地语义检索与 BM25 混合召回；
+- 带 `[S1]` 来源引用的 OpenCode RAG 知识问答；
+- `keyword`、`semantic`、`hybrid` 三种稳定搜索接口。
 
 搜索接口示例：
 
@@ -113,22 +114,45 @@ secall-opencode serve
 GET /api/search?q=断点续传&scope=all&mode=keyword&limit=20
 ```
 
-语义检索配置已预留在配置文件的 `semantic` 节中：
+安装本地语义检索依赖：
+
+```powershell
+python -m pip install -e ".[semantic]"
+```
+
+在配置文件的 `semantic` 节中启用 BGE-M3：
 
 ```json
 {
   "semantic": {
-    "backend": "none",
-    "model_dir": "C:/Users/USER/.cache/secall/models/bge-m3-onnx",
-    "batch_size": 8,
-    "chunk_size": 1200,
-    "chunk_overlap": 160
+    "backend": "onnx",
+    "model_dir": "D:/Models/bge-m3",
+    "batch_size": 16,
+    "chunk_size": 600,
+    "chunk_overlap": 80
   }
 }
 ```
 
-第一阶段不加载 ONNX 运行库。BGE-M3 下载完成后可在不修改前端接口的
-情况下接入 `OnnxSemanticBackend`。
+运行 `secall-opencode index` 会同步建立关键词索引和 BGE-M3 向量索引。
+知识卡片与已审核 QA 使用 1024 维本地向量；原始 Session 继续使用
+seCall/BM25，以避免大型工具输出导致首次索引耗时过长。`hybrid` 模式会融合
+两类召回结果。
+
+RAG 问答接口：
+
+```text
+POST /api/rag/query
+{
+  "question": "ChatGPT 会话导入后为什么没有生成知识？",
+  "scope": "all",
+  "mode": "hybrid",
+  "limit": 6
+}
+```
+
+接口会先在本地检索证据，再通过已配置的 OpenCode 模型生成带来源编号的回答。
+检索不到证据时不会调用生成模型。
 
 执行完整流水线：
 

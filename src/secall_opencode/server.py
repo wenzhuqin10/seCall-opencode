@@ -23,6 +23,7 @@ from .knowledge_store import (
     update_knowledge_document,
 )
 from .opencode_client import OpenCodeClient, Runner
+from .rag import answer_with_rag
 from .search import HybridSearchService, build_search_service
 
 
@@ -211,7 +212,7 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.3"
+    server_version = "seCallOpenCodeLocal/0.4"
 
     @property
     def config(self) -> Config:
@@ -276,6 +277,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"请求不是有效 JSON：{exc}") from exc
 
+    def _refresh_search(self) -> Dict[str, Any]:
+        keyword = self.search.keyword.rebuild()
+        semantic_sync = getattr(self.search.semantic, "sync", None)
+        semantic = (
+            semantic_sync()
+            if self.search.semantic.available and callable(semantic_sync)
+            else self.search.semantic.status()
+        )
+        return {"keyword": keyword, "semantic": semantic}
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         if self._origin() not in ALLOWED_ORIGINS:
             self._send(HTTPStatus.FORBIDDEN, {"ok": False, "error": {"message": "不允许的来源。"}})
@@ -299,7 +310,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(
                     {
                         "ready": True,
-                        "api_version": "0.3.0",
+                        "api_version": "0.4.0",
                         "vault": str(self.config.vault),
                         "opencode_version": opencode_version,
                         "models": models,
@@ -308,6 +319,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "knowledge": len(knowledge),
                         "qa": len(qa),
                         "pending_qa": sum(item.get("review_status") == "pending" for item in qa),
+                        "semantic": self.search.semantic.status(),
                     }
                 )
             elif parsed.path == "/api/sessions":
@@ -370,19 +382,32 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         overwrite=bool(body.get("overwrite")),
                         timeout=int(body.get("timeout") or 1800),
                     )
-                self.search.keyword.rebuild()
+                self._refresh_search()
                 self._ok(result)
             elif parsed.path == "/api/index":
                 result = Runner(self.config.secall_command).run(
                     "reindex", "--from-vault", timeout=600
                 )
-                search_result = self.search.keyword.rebuild()
+                search_result = self._refresh_search()
                 self._ok(
                     {
                         "indexed": True,
                         "output": result.stdout.strip(),
                         "search": search_result,
                     }
+                )
+            elif parsed.path == "/api/rag/query":
+                self._ok(
+                    answer_with_rag(
+                        self.config,
+                        self.search,
+                        str(body.get("question") or ""),
+                        scope=str(body.get("scope") or "all"),
+                        mode=str(body.get("mode") or "hybrid"),
+                        limit=max(1, min(int(body.get("limit") or 6), 12)),
+                        model=str(body["model"]) if body.get("model") else None,
+                        timeout=int(body.get("timeout") or 600),
+                    )
                 )
             elif parsed.path == "/api/qa/review":
                 qa_id = str(body.get("id") or "")
@@ -399,7 +424,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if not matched:
                     raise FileNotFoundError(f"QA 不存在：{qa_id}")
                 write_qa(self.config, items)
-                self.search.keyword.rebuild()
+                self._refresh_search()
                 self._ok({"id": qa_id, "review_status": status})
             elif (
                 parsed.path.startswith("/api/knowledge/trash/")
@@ -412,7 +437,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     self.config,
                     trash_id.rstrip("/"),
                 )
-                self.search.keyword.rebuild()
+                self._refresh_search()
                 self._ok(restored)
             else:
                 self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
@@ -431,7 +456,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = parsed.path.removeprefix("/api/knowledge/")
             updated = update_knowledge_document(self.config, knowledge_id, body)
-            self.search.keyword.rebuild()
+            self._refresh_search()
             self._ok(updated)
         except FileNotFoundError as exc:
             self._fail(exc, HTTPStatus.NOT_FOUND)
@@ -447,7 +472,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = parsed.path.removeprefix("/api/knowledge/")
             deleted = delete_knowledge_document(self.config, knowledge_id)
-            self.search.keyword.rebuild()
+            self._refresh_search()
             self._ok(deleted)
         except FileNotFoundError as exc:
             self._fail(exc, HTTPStatus.NOT_FOUND)

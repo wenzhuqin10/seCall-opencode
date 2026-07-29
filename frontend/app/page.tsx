@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type View = "overview" | "sessions" | "pipeline" | "knowledge" | "qa" | "diagnostics";
+type View = "overview" | "sessions" | "pipeline" | "knowledge" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
 type SessionItem = {
   id: string; title: string; project: string; model: string; turns: number;
@@ -34,10 +34,19 @@ type SearchResponse = {
   requested_mode: string; effective_mode: string; semantic_available: boolean;
   fallback_reason?: string; count: number; results: SearchResult[];
 };
+type RagResponse = {
+  question: string; answer: string; sources: Array<SearchResult & { citation: string }>;
+  requested_mode: string; effective_mode: string; semantic_available: boolean;
+  fallback_reason?: string; grounded: boolean;
+};
 type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
   knowledge: number; qa: number; pending_qa: number;
+  semantic?: {
+    available: boolean; backend: string; model_dir: string;
+    indexed_documents: number; indexed_chunks: number; reason?: string;
+  };
 };
 
 const demoSessions: SessionItem[] = [
@@ -78,6 +87,7 @@ const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
   { id: "sessions", label: "会话", icon: "◫", badge: "12" },
   { id: "pipeline", label: "流水线", icon: "⌘", badge: "1" },
   { id: "knowledge", label: "知识库", icon: "◇" },
+  { id: "rag", label: "RAG 问答", icon: "✦" },
   { id: "qa", label: "QA 审核", icon: "✓", badge: "18" },
   { id: "diagnostics", label: "环境诊断", icon: "+" },
 ];
@@ -100,7 +110,7 @@ function MiniBars() {
 export default function Home() {
   const [active, setActive] = useState<View>("overview");
   const [query, setQuery] = useState("");
-  const [searchMode, setSearchMode] = useState<"keyword" | "semantic" | "hybrid">("keyword");
+  const [searchMode, setSearchMode] = useState<"keyword" | "semantic" | "hybrid">("hybrid");
   const [searchScope, setSearchScope] = useState<"all" | "session" | "knowledge" | "qa">("all");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -125,6 +135,11 @@ export default function Home() {
   const [savingKnowledge, setSavingKnowledge] = useState(false);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [showTrash, setShowTrash] = useState(false);
+  const [ragQuestion, setRagQuestion] = useState("");
+  const [ragScope, setRagScope] = useState<"all" | "session" | "knowledge" | "qa">("all");
+  const [ragMode, setRagMode] = useState<"keyword" | "semantic" | "hybrid">("hybrid");
+  const [ragLoading, setRagLoading] = useState(false);
+  const [ragResult, setRagResult] = useState<RagResponse | null>(null);
 
   const refreshData = async () => {
     const [healthResult, sessionResult, qaResult, knowledgeResult] = await Promise.all([
@@ -297,13 +312,40 @@ export default function Home() {
 
   const refreshIndex = async () => {
     try {
-      const result = await apiRequest<{ search: { indexed: number } }>("/api/index", {
+      const result = await apiRequest<{ search: { keyword: { indexed: number }; semantic: { indexed_chunks: number } } }>("/api/index", {
         method: "POST",
         body: "{}",
       });
-      notify("索引已刷新", `已同步 ${result.search.indexed} 份知识与审核通过的 QA`);
+      await refreshData();
+      notify("索引已刷新", `关键词 ${result.search.keyword.indexed} 份，向量 ${result.search.semantic.indexed_chunks} 个分块`);
     } catch (error) {
       notify("索引刷新失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const askRag = async () => {
+    const question = ragQuestion.trim();
+    if (question.length < 2) {
+      notify("请输入问题", "问题至少需要两个字符");
+      return;
+    }
+    setRagLoading(true);
+    setRagResult(null);
+    try {
+      const result = await apiRequest<RagResponse>("/api/rag/query", {
+        method: "POST",
+        body: JSON.stringify({
+          question,
+          scope: ragScope,
+          mode: ragMode,
+          limit: 6,
+        }),
+      });
+      setRagResult(result);
+    } catch (error) {
+      notify("RAG 问答失败", error instanceof Error ? error.message : "请检查本地模型与 OpenCode");
+    } finally {
+      setRagLoading(false);
     }
   };
 
@@ -450,8 +492,8 @@ export default function Home() {
                   ))}</div>
                   <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as typeof searchMode)} aria-label="检索模式">
                     <option value="keyword">关键词</option>
-                    <option value="semantic">语义（暂不可用）</option>
-                    <option value="hybrid">混合（暂不可用）</option>
+                    <option value="semantic">语义{health?.semantic?.available ? "" : "（暂不可用）"}</option>
+                    <option value="hybrid">混合{health?.semantic?.available ? "" : "（降级）"}</option>
                   </select>
                 </div>
                 {searchFallback && <p className="search-fallback">◇ {searchFallback}</p>}
@@ -626,6 +668,62 @@ export default function Home() {
             </section>
           )}
 
+          {active === "rag" && (
+            <section className="subpage rag-page">
+              <div className="subpage-heading">
+                <div><p className="eyebrow">LOCAL RETRIEVAL AUGMENTED GENERATION</p><h1>RAG 知识问答</h1><p>由 BGE-M3 从本地会话、知识卡片和已审核 QA 中召回证据，再交给 OpenCode 生成可追溯回答。</p></div>
+                <div className={`semantic-state ${health?.semantic?.available ? "ready" : ""}`}>
+                  <i /><span><strong>{health?.semantic?.available ? "BGE-M3 已就绪" : "语义模型未就绪"}</strong><small>{health?.semantic?.indexed_chunks ?? 0} 个向量分块</small></span>
+                </div>
+              </div>
+              <div className="rag-layout">
+                <article className="rag-composer">
+                  <div className="rag-mode-row">
+                    <label>检索范围
+                      <select value={ragScope} onChange={(event) => setRagScope(event.target.value as typeof ragScope)}>
+                        <option value="all">全部知识</option><option value="session">研发会话</option><option value="knowledge">知识卡片</option><option value="qa">已审核 QA</option>
+                      </select>
+                    </label>
+                    <label>召回方式
+                      <select value={ragMode} onChange={(event) => setRagMode(event.target.value as typeof ragMode)}>
+                        <option value="hybrid">混合检索</option><option value="semantic">语义检索</option><option value="keyword">关键词检索</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label className="rag-question">
+                    <span>向本地知识库提问</span>
+                    <textarea value={ragQuestion} onChange={(event) => setRagQuestion(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void askRag(); }} placeholder="例如：ChatGPT 会话导入后为什么没有生成知识库内容？" />
+                  </label>
+                  <div className="rag-submit"><small>Ctrl / Cmd + Enter 发送</small><button className="primary-button" disabled={ragLoading} onClick={() => void askRag()}>{ragLoading ? "正在检索并生成…" : "✦ 开始问答"}</button></div>
+                </article>
+                <aside className="rag-index-card">
+                  <p className="eyebrow">RETRIEVAL INDEX</p><h3>本地语义索引</h3>
+                  <div><span>模型</span><strong>BGE-M3 ONNX</strong></div>
+                  <div><span>文档</span><strong>{health?.semantic?.indexed_documents ?? 0}</strong></div>
+                  <div><span>分块</span><strong>{health?.semantic?.indexed_chunks ?? 0}</strong></div>
+                  <div><span>维度</span><strong>1024</strong></div>
+                  <button onClick={() => void refreshIndex()}>↻ 重建混合索引</button>
+                </aside>
+              </div>
+              {ragLoading && <div className="rag-thinking"><span>✦</span><div><strong>正在组织回答</strong><small>BGE-M3 已完成召回，OpenCode 正在基于证据生成内容…</small></div></div>}
+              {ragResult && (
+                <section className="rag-answer">
+                  <header><div><p className="eyebrow">GROUNDED ANSWER</p><h2>{ragResult.question}</h2></div><span className={ragResult.grounded ? "grounded" : ""}>{ragResult.grounded ? "✓ 有证据支撑" : "证据不足"}</span></header>
+                  {ragResult.fallback_reason && <p className="search-fallback">◇ {ragResult.fallback_reason}</p>}
+                  <div className="rag-answer-text">{ragResult.answer}</div>
+                  <div className="rag-sources">
+                    <h3>引用来源 <span>{ragResult.sources.length}</span></h3>
+                    {ragResult.sources.map((source) => (
+                      <button key={`${source.scope}-${source.id}`} onClick={() => openSearchResult(source)}>
+                        <b>[{source.citation}]</b><span><strong>{source.title}</strong><small>{source.snippet}</small><em>{source.project} · {source.match_type}</em></span><i>›</i>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              )}
+            </section>
+          )}
+
           {active === "qa" && (
             <section className="subpage">
               <div className="subpage-heading"><div><p className="eyebrow">HUMAN IN THE LOOP</p><h1>QA 审核队列</h1><p>核验证据与答案，只让可信知识进入正式索引。</p></div><div className="review-count"><strong>{qaItems.filter((q) => q.state === "pending").length}</strong><span>条待审核</span></div></div>
@@ -655,7 +753,7 @@ export default function Home() {
                   ["seCall Core", "本地", apiConnected ? "索引与 Vault 连接正常" : "等待本地 API", "127.0.0.1:8765"],
                   ["SQLite / FTS5", `${health?.sessions ?? 0} Sessions`, "全文索引状态健康", "index.sqlite"],
                   ["本地 Vault", "2.4 GB", "读写权限与目录结构正常", "Documents/seCallVault"],
-                  ["适配器", "0.1.0", "7 项自动化检查通过", "secall-opencode doctor"],
+                  ["适配器", health?.api_version ?? "0.4.0", "本地 RAG 与知识管理接口正常", "secall-opencode doctor"],
                 ].map(([name, version, desc, command]) => (
                   <article key={name}><div><span>{name.slice(0, 2)}</span><i /></div><h3>{name}</h3><strong>{version}</strong><p>{desc}</p><code>{command}</code></article>
                 ))}

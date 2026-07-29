@@ -10,3 +10,4 @@ build/
 exports/
 generated/
 .frontend-git-backup/
+.local-api.*.log

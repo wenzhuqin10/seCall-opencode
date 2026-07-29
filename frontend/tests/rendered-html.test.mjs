@@ -48,8 +48,11 @@ test("contains search and knowledge management contracts", async () => {
   assert.match(page, /\/api\/knowledge\/trash/);
   assert.match(page, /method:\s*"PUT"/);
   assert.match(page, /method:\s*"DELETE"/);
+  assert.match(page, /\/api\/rag\/query/);
+  assert.match(page, /RAG 知识问答/);
   assert.match(page, /Ctrl K/);
   assert.match(layout, /title:\s*"seCall OpenCode Studio"/);
   assert.match(css, /\.search-popover/);
   assert.match(css, /\.knowledge-drawer/);
+  assert.match(css, /\.rag-answer/);
 });
