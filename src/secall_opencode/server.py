@@ -27,11 +27,12 @@ from .rag import answer_with_rag
 from .search import HybridSearchService, build_search_service
 from .session_review_store import (
     annotate_sessions,
-    get_session_review,
     hide_session,
     restore_session,
     update_session_review,
 )
+from .session_lifecycle import iter_session_files, migrate_legacy_sessions, move_session_file
+from .session_sync import SessionSyncWorker
 from .wiki_store import graph_snapshot, list_wiki_pages, read_wiki_page, rebuild_graph
 
 
@@ -110,12 +111,16 @@ def list_vault_sessions(
     *,
     include_hidden: bool = False,
 ) -> List[Dict[str, Any]]:
-    root = config.vault / "raw" / ".sessions"
-    if not root.exists():
+    files_with_state = list(iter_session_files(config))
+    if not files_with_state:
         return []
     result: List[Dict[str, Any]] = []
-    files = sorted(root.rglob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for path in files[:1000]:
+    files = sorted(
+        files_with_state,
+        key=lambda item: item[1].stat().st_mtime,
+        reverse=True,
+    )
+    for storage_state, path in files[:1000]:
         text = path.read_text(encoding="utf-8", errors="replace")
         meta = _frontmatter(text)
         title_match = re.search(r"(?m)^#\s+(.+)$", text)
@@ -132,6 +137,7 @@ def list_vault_sessions(
                 "date": meta.get("date") or "",
                 "path": str(path),
                 "updated": int(path.stat().st_mtime * 1000),
+                "storage_state": storage_state,
             }
         )
     annotated = annotate_sessions(config, result, include_hidden=include_hidden)
@@ -250,6 +256,7 @@ def import_chatgpt(
             conversation.as_export(project),
             config.vault,
             overwrite=overwrite,
+            destination_dir="staging/sessions",
         )
         results.append(converted.as_dict())
     return {
@@ -271,10 +278,9 @@ def run_session_pipeline(
     match = next((item for item in sessions if item["id"] == session_id), None)
     if not match:
         raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
-    review = get_session_review(config, session_id)
-    if review["hidden"]:
+    if match["hidden"]:
         raise ValueError("该会话已在前端隐藏，请先恢复后再运行流水线。")
-    if review["review_status"] != "approved":
+    if match["review_status"] != "approved" or match["storage_state"] != "approved":
         raise ValueError("该会话尚未通过预审核，只有“已通过”的会话可以运行流水线。")
     session_path = _safe_vault_path(config.vault, Path(match["path"]))
     prompt = Path(__file__).parent / "prompts" / "issue-card.md"
@@ -416,6 +422,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "pending_qa": sum(item.get("review_status") == "pending" for item in qa),
                         "wiki": wiki["count"],
                         "graph": graph["stats"],
+                        "sync": self.server.sync_worker.status(),  # type: ignore[attr-defined]
                         "semantic": self.search.semantic.status(),
                     }
                 )
@@ -470,6 +477,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/search/status":
                 self._ok(self.search.semantic.status())
+            elif parsed.path == "/api/sync/status":
+                self._ok(self.server.sync_worker.status())  # type: ignore[attr-defined]
             else:
                 self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
         except FileNotFoundError as exc:
@@ -522,6 +531,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "search": search_result,
                     }
                 )
+            elif parsed.path == "/api/sync/now":
+                self._ok(self.server.sync_worker.scan(force=True))  # type: ignore[attr-defined]
             elif parsed.path == "/api/rag/query":
                 self._ok(
                     answer_with_rag(
@@ -553,10 +564,19 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 }
                 if session_id not in known:
                     raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+                requested_status = str(body.get("status") or "")
+                target_state = {
+                    "approved": "approved",
+                    "rejected": "rejected",
+                    "pending": "pending",
+                }.get(requested_status)
+                if target_state is None:
+                    raise ValueError("审核状态必须是 pending、approved 或 rejected。")
+                move_session_file(self.config, session_id, target_state)
                 result = update_session_review(
                     self.config,
                     session_id,
-                    str(body.get("status") or ""),
+                    requested_status,
                     str(body.get("note") or ""),
                 )
                 self._refresh_search()
@@ -633,14 +653,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/sessions/"):
                 session_id = unquote(parsed.path.removeprefix("/api/sessions/"))
                 known = {
-                    item["id"]
+                    item["id"]: item
                     for item in list_vault_sessions(
                         self.config, limit=1000, include_hidden=True
                     )
                 }
                 if session_id not in known:
                     raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
-                hidden = hide_session(self.config, session_id)
+                hidden = hide_session(
+                    self.config,
+                    session_id,
+                    str(known[session_id].get("review_status") or "pending"),
+                )
                 self._refresh_search()
                 self._ok(hidden)
                 return
@@ -663,17 +687,27 @@ class LocalAPIServer(ThreadingHTTPServer):
         super().__init__(address, LocalAPIHandler)
         self.config = config
         self.search = build_search_service(config)
+        self.sync_worker = SessionSyncWorker(config)
 
 
 def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("本地 API 默认只允许绑定回环地址。")
+    migration = migrate_legacy_sessions(config)
+    if migration.get("staged"):
+        try:
+            Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
+        except Exception as exc:
+            print(f"迁移后的 seCall 索引刷新失败，可稍后在前端手动重建：{exc}")
     server = LocalAPIServer((host, port), config)
+    server.sync_worker.start()
     print(f"seCall OpenCode Local API: http://{host}:{port}")
+    print(f"会话生命周期迁移：{migration}")
     print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        server.sync_worker.stop()
         server.server_close()

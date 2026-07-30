@@ -71,13 +71,17 @@ def annotate_sessions(
     result: List[Dict[str, Any]] = []
     for session in sessions:
         item = records.get(str(session["id"]), {})
+        default_status = {
+            "approved": "approved",
+            "rejected": "rejected",
+        }.get(str(session.get("storage_state") or ""), "pending")
         hidden = bool(item.get("hidden", False))
         if hidden and not include_hidden:
             continue
         result.append(
             {
                 **session,
-                "review_status": str(item.get("review_status") or "pending"),
+                "review_status": str(item.get("review_status") or default_status),
                 "review_note": str(item.get("review_note") or ""),
                 "hidden": hidden,
                 "reviewed_at": str(item.get("reviewed_at") or ""),
@@ -107,13 +111,17 @@ def update_session_review(
     return {"id": session_id, **get_session_review(config, session_id)}
 
 
-def hide_session(config: Config, session_id: str) -> Dict[str, Any]:
+def hide_session(
+    config: Config,
+    session_id: str,
+    current_status: str = "pending",
+) -> Dict[str, Any]:
     session_id = _validate_session_id(session_id)
     records = _load(config)
     current = records.get(session_id, {})
     records[session_id] = {
         **current,
-        "review_status": str(current.get("review_status") or "pending"),
+        "review_status": str(current.get("review_status") or current_status),
         "review_note": str(current.get("review_note") or ""),
         "hidden": True,
         "hidden_at": datetime.now(timezone.utc).isoformat(),

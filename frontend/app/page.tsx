@@ -9,6 +9,7 @@ type SessionItem = {
   updated: string; status: string; source?: string; path?: string;
   review_status?: "pending" | "approved" | "rejected";
   review_note?: string; hidden?: boolean; reviewed_at?: string;
+  storage_state?: "pending" | "approved" | "rejected";
 };
 type SessionDetail = SessionItem & {
   metadata: Record<string, string>; markdown: string; full_length: number; truncated: boolean;
@@ -72,6 +73,10 @@ type Health = {
   models: string[]; configured_model?: string; sessions: number;
   knowledge: number; qa: number; pending_qa: number;
   wiki?: number; graph?: { nodes: number; links: number; types: Record<string, number> };
+  sync?: {
+    running: boolean; syncing: boolean; last_checked: string; last_synced: string;
+    synced_total: number; pending_changes: number; last_error: string;
+  };
   semantic?: {
     available: boolean; backend: string; model_dir: string;
     indexed_documents: number; indexed_chunks: number; reason?: string;
@@ -113,13 +118,13 @@ function formatUpdated(value: number | string): string {
 
 const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
   { id: "overview", label: "总览", icon: "⌂" },
-  { id: "sessions", label: "会话", icon: "◫", badge: "12" },
+  { id: "sessions", label: "会话", icon: "◫" },
   { id: "pipeline", label: "流水线", icon: "⌘", badge: "1" },
   { id: "knowledge", label: "知识库", icon: "◇" },
   { id: "wiki", label: "Wiki 中心", icon: "▤" },
   { id: "graph", label: "知识关系图", icon: "◎" },
   { id: "rag", label: "RAG 问答", icon: "✦" },
-  { id: "qa", label: "QA 审核", icon: "✓", badge: "18" },
+  { id: "qa", label: "QA 审核", icon: "✓" },
   { id: "diagnostics", label: "环境诊断", icon: "+" },
 ];
 
@@ -231,6 +236,7 @@ export default function Home() {
   const [sessionReviewFilter, setSessionReviewFilter] = useState<"all" | "pending" | "approved" | "rejected" | "hidden">("all");
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
   const [sessionPreviewLoading, setSessionPreviewLoading] = useState(false);
+  const [syncingSessions, setSyncingSessions] = useState(false);
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
   const [health, setHealth] = useState<Health | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
@@ -284,6 +290,7 @@ export default function Home() {
       review_note: String(item.review_note ?? ""),
       hidden: Boolean(item.hidden),
       reviewed_at: String(item.reviewed_at ?? ""),
+      storage_state: String(item.storage_state ?? "pending") as SessionItem["storage_state"],
     });
     const normalizedSessions = sessionResult.map(normalizeSession);
     const normalizedHiddenSessions = hiddenSessionResult.map(normalizeSession);
@@ -390,6 +397,12 @@ export default function Home() {
   );
   const currentSession = sessionItems.find((item) => item.id === selectedSession) ?? sessionItems[0];
   const pipelineSession = approvedSessions.find((item) => item.id === selectedSession) ?? approvedSessions[0];
+  const hour = new Date().getHours();
+  const greeting = hour >= 5 && hour < 12 ? "早上好" : hour < 14 ? "中午好" : hour < 18 ? "下午好" : "晚上好";
+  const today = new Date();
+  const todayDay = today.getDate();
+  const todayWeekday = new Intl.DateTimeFormat("zh-CN", { weekday: "long" }).format(today);
+  const todayMonth = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(today);
   const filteredWiki = useMemo(
     () => wikiPages.filter((page) => (
       (wikiCategory === "all" || page.category === wikiCategory)
@@ -447,6 +460,25 @@ export default function Home() {
     }
   };
 
+  const syncOpenCodeSessions = async () => {
+    setSyncingSessions(true);
+    try {
+      const result = await apiRequest<{ synced: number; pending_changes: number; last_error: string }>("/api/sync/now", {
+        method: "POST",
+        body: "{}",
+      });
+      await refreshData();
+      notify(
+        "OpenCode 会话同步完成",
+        result.last_error ? result.last_error : `新增或更新 ${result.synced} 条，等待稳定 ${result.pending_changes} 条`,
+      );
+    } catch (error) {
+      notify("会话同步失败", error instanceof Error ? error.message : "请检查 OpenCode");
+    } finally {
+      setSyncingSessions(false);
+    }
+  };
+
   const reviewSession = async (
     session: SessionItem,
     status: "pending" | "approved" | "rejected",
@@ -461,7 +493,7 @@ export default function Home() {
       });
       await refreshData();
       setSessionDetail((detail) => detail?.id === session.id
-        ? { ...detail, review_status: status, review_note: note }
+        ? { ...detail, review_status: status, review_note: note, storage_state: status }
         : detail);
       notify(
         status === "approved" ? "会话已通过预审核" : status === "rejected" ? "会话已拒绝" : "会话已退回待审核",
@@ -706,12 +738,19 @@ export default function Home() {
         </div>
         <nav className="main-nav" aria-label="主导航">
           <p>工作台</p>
-          {navItems.map((item) => (
-            <button key={item.id} className={active === item.id ? "active" : ""} onClick={() => setActive(item.id)}>
-              <span className="nav-icon">{item.icon}</span>{item.label}
-              {item.badge && <em>{item.badge}</em>}
-            </button>
-          ))}
+          {navItems.map((item) => {
+            const badge = item.id === "sessions"
+              ? String(health?.sessions ?? sessionItems.length)
+              : item.id === "qa"
+                ? String(qaItems.filter((item) => item.state === "pending").length)
+                : item.badge;
+            return (
+              <button key={item.id} className={active === item.id ? "active" : ""} onClick={() => setActive(item.id)}>
+                <span className="nav-icon">{item.icon}</span>{item.label}
+                {badge && <em>{badge}</em>}
+              </button>
+            );
+          })}
         </nav>
         <div className="sidebar-bottom">
           <div className="local-card">
@@ -780,14 +819,14 @@ export default function Home() {
           {active === "overview" && (
             <>
               <section className="page-heading">
-                <div><p className="eyebrow">KNOWLEDGE OPERATIONS</p><h1>早上好，Qin <span>✦</span></h1><p>你的本地知识系统运行稳定，今天已有 <b>12</b> 个会话完成沉淀。</p></div>
-                <div className="date-chip"><span>28</span><div><strong>星期二</strong><small>2026 年 7 月</small></div></div>
+                <div><p className="eyebrow">KNOWLEDGE OPERATIONS</p><h1>{greeting}，Qin <span>✦</span></h1><p>你的本地知识系统运行稳定，当前共有 <b>{health?.sessions ?? sessionItems.length}</b> 个可审核会话。</p></div>
+                <div className="date-chip"><span>{todayDay}</span><div><strong>{todayWeekday}</strong><small>{todayMonth}</small></div></div>
               </section>
 
               <section className="metric-grid">
                 <article className="metric-card dark">
                   <div className="metric-top"><span className="metric-icon">⌘</span><em>+12.4%</em></div>
-                  <strong>{health?.sessions ?? sessionItems.length}</strong><p>已归档会话</p>
+                  <strong>{approvedSessions.length}</strong><p>已审核入库</p>
                   <div className="sparkline"><i /><i /><i /><i /><i /><i /><i /></div>
                 </article>
                 <article className="metric-card">
@@ -795,7 +834,7 @@ export default function Home() {
                   <strong>{health?.knowledge ?? knowledgeItems.length}</strong><p>Issue Cards</p><MiniBars />
                 </article>
                 <article className="metric-card">
-                  <div className="metric-top"><span className="metric-icon mint">✓</span><span className="tiny-label">待处理 18</span></div>
+                  <div className="metric-top"><span className="metric-icon mint">✓</span><span className="tiny-label">待处理 {qaItems.filter((item) => item.state === "pending").length}</span></div>
                   <strong>{health?.qa ?? qaItems.length}</strong><p>QA 问答对</p>
                   <div className="progress-line"><span style={{ width: "78%" }} /></div>
                 </article>
@@ -861,13 +900,20 @@ export default function Home() {
 
           {active === "sessions" && (
             <section className="subpage">
-              <div className="subpage-heading"><div><p className="eyebrow">SESSION PRE-REVIEW</p><h1>研发会话</h1><p>先审核会话质量，再进入知识流水线；隐藏操作不会删除 OpenCode 原始会话。</p></div><div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div></div>
+              <div className="subpage-heading">
+                <div><p className="eyebrow">SESSION PRE-REVIEW</p><h1>研发会话</h1><p>OpenCode 新会话自动进入暂存区；审核通过后才进入正式 Vault 和知识流水线。</p></div>
+                <div className="session-heading-actions">
+                  <span className={`sync-state ${health?.sync?.running ? "running" : ""}`}><i />{health?.sync?.syncing ? "正在监听…" : health?.sync?.running ? "实时监听中" : "监听未启动"}</span>
+                  <button className="secondary-button" onClick={() => void syncOpenCodeSessions()} disabled={syncingSessions}>↻ {syncingSessions ? "同步中…" : "立即同步"}</button>
+                  <div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div>
+                </div>
+              </div>
               <div className="session-review-summary">
                 <article><span className="pending">●</span><strong>{sessionItems.filter((item) => item.review_status === "pending").length}</strong><small>待预审核</small></article>
                 <article><span className="approved">●</span><strong>{sessionItems.filter((item) => item.review_status === "approved").length}</strong><small>已通过</small></article>
                 <article><span className="rejected">●</span><strong>{sessionItems.filter((item) => item.review_status === "rejected").length}</strong><small>已拒绝</small></article>
                 <article><span className="hidden">●</span><strong>{hiddenSessionItems.length}</strong><small>前端隐藏</small></article>
-                <p><b>安全说明</b> 审核和隐藏仅影响当前知识工作台，不修改 OpenCode 数据库和原始 Session Markdown。</p>
+                <p><b>会话生命周期</b> 待审核存放在暂存区；通过后移入正式 Vault；拒绝后移入隔离区。OpenCode 原始数据始终不变。</p>
               </div>
               <div className="filter-bar review-filter">
                 {([
@@ -1191,7 +1237,7 @@ export default function Home() {
               <div>
                 <p className="eyebrow">READ-ONLY SESSION PREVIEW</p>
                 <h2 id="session-preview-title">{sessionDetail.title}</h2>
-                <small>{sessionDetail.id} · {sessionDetail.project} · {sessionDetail.turns} 轮</small>
+                <small>{sessionDetail.id} · {sessionDetail.project} · {sessionDetail.turns} 轮 · {{ pending: "暂存区", approved: "正式 Vault", rejected: "拒绝隔离区" }[sessionDetail.storage_state ?? "pending"]}</small>
               </div>
               <ReviewPill status={sessionDetail.review_status} />
               <button onClick={() => setSessionDetail(null)} aria-label="关闭会话预览">×</button>

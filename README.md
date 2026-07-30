@@ -48,7 +48,9 @@ ChatGPT conversations.json
 原始 Session 与生成知识分别写入：
 
 ```text
-<vault>/raw/.sessions/YYYY-MM-DD/
+<vault>/staging/sessions/YYYY-MM-DD/   # 自动同步、等待预审核
+<vault>/raw/.sessions/YYYY-MM-DD/      # 预审核通过、正式 Vault
+<vault>/staging/rejected/YYYY-MM-DD/   # 预审核拒绝、隔离保留
 <vault>/wiki/issues/
 <vault>/knowledge/qa/candidates.jsonl
 ```
@@ -104,6 +106,7 @@ secall-opencode serve
 - 统一搜索会话、知识卡片和审核通过的 QA；
 - 只读会话内容预览、辅助质量信号、预审核和低质会话拒绝；
 - 不删除 OpenCode 原始数据的前端隐藏与恢复；
+- OpenCode 会话后台增量监听、稳定窗口和手动立即同步；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
 - Wiki 知识中心，按总览、项目、主题、决策和问题定位分类浏览；
@@ -165,6 +168,15 @@ POST   /api/sessions/{id}/restore
 会话必须通过预审核后才能运行知识流水线。被拒绝或隐藏的会话不会出现在
 工作台检索与 RAG 会话召回中；这些操作不会删除 OpenCode 数据库或 Vault 中的
 原始 Session Markdown。
+
+本地 API 启动后每 10 秒只读检查 OpenCode 会话更新时间。新增或发生变化的
+会话在停止更新 20 秒后自动同步到暂存区；已通过会话再次发生变化时会退回
+暂存区重新审核。可通过以下接口查看状态或立即同步：
+
+```text
+GET  /api/sync/status
+POST /api/sync/now
+```
 
 RAG 问答接口：
 

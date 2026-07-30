@@ -247,13 +247,14 @@ def convert_export(
     vault: Path,
     dry_run: bool = False,
     overwrite: bool = False,
+    destination_dir: str = "raw/.sessions",
 ) -> ConversionResult:
     markdown, meta = render_markdown(data)
     info = _dict(data.get("info"))
     source = _safe_name(str(info.get("source") or info.get("agent") or "opencode"))
     short_id = _safe_name(meta["session_id"])[:16]
     filename = f"{source}_{_safe_name(meta['project'])}_{short_id}.md"
-    output_path = vault / "raw" / ".sessions" / meta["date"] / filename
+    output_path = vault / destination_dir / meta["date"] / filename
     exists = output_path.exists()
     if exists and not overwrite:
         existing = output_path.read_text(encoding="utf-8")

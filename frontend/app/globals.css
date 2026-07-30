@@ -250,6 +250,12 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .session-review-summary article small { align-self: start; margin-top: 4px; color: #98939e; font-size: 7px; }
 .session-review-summary > p { margin: 0; padding: 11px 15px; align-content: center; border: 1px solid #e3def1; border-radius: 12px; color: #716b78; background: linear-gradient(135deg, #faf8ff, #fff); font-size: 8px; line-height: 1.65; }
 .session-review-summary > p b { display: block; margin-bottom: 2px; color: #5c48b7; }
+.session-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.session-heading-actions .import-actions { margin-left: 3px; }
+.sync-state { display: inline-flex; align-items: center; gap: 6px; padding: 8px 10px; border: 1px solid #e0dce5; border-radius: 9px; color: #8b8591; background: white; font-size: 8px; white-space: nowrap; }
+.sync-state i { width: 6px; height: 6px; border-radius: 50%; background: #aaa4ae; }
+.sync-state.running { color: #318653; border-color: #c5e4d0; background: #f4fbf7; }
+.sync-state.running i { background: #43ba72; box-shadow: 0 0 0 4px #43ba7218; }
 .review-filter { padding: 0 3px; }
 .session-review-row { grid-template-columns: minmax(250px, 2fr) 100px 55px 95px 90px minmax(240px, 1.3fr); min-width: 940px; }
 .session-review-row:not(.table-head) { cursor: pointer; }
@@ -616,6 +622,7 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .session-review-summary { grid-template-columns: repeat(2, 1fr); }
   .session-quality-panel { grid-template-columns: 72px 1fr; }
   .session-quality-panel dl { grid-column: 1 / -1; grid-template-columns: repeat(4, 1fr); }
+  .session-heading-actions { flex-wrap: wrap; }
 }
 @media (max-width: 650px) {
   .sidebar { display: none; }
@@ -673,4 +680,6 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .session-preview-content { padding: 22px 17px 45px; }
   .session-preview-drawer > footer { flex-wrap: wrap; padding: 10px 14px; }
   .session-preview-drawer > footer > span { width: 100%; flex-basis: 100%; }
+  .session-heading-actions { align-items: flex-end; flex-direction: column; }
+  .sync-state { display: none; }
 }
