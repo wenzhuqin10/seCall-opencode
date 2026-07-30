@@ -539,7 +539,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/graph":
                 self._ok(graph_snapshot(self.config))
             elif parsed.path.startswith("/api/knowledge/"):
-                knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+                knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))
                 self._ok(read_knowledge_document(self.config, knowledge_id))
             elif parsed.path == "/api/qa":
                 self._ok(read_qa(self.config)[: max(1, min(limit, 1000))])
@@ -726,7 +726,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 )
                 restored = restore_knowledge_document(
                     self.config,
-                    trash_id.rstrip("/"),
+                    unquote(trash_id.rstrip("/")),
                 )
                 self._refresh_search()
                 self._ok(restored)
@@ -745,7 +745,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 raise ValueError("请求体必须是 JSON 对象。")
             if not parsed.path.startswith("/api/knowledge/"):
                 raise FileNotFoundError("接口不存在。")
-            knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+            knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))
             updated = update_knowledge_document(self.config, knowledge_id, body)
             self._refresh_search()
             self._ok(updated)
@@ -779,7 +779,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 return
             if not parsed.path.startswith("/api/knowledge/"):
                 raise FileNotFoundError("接口不存在。")
-            knowledge_id = parsed.path.removeprefix("/api/knowledge/")
+            knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))
             deleted = delete_knowledge_document(self.config, knowledge_id)
             self._refresh_search()
             self._ok(deleted)

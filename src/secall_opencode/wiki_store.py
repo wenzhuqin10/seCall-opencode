@@ -228,7 +228,8 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("知识图谱快照格式无效。")
     nodes = value.get("nodes") if isinstance(value.get("nodes"), list) else []
-    links = value.get("links") if isinstance(value.get("links"), list) else []
+    raw_links = value.get("links") if isinstance(value.get("links"), list) else []
+    links = [dict(item) for item in raw_links if isinstance(item, dict)]
 
     session_meta: Dict[str, Dict[str, str]] = {}
     session_root = config.vault / "raw" / ".sessions"
@@ -261,7 +262,7 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
                 node["label"] = metadata["title"]
                 node["project"] = metadata["project"]
     for link in links:
-        if not isinstance(link, dict) or link.get("relation") != "belongs_to":
+        if link.get("relation") != "belongs_to":
             continue
         source = str(link.get("source") or "")
         target = str(link.get("target") or "")
@@ -269,6 +270,53 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
         metadata = session_meta.get(session_id)
         if metadata and target in node_map:
             node_map[target]["label"] = metadata["project"]
+
+    existing_links = {
+        (
+            str(link.get("source") or ""),
+            str(link.get("target") or ""),
+            str(link.get("relation") or ""),
+        )
+        for link in links
+    }
+    for page in iter_wiki_pages(config):
+        if page["category"] != "issues":
+            continue
+        issue_id = f"issue:{page['slug']}"
+        project_id = f"project:{page['project']}"
+        node_map[issue_id] = {
+            "id": issue_id,
+            "label": page["title"],
+            "type": "issue",
+            "project": page["project"],
+            "source_session": page["source_session"],
+            "wiki_id": page["id"],
+        }
+        if project_id not in node_map:
+            node_map[project_id] = {
+                "id": project_id,
+                "label": page["project"],
+                "type": "project",
+            }
+        derived_edges = [
+            (issue_id, project_id, "belongs_to"),
+        ]
+        session_id = f"session:{page['source_session']}"
+        if page["source_session"] and session_id in node_map:
+            derived_edges.append((issue_id, session_id, "derived_from"))
+        for source, target, relation in derived_edges:
+            if (source, target, relation) in existing_links:
+                continue
+            links.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "relation": relation,
+                    "confidence": "DERIVED",
+                    "weight": 1.0,
+                }
+            )
+            existing_links.add((source, target, relation))
 
     return {
         "directed": bool(value.get("directed", True)),

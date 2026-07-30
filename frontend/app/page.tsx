@@ -196,7 +196,7 @@ function graphPositions(nodes: GraphNode[]) {
     const type = node.type || "other";
     groups.set(type, [...(groups.get(type) || []), node]);
   });
-  const radii: Record<string, number> = { agent: 70, project: 170, tool: 265, session: 370 };
+  const radii: Record<string, number> = { agent: 70, project: 170, tool: 255, issue: 320, session: 390 };
   const fallback = 300;
   const positions = new Map<string, { x: number; y: number }>();
   Array.from(groups.entries()).forEach(([type, items], groupIndex) => {
@@ -337,6 +337,15 @@ export default function Home() {
     setWikiPages(wikiResult.pages);
     setWikiCounts(wikiResult.counts);
     setGraph(graphResult);
+    setKnowledgeDetail((current) => (
+      current && !knowledgeResult.some((item) => item.id === current.id) ? null : current
+    ));
+    setWikiDetail((current) => (
+      current && !wikiResult.pages.some((item) => item.id === current.id) ? null : current
+    ));
+    setGraphSelected((current) => (
+      current && !graphResult.nodes.some((item) => item.id === current.id) ? null : current
+    ));
     setApiConnected(true);
     if (normalizedSessions.length && !normalizedSessions.some((item) => item.id === selectedSession)) {
       setSelectedSession(normalizedSessions[0].id);
@@ -575,7 +584,7 @@ export default function Home() {
       setKnowledgeDetail(updated);
       setEditingKnowledge(false);
       await refreshData();
-      notify("知识卡片已保存", "关键词索引已同步更新");
+      notify("知识卡片已保存", "Wiki、关系图和检索索引已同步更新");
     } catch (error) {
       notify("保存失败", error instanceof Error ? error.message : "请刷新后重试");
     } finally {
@@ -590,7 +599,7 @@ export default function Home() {
       await apiRequest(`/api/knowledge/${encodeURIComponent(knowledgeDetail.id)}`, { method: "DELETE" });
       setKnowledgeDetail(null);
       await refreshData();
-      notify("已移入回收站", "知识卡片和关联 QA 均可恢复");
+      notify("已移入回收站", "Wiki 页面、关系节点和关联 QA 已同步移除，均可恢复");
     } catch (error) {
       notify("删除失败", error instanceof Error ? error.message : "请检查本地服务");
     }
@@ -613,7 +622,7 @@ export default function Home() {
         body: "{}",
       });
       await Promise.all([refreshData(), loadTrash()]);
-      notify("知识卡片已恢复", "关联 QA 和关键词索引已恢复");
+      notify("知识卡片已恢复", "Wiki 页面、关系节点、关联 QA 和检索索引已恢复");
     } catch (error) {
       notify("恢复失败", error instanceof Error ? error.message : "可能存在同名知识卡片");
     }
@@ -1122,14 +1131,14 @@ export default function Home() {
           {active === "graph" && (
             <section className="subpage graph-page">
               <div className="subpage-heading">
-                <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>探索会话、项目、工具与智能体之间的连接，发现跨会话复用的工程经验。</p></div>
+                <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>探索知识卡片、来源会话、项目、工具与智能体之间的连接。</p></div>
                 <button className="primary-button" disabled={graphLoading} onClick={() => void rebuildKnowledgeGraph()}>{graphLoading ? "正在构建…" : "↻ 重建关系图"}</button>
               </div>
               <div className="graph-toolbar">
                 <label><span>⌕</span><input value={graphQuery} onChange={(event) => setGraphQuery(event.target.value)} placeholder="查找节点…" /></label>
-                <div>{["all", "session", "project", "tool", "agent"].map((type) => (
+                <div>{["all", "issue", "session", "project", "tool", "agent"].map((type) => (
                   <button key={type} className={graphType === type ? "active" : ""} onClick={() => setGraphType(type)}>
-                    {{ all: "全部", session: "会话", project: "项目", tool: "工具", agent: "智能体" }[type as "all" | "session" | "project" | "tool" | "agent"]}
+                    {{ all: "全部", issue: "知识卡片", session: "会话", project: "项目", tool: "工具", agent: "智能体" }[type as "all" | "issue" | "session" | "project" | "tool" | "agent"]}
                     <em>{type === "all" ? graph.stats.nodes : graph.stats.types[type] ?? 0}</em>
                   </button>
                 ))}</div>
@@ -1150,14 +1159,14 @@ export default function Home() {
                         if (!position) return null;
                         const matched = !graphQuery || `${node.label || node.id} ${node.project || ""}`.toLowerCase().includes(graphQuery.toLowerCase());
                         return <g key={node.id} className={`${node.type || "other"} ${matched ? "matched" : "dimmed"} ${graphSelected?.id === node.id ? "selected" : ""}`} transform={`translate(${position.x} ${position.y})`} onClick={() => setGraphSelected(node)}>
-                          <circle r={node.type === "project" ? 16 : node.type === "agent" ? 15 : 10} />
+                          <circle r={node.type === "project" ? 16 : node.type === "agent" ? 15 : node.type === "issue" ? 12 : 10} />
                           <text y={node.type === "session" ? 22 : 26}>{(node.label || node.id).slice(0, 16)}</text>
                           <title>{node.label || node.id}</title>
                         </g>;
                       })}</g>
                     </svg>
                   ) : <div className="graph-empty"><span>◎</span><h3>关系图尚未构建</h3><p>点击“重建关系图”，从本地会话提取项目、工具和智能体关系。</p></div>}
-                  <div className="graph-legend"><span className="project">项目</span><span className="session">会话</span><span className="tool">工具</span><span className="agent">智能体</span></div>
+                  <div className="graph-legend"><span className="issue">知识卡片</span><span className="project">项目</span><span className="session">会话</span><span className="tool">工具</span><span className="agent">智能体</span></div>
                 </div>
                 <aside className="graph-inspector">
                   {graphSelected ? (
