@@ -102,7 +102,8 @@ secall-opencode serve
 本地工作台支持：
 
 - 统一搜索会话、知识卡片和审核通过的 QA；
-- 会话预审核、低质会话拒绝，以及不删除 OpenCode 原始数据的前端隐藏/恢复；
+- 只读会话内容预览、辅助质量信号、预审核和低质会话拒绝；
+- 不删除 OpenCode 原始数据的前端隐藏与恢复；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
 - Wiki 知识中心，按总览、项目、主题、决策和问题定位分类浏览；
@@ -155,6 +156,7 @@ POST /api/graph/rebuild
 
 ```text
 POST   /api/sessions/{id}/review
+GET    /api/sessions/{id}
 DELETE /api/sessions/{id}
 GET    /api/sessions/hidden
 POST   /api/sessions/{id}/restore

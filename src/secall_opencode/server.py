@@ -47,6 +47,8 @@ DISPLAY_TRANSLATIONS = {
     "세션": "会话",
     "턴": "轮",
     "프로젝트": "项目",
+    "브랜치": "分支",
+    "시간": "时间",
     "사용자": "用户",
     "어시스턴트": "助手",
     "도구": "工具",
@@ -70,8 +72,8 @@ def localize_display_text(value: str) -> str:
     }
     for source, label in labels.items():
         result = re.sub(
-            rf"(?i)^{source}\s+会话\s*[:：]\s*",
-            f"{label} 会话：",
+            rf"(?im)^(#{{1,6}}\s*)?{source}\s+会话\s*[:：]\s*",
+            lambda match: f"{match.group(1) or ''}{label} 会话：",
             result,
         )
     return result
@@ -134,6 +136,78 @@ def list_vault_sessions(
         )
     annotated = annotate_sessions(config, result, include_hidden=include_hidden)
     return annotated[: max(1, min(limit, 1000))]
+
+
+def read_vault_session(config: Config, session_id: str) -> Dict[str, Any]:
+    sessions = list_vault_sessions(config, limit=1000, include_hidden=True)
+    match = next((item for item in sessions if item["id"] == session_id), None)
+    if not match:
+        raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+    path = _safe_vault_path(config.vault, Path(match["path"]))
+    markdown = path.read_text(encoding="utf-8", errors="replace")
+    metadata = _frontmatter(markdown)
+    localized = localize_display_text(markdown)
+    full_length = len(localized)
+    preview_limit = 180_000
+    truncated = full_length > preview_limit
+    if truncated:
+        localized = (
+            localized[:130_000]
+            + "\n\n> **预览提示**：中间内容较长，已在前端预览中折叠。"
+            + "原始 Session 未被修改。\n\n"
+            + localized[-50_000:]
+        )
+
+    tool_calls = len(re.findall(r"(?m)^>\s*\[!tool\]", markdown))
+    user_turns = len(re.findall(r"(?mi)^#{2,3}\s+Turn\s+\d+.*User", markdown))
+    assistant_turns = len(
+        re.findall(r"(?mi)^#{2,3}\s+Turn\s+\d+.*Assistant", markdown)
+    )
+    conclusion_terms = ("完成", "解决", "验证", "结论", "通过", "成功", "修复")
+    has_conclusion = any(term in markdown[-8000:] for term in conclusion_terms)
+    score = 100
+    turns = int(match.get("turns") or 0)
+    if turns <= 2:
+        score -= 35
+    elif turns <= 5:
+        score -= 15
+    if full_length < 1000:
+        score -= 30
+    elif full_length < 5000:
+        score -= 10
+    if tool_calls == 0:
+        score -= 10
+    if not has_conclusion:
+        score -= 20
+    score = max(0, min(score, 100))
+    flags: List[str] = []
+    if turns <= 2:
+        flags.append("会话轮次较少")
+    if full_length < 1000:
+        flags.append("正文内容较短")
+    if tool_calls == 0:
+        flags.append("未检测到工具调用证据")
+    if not has_conclusion:
+        flags.append("末尾未检测到明确结论")
+    if not flags:
+        flags.append("结构和证据要素较完整")
+
+    return {
+        **match,
+        "metadata": metadata,
+        "markdown": localized,
+        "full_length": full_length,
+        "truncated": truncated,
+        "quality": {
+            "score": score,
+            "level": "high" if score >= 80 else "medium" if score >= 55 else "low",
+            "flags": flags,
+            "tool_calls": tool_calls,
+            "user_turns": user_turns,
+            "assistant_turns": assistant_turns,
+            "has_conclusion": has_conclusion,
+        },
+    }
 
 
 def list_knowledge(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
@@ -356,6 +430,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     if item["hidden"]
                 ]
                 self._ok(hidden[: max(1, min(limit, 1000))])
+            elif parsed.path.startswith("/api/sessions/"):
+                session_id = unquote(parsed.path.removeprefix("/api/sessions/"))
+                self._ok(read_vault_session(self.config, session_id))
             elif parsed.path == "/api/knowledge":
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":

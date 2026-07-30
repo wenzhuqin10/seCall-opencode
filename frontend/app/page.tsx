@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
 type View = "overview" | "sessions" | "pipeline" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
@@ -9,6 +9,14 @@ type SessionItem = {
   updated: string; status: string; source?: string; path?: string;
   review_status?: "pending" | "approved" | "rejected";
   review_note?: string; hidden?: boolean; reviewed_at?: string;
+};
+type SessionDetail = SessionItem & {
+  metadata: Record<string, string>; markdown: string; full_length: number; truncated: boolean;
+  quality: {
+    score: number; level: "high" | "medium" | "low"; flags: string[];
+    tool_calls: number; user_turns: number; assistant_turns: number;
+    has_conclusion: boolean;
+  };
 };
 type QaItem = {
   id: string; question: string; answer: string; source: string;
@@ -221,6 +229,8 @@ export default function Home() {
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
   const [hiddenSessionItems, setHiddenSessionItems] = useState<SessionItem[]>([]);
   const [sessionReviewFilter, setSessionReviewFilter] = useState<"all" | "pending" | "approved" | "rejected" | "hidden">("all");
+  const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
+  const [sessionPreviewLoading, setSessionPreviewLoading] = useState(false);
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
   const [health, setHealth] = useState<Health | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
@@ -424,6 +434,19 @@ export default function Home() {
     }
   };
 
+  const openSessionPreview = async (session: SessionItem) => {
+    setSelectedSession(session.id);
+    setSessionPreviewLoading(true);
+    try {
+      const detail = await apiRequest<SessionDetail>(`/api/sessions/${encodeURIComponent(session.id)}`);
+      setSessionDetail(detail);
+    } catch (error) {
+      notify("无法打开会话预览", error instanceof Error ? error.message : "请检查本地服务");
+    } finally {
+      setSessionPreviewLoading(false);
+    }
+  };
+
   const reviewSession = async (
     session: SessionItem,
     status: "pending" | "approved" | "rejected",
@@ -437,6 +460,9 @@ export default function Home() {
         body: JSON.stringify({ status, note }),
       });
       await refreshData();
+      setSessionDetail((detail) => detail?.id === session.id
+        ? { ...detail, review_status: status, review_note: note }
+        : detail);
       notify(
         status === "approved" ? "会话已通过预审核" : status === "rejected" ? "会话已拒绝" : "会话已退回待审核",
         status === "approved" ? "现在可以进入知识流水线" : "低质会话不会进入检索和流水线",
@@ -451,6 +477,7 @@ export default function Home() {
     try {
       await apiRequest(`/api/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
       await refreshData();
+      setSessionDetail(null);
       notify("会话已从前端隐藏", "原始 OpenCode 会话保持不变，可在“已隐藏”中恢复");
     } catch (error) {
       notify("隐藏失败", error instanceof Error ? error.message : "请检查本地服务");
@@ -464,6 +491,7 @@ export default function Home() {
         body: "{}",
       });
       await refreshData();
+      setSessionDetail((detail) => detail?.id === session.id ? { ...detail, hidden: false } : detail);
       notify("会话已恢复显示", "原审核状态保持不变");
     } catch (error) {
       notify("恢复失败", error instanceof Error ? error.message : "请检查本地服务");
@@ -803,7 +831,7 @@ export default function Home() {
                     <div className="panel-heading"><div>最近会话 <span className="count-tag">{filteredSessions.length}</span></div><button onClick={() => setActive("sessions")}>全部会话 <b>→</b></button></div>
                     <div className="session-list">
                       {filteredSessions.slice(0, 4).map((session) => (
-                        <button className="session-row" key={session.id} onClick={() => { setSelectedSession(session.id); setActive("sessions"); }}>
+                        <button className="session-row" key={session.id} onClick={() => { setActive("sessions"); void openSessionPreview(session); }}>
                           <span className={`project-icon ${session.project === "seCall" ? "violet" : ""}`}>{session.project === "seCall" ? "SC" : "WB"}</span>
                           <span className="session-name"><strong>{session.title}</strong><small>{session.project} · {session.turns} turns</small></span>
                           <code>{session.id}</code><StatusPill status={session.status} /><time>{session.updated}</time><b>›</b>
@@ -855,12 +883,12 @@ export default function Home() {
                 <div className="data-table">
                   <div className="table-row session-review-row table-head"><span>会话名称</span><span>模型</span><span>轮次</span><span>预审核</span><span>更新时间</span><span>操作</span></div>
                   {reviewedSessions.map((session) => (
-                    <div className={`table-row session-review-row ${selectedSession === session.id ? "selected" : ""}`} key={session.id} onClick={() => setSelectedSession(session.id)}>
+                    <div className={`table-row session-review-row ${selectedSession === session.id ? "selected" : ""}`} key={session.id} role="button" tabIndex={0} onClick={() => void openSessionPreview(session)} onKeyDown={(event) => { if (event.key === "Enter") void openSessionPreview(session); }}>
                       <span className="title-cell"><i>{session.project === "seCall" ? "SC" : "WB"}</i><b>{session.title}<small>{session.id} · {session.project}{session.review_note ? ` · ${session.review_note}` : ""}</small></b></span>
                       <span>{session.model}</span><span>{session.turns}</span><ReviewPill status={session.review_status} /><span>{session.updated}</span>
                       <span className="session-review-actions" onClick={(event) => event.stopPropagation()}>
                         {session.hidden ? (
-                          <button className="restore" onClick={() => void restoreFrontendSession(session)}>恢复显示</button>
+                            <button className="restore" onClick={() => void restoreFrontendSession(session)}>恢复显示</button>
                         ) : (
                           <>
                             {session.review_status !== "approved" && <button className="approve" onClick={() => void reviewSession(session, "approved")}>通过</button>}
@@ -875,6 +903,7 @@ export default function Home() {
                   {!reviewedSessions.length && <div className="empty-state">当前筛选条件下没有会话</div>}
                 </div>
               </article>
+              {sessionPreviewLoading && <div className="preview-loading"><span>◌</span>正在读取会话内容…</div>}
             </section>
           )}
 
@@ -1152,6 +1181,53 @@ export default function Home() {
             <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" defaultChecked aria-label="完成后重建索引" /></div>
             <div className="modal-actions"><button onClick={() => setModal(false)}>取消</button><button className="primary-button" onClick={startPipeline}>启动流水线 <span>→</span></button></div>
           </section>
+        </div>
+      )}
+
+      {sessionDetail && (
+        <div className="drawer-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSessionDetail(null); }}>
+          <aside className="session-preview-drawer" role="dialog" aria-modal="true" aria-labelledby="session-preview-title">
+            <header>
+              <div>
+                <p className="eyebrow">READ-ONLY SESSION PREVIEW</p>
+                <h2 id="session-preview-title">{sessionDetail.title}</h2>
+                <small>{sessionDetail.id} · {sessionDetail.project} · {sessionDetail.turns} 轮</small>
+              </div>
+              <ReviewPill status={sessionDetail.review_status} />
+              <button onClick={() => setSessionDetail(null)} aria-label="关闭会话预览">×</button>
+            </header>
+            <section className="session-quality-panel">
+              <div className={`quality-orb ${sessionDetail.quality.level}`} style={{ "--quality-score": `${sessionDetail.quality.score * 3.6}deg` } as CSSProperties}>
+                <strong>{sessionDetail.quality.score}</strong><small>参考分</small>
+              </div>
+              <div className="quality-facts">
+                <p className="eyebrow">PRE-REVIEW SIGNALS</p><h3>会话质量辅助判断</h3>
+                <div>{sessionDetail.quality.flags.map((flag) => <span key={flag}>◇ {flag}</span>)}</div>
+                <small>该评分仅用于辅助人工预审核，不会自动通过或拒绝会话。</small>
+              </div>
+              <dl>
+                <div><dt>工具调用</dt><dd>{sessionDetail.quality.tool_calls}</dd></div>
+                <div><dt>用户轮次</dt><dd>{sessionDetail.quality.user_turns || "—"}</dd></div>
+                <div><dt>助手轮次</dt><dd>{sessionDetail.quality.assistant_turns || "—"}</dd></div>
+                <div><dt>正文长度</dt><dd>{sessionDetail.full_length.toLocaleString()} 字符</dd></div>
+              </dl>
+            </section>
+            {sessionDetail.truncated && <p className="session-truncated">会话内容较长，预览保留了开头和结尾；原始 Session 未被截断或修改。</p>}
+            <div className="session-preview-content"><MarkdownViewer markdown={sessionDetail.markdown} /></div>
+            <footer>
+              <span><b>只读预览</b> 审核操作不会修改 OpenCode 原始会话</span>
+              {sessionDetail.hidden ? (
+                <button className="restore-session-button" onClick={() => void restoreFrontendSession(sessionDetail)}>恢复显示</button>
+              ) : (
+                <>
+                  {sessionDetail.review_status !== "rejected" && <button className="reject-session-button" onClick={() => void reviewSession(sessionDetail, "rejected")}>拒绝</button>}
+                  <button className="hide-session-button" onClick={() => void hideFrontendSession(sessionDetail)}>前端隐藏</button>
+                  {sessionDetail.review_status !== "approved" && <button className="primary-button" onClick={() => void reviewSession(sessionDetail, "approved")}>✓ 通过预审核</button>}
+                  {sessionDetail.review_status === "approved" && <button className="pending-session-button" onClick={() => void reviewSession(sessionDetail, "pending")}>退回待审核</button>}
+                </>
+              )}
+            </footer>
+          </aside>
         </div>
       )}
 
