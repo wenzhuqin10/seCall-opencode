@@ -44,7 +44,11 @@ class SessionSyncWorker:
     @staticmethod
     def _skip(item: Dict[str, Any]) -> bool:
         title = str(item.get("title") or "")
-        return title.startswith("seCall knowledge:") or title.startswith("seCall RAG:")
+        return (
+            title.startswith("seCall knowledge:")
+            or title.startswith("seCall RAG:")
+            or title.startswith("seCall pipeline diagnostic")
+        )
 
     def status(self) -> Dict[str, Any]:
         with self._lock:

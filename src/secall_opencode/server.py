@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -274,6 +275,19 @@ def run_session_pipeline(
     overwrite: bool = False,
     timeout: int = 1800,
 ) -> Dict[str, Any]:
+    started_at = time.monotonic()
+    stages: List[Dict[str, Any]] = []
+
+    def record_stage(name: str, stage_started: float, detail: str) -> None:
+        stages.append(
+            {
+                "name": name,
+                "duration_seconds": round(time.monotonic() - stage_started, 2),
+                "detail": detail,
+            }
+        )
+
+    stage_started = time.monotonic()
     sessions = list_vault_sessions(config, limit=1000, include_hidden=True)
     match = next((item for item in sessions if item["id"] == session_id), None)
     if not match:
@@ -283,30 +297,93 @@ def run_session_pipeline(
     if match["review_status"] != "approved" or match["storage_state"] != "approved":
         raise ValueError("该会话尚未通过预审核，只有“已通过”的会话可以运行流水线。")
     session_path = _safe_vault_path(config.vault, Path(match["path"]))
-    prompt = Path(__file__).parent / "prompts" / "issue-card.md"
-    generated = OpenCodeClient(config.opencode_command).run_generation(
-        session_path,
-        prompt,
-        config.vault,
-        model=model or config.model,
-        timeout=timeout,
-    )
-    knowledge = store_knowledge(
-        generated,
-        session_path.read_text(encoding="utf-8"),
-        config.vault,
-        config.knowledge_dir,
-        config.qa_file,
-        overwrite=overwrite,
-    )
+    source_markdown = session_path.read_text(encoding="utf-8")
+    record_stage("读取并验证会话", stage_started, f"{match['turns']} 轮消息，预审核已通过")
+
+    existing_issue: Optional[Path] = None
+    for issue_path in (config.vault / config.knowledge_dir).glob("*.md"):
+        if _frontmatter(issue_path.read_text(encoding="utf-8")).get("source_session") == session_id:
+            existing_issue = issue_path
+            break
+
+    def qa_count_for_session() -> int:
+        qa_path = config.vault / config.qa_file
+        if not qa_path.exists():
+            return 0
+        count = 0
+        for line in qa_path.read_text(encoding="utf-8").splitlines():
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict) and str(item.get("source_session") or "") == session_id:
+                count += 1
+        return count
+
+    reused = existing_issue is not None and not overwrite
+    if reused:
+        stages.append(
+            {
+                "name": "OpenCode 知识抽取",
+                "duration_seconds": 0.0,
+                "detail": "检测到现有 Issue Card，本次未重复调用模型。",
+            }
+        )
+        stages.append(
+            {
+                "name": "写入知识库",
+                "duration_seconds": 0.0,
+                "detail": "已安全复用现有知识；如需重新生成请启用覆盖。",
+            }
+        )
+        knowledge_result = {
+            "issue_path": str(existing_issue),
+            "qa_path": str(config.vault / config.qa_file),
+            "qa_count": qa_count_for_session(),
+            "new_qa_count": 0,
+        }
+    else:
+        stage_started = time.monotonic()
+        prompt = Path(__file__).parent / "prompts" / "issue-card.md"
+        generated = OpenCodeClient(config.opencode_command).run_generation(
+            session_path,
+            prompt,
+            config.vault,
+            model=model or config.model,
+            timeout=timeout,
+        )
+        record_stage("OpenCode 知识抽取", stage_started, "已生成 Issue Card 与候选 QA")
+
+        stage_started = time.monotonic()
+        knowledge = store_knowledge(
+            generated,
+            source_markdown,
+            config.vault,
+            config.knowledge_dir,
+            config.qa_file,
+            overwrite=overwrite,
+        )
+        knowledge_result = knowledge.as_dict()
+        knowledge_result["new_qa_count"] = knowledge.qa_count
+        knowledge_result["qa_count"] = qa_count_for_session()
+        record_stage(
+            "写入知识库",
+            stage_started,
+            f"新增 {knowledge.qa_count} 条候选 QA",
+        )
     indexed = False
     if reindex:
+        stage_started = time.monotonic()
         Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
         indexed = True
+        record_stage("重建 seCall 索引", stage_started, "会话全文索引已刷新")
     return {
         "session_id": session_id,
-        "knowledge": knowledge.as_dict(),
+        "knowledge": knowledge_result,
         "indexed": indexed,
+        "reused": reused,
+        "stages": stages,
+        "elapsed_seconds": round(time.monotonic() - started_at, 2),
     }
 
 
@@ -509,15 +586,47 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     HTTPStatus.CREATED,
                 )
             elif parsed.path == "/api/pipeline":
+                reindex_requested = bool(body.get("reindex", True))
                 result = run_session_pipeline(
-                        self.config,
-                        str(body.get("session_id") or ""),
-                        model=str(body["model"]) if body.get("model") else None,
-                        reindex=bool(body.get("reindex", True)),
-                        overwrite=bool(body.get("overwrite")),
-                        timeout=int(body.get("timeout") or 1800),
+                    self.config,
+                    str(body.get("session_id") or ""),
+                    model=str(body["model"]) if body.get("model") else None,
+                    reindex=reindex_requested,
+                    overwrite=bool(body.get("overwrite")),
+                    timeout=int(body.get("timeout") or 1800),
+                )
+                if reindex_requested:
+                    search_started = time.monotonic()
+                    search_result = self._refresh_search()
+                    search_elapsed = round(time.monotonic() - search_started, 2)
+                    result["stages"].append(
+                        {
+                            "name": "重建关键词与语义索引",
+                            "duration_seconds": search_elapsed,
+                            "detail": (
+                                f"关键词 {search_result['keyword'].get('indexed', 0)} 篇，"
+                                f"向量 {search_result['semantic'].get('indexed_documents', 0)} 篇"
+                            ),
+                        }
                     )
-                self._refresh_search()
+                    result["elapsed_seconds"] = round(
+                        float(result["elapsed_seconds"]) + search_elapsed, 2
+                    )
+                else:
+                    result["stages"].extend(
+                        [
+                            {
+                                "name": "重建 seCall 索引",
+                                "duration_seconds": 0.0,
+                                "detail": "已按本次运行配置跳过。",
+                            },
+                            {
+                                "name": "重建关键词与语义索引",
+                                "duration_seconds": 0.0,
+                                "detail": "已按本次运行配置跳过。",
+                            },
+                        ]
+                    )
                 self._ok(result)
             elif parsed.path == "/api/index":
                 result = Runner(self.config.secall_command).run(

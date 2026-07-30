@@ -282,8 +282,13 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .pipeline-hero { border-radius: 17px; padding: 21px 23px; background: #1d1c22; color: white; display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; overflow: hidden; position: relative; }
 .pipeline-hero::after { content: ""; position: absolute; width: 180px; height: 180px; border-radius: 50%; background: #7158e825; right: -70px; top: -80px; }
 .pipeline-hero > div:first-child { display: flex; align-items: center; gap: 15px; }
-.done-mark, .spin-mark { width: 43px; height: 43px; border-radius: 12px; display: grid; place-items: center; color: #18231c; background: #a3e7b9; font-size: 18px; }
+.done-mark, .spin-mark, .idle-mark { width: 43px; height: 43px; border-radius: 12px; display: grid; place-items: center; color: #18231c; background: #a3e7b9; font-size: 18px; }
 .spin-mark { color: white; background: var(--purple); animation: spin 1.4s linear infinite; }
+.idle-mark { color: #77717f; background: #f0edf5; }
+.pipeline-hero.failed .idle-mark { color: #a73f4c; background: #ffdfe3; }
+.pipeline-error { display: flex; gap: 12px; align-items: flex-start; padding: 13px 16px; margin: -4px 0 16px; border: 1px solid #f1b7bf; border-radius: 12px; color: #8d3340; background: #fff3f5; font-size: 11px; }
+.pipeline-error strong { flex: 0 0 auto; }
+.pipeline-error span { overflow-wrap: anywhere; white-space: pre-wrap; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .pipeline-hero p { margin: 0; }
 .pipeline-hero p small, .pipeline-hero p strong, .pipeline-hero p code { display: block; }

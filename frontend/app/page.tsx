@@ -68,6 +68,16 @@ type RagResponse = {
   requested_mode: string; effective_mode: string; semantic_available: boolean;
   fallback_reason?: string; grounded: boolean;
 };
+type PipelineStage = {
+  name: string; duration_seconds: number; detail: string;
+};
+type PipelineResult = {
+  session_id: string;
+  knowledge: {
+    issue_path: string; qa_path: string; qa_count: number; new_qa_count: number;
+  };
+  indexed: boolean; reused: boolean; stages: PipelineStage[]; elapsed_seconds: number;
+};
 type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
@@ -114,6 +124,13 @@ function formatUpdated(value: number | string): string {
   return new Intl.DateTimeFormat("zh-CN", {
     month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
   }).format(new Date(value));
+}
+
+function formatElapsed(seconds: number): string {
+  const normalized = Math.max(0, seconds);
+  if (normalized < 60) return `${normalized.toFixed(normalized < 10 ? 2 : 1)}s`;
+  const whole = Math.round(normalized);
+  return `${String(Math.floor(whole / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}`;
 }
 
 const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
@@ -229,7 +246,14 @@ export default function Home() {
   const [modal, setModal] = useState(false);
   const [toast, setToast] = useState<Toast>(null);
   const [pipelineRunning, setPipelineRunning] = useState(false);
-  const [pipelineStep, setPipelineStep] = useState(4);
+  const [pipelineStep, setPipelineStep] = useState(0);
+  const [pipelineStatus, setPipelineStatus] = useState<"idle" | "running" | "success" | "failed">("idle");
+  const [pipelineElapsed, setPipelineElapsed] = useState(0);
+  const [pipelineResult, setPipelineResult] = useState<PipelineResult | null>(null);
+  const [pipelineError, setPipelineError] = useState("");
+  const [pipelineModel, setPipelineModel] = useState("");
+  const [pipelineOverwrite, setPipelineOverwrite] = useState(false);
+  const [pipelineReindex, setPipelineReindex] = useState(true);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
   const [hiddenSessionItems, setHiddenSessionItems] = useState<SessionItem[]>([]);
@@ -395,7 +419,6 @@ export default function Home() {
     () => sessionItems.filter((item) => item.review_status === "approved"),
     [sessionItems],
   );
-  const currentSession = sessionItems.find((item) => item.id === selectedSession) ?? sessionItems[0];
   const pipelineSession = approvedSessions.find((item) => item.id === selectedSession) ?? approvedSessions[0];
   const hour = new Date().getHours();
   const greeting = hour >= 5 && hour < 12 ? "早上好" : hour < 14 ? "中午好" : hour < 18 ? "下午好" : "晚上好";
@@ -659,27 +682,47 @@ export default function Home() {
     setModal(false);
     setActive("pipeline");
     setPipelineRunning(true);
+    setPipelineStatus("running");
     setPipelineStep(1);
+    setPipelineElapsed(0);
+    setPipelineResult(null);
+    setPipelineError("");
     notify("流水线已启动", "正在读取本地 Session 并抽取知识");
-    let simulatedStep = 1;
+    const startedAt = Date.now();
     const timer = window.setInterval(() => {
-      simulatedStep = Math.min(4, simulatedStep + 1);
-      setPipelineStep(simulatedStep);
-    }, 1600);
+      setPipelineElapsed((Date.now() - startedAt) / 1000);
+    }, 250);
     try {
       if (!apiConnected) throw new Error("本地 API 未连接，请先启动本地服务。");
-      const result = await apiRequest<{ knowledge: { qa_count: number } }>("/api/pipeline", {
+      const result = await apiRequest<PipelineResult>("/api/pipeline", {
         method: "POST",
-        body: JSON.stringify({ session_id: pipelineSession.id, reindex: true }),
+        body: JSON.stringify({
+          session_id: pipelineSession.id,
+          model: pipelineModel || undefined,
+          reindex: pipelineReindex,
+          overwrite: pipelineOverwrite,
+        }),
       });
       window.clearInterval(timer);
       setPipelineStep(5);
+      setPipelineStatus("success");
+      setPipelineElapsed(result.elapsed_seconds);
+      setPipelineResult(result);
       await refreshData();
-      notify("知识已成功入库", `新增 ${result.knowledge.qa_count} 条候选 QA`);
+      notify(
+        result.reused ? "已复用现有知识并刷新索引" : "知识已成功入库",
+        result.reused
+          ? `现有 ${result.knowledge.qa_count} 条候选 QA，未重复生成`
+          : `新增 ${result.knowledge.new_qa_count} 条候选 QA`,
+      );
     } catch (error) {
       window.clearInterval(timer);
       setPipelineStep(0);
-      notify("流水线执行失败", error instanceof Error ? error.message : "请检查本地服务");
+      setPipelineStatus("failed");
+      setPipelineElapsed((Date.now() - startedAt) / 1000);
+      const message = error instanceof Error ? error.message : "请检查本地服务";
+      setPipelineError(message);
+      notify("流水线执行失败", message);
     } finally {
       setPipelineRunning(false);
     }
@@ -852,12 +895,15 @@ export default function Home() {
                     <div className="active-job">
                       <div className="job-head">
                         <div className="session-glyph">OC</div>
-                        <div><strong>修复 Scheduler HARQ timeout</strong><span><code>ses_0598ac</code> · wireless-baseband</span></div>
-                        <div className="job-progress"><strong>{pipelineRunning ? "处理中" : "80%"}</strong><span>预计剩余 18 秒</span></div>
+                        <div><strong>{pipelineSession?.title ?? "等待选择会话"}</strong><span><code>{pipelineSession?.id ?? "—"}</code> · {pipelineSession?.project ?? "—"}</span></div>
+                        <div className="job-progress">
+                          <strong>{pipelineStatus === "failed" ? "失败" : pipelineStatus === "success" ? "100%" : pipelineRunning ? `${pipelineStep * 20}%` : "未运行"}</strong>
+                          <span>{pipelineRunning ? `已耗时 ${formatElapsed(pipelineElapsed)}` : pipelineStatus === "success" ? `耗时 ${formatElapsed(pipelineElapsed)}` : pipelineStatus === "failed" ? "查看失败原因" : "可从流水线页面启动"}</span>
+                        </div>
                       </div>
                       <div className="stepper">
-                        {["会话导出", "格式转换", "知识抽取", "QA 生成", "混合索引"].map((step, index) => (
-                          <div key={step} className={index < pipelineStep ? "done" : index === pipelineStep ? "current" : ""}>
+                        {["会话校验", "知识抽取", "知识写入", "seCall 索引", "混合索引"].map((step, index) => (
+                          <div key={step} className={index < pipelineStep ? "done" : pipelineRunning && index === pipelineStep ? "current" : ""}>
                             <span>{index < pipelineStep ? "✓" : index + 1}</span><small>{step}</small>
                             {index < 4 && <i />}
                           </div>
@@ -956,14 +1002,30 @@ export default function Home() {
           {active === "pipeline" && (
             <section className="subpage">
               <div className="subpage-heading"><div><p className="eyebrow">AUTOMATION</p><h1>知识流水线</h1><p>监控 Session 从导出到可检索知识的完整过程。</p></div><button className="primary-button" onClick={() => setModal(true)}>＋ 运行流水线</button></div>
-              <article className="pipeline-hero">
-                <div><span className={pipelineRunning ? "spin-mark" : "done-mark"}>{pipelineRunning ? "↻" : "✓"}</span><p><small>{pipelineRunning ? "正在处理" : "最近一次运行成功"}</small><strong>{currentSession?.title ?? "请选择会话"}</strong><code>{currentSession?.id ?? "无会话"} · {currentSession?.model ?? "默认模型"}</code></p></div>
-                <div className="hero-metrics"><span><b>{pipelineStep}/5</b><small>完成步骤</small></span><span><b>00:18</b><small>运行耗时</small></span><span><b>5</b><small>候选 QA</small></span></div>
+              <article className={`pipeline-hero ${pipelineStatus === "failed" ? "failed" : ""}`}>
+                <div>
+                  <span className={pipelineRunning ? "spin-mark" : pipelineStatus === "success" ? "done-mark" : "idle-mark"}>{pipelineRunning ? "↻" : pipelineStatus === "success" ? "✓" : pipelineStatus === "failed" ? "!" : "○"}</span>
+                  <p>
+                    <small>{{ idle: "尚未运行", running: "正在处理", success: pipelineResult?.reused ? "已复用现有知识并刷新索引" : "最近一次运行成功", failed: "最近一次运行失败" }[pipelineStatus]}</small>
+                    <strong>{pipelineSession?.title ?? "请选择已通过预审核的会话"}</strong>
+                    <code>{pipelineSession?.id ?? "无会话"} · {pipelineSession?.model ?? "默认模型"}</code>
+                  </p>
+                </div>
+                <div className="hero-metrics"><span><b>{pipelineStep}/5</b><small>完成步骤</small></span><span><b>{formatElapsed(pipelineElapsed)}</b><small>实际耗时</small></span><span><b>{pipelineResult?.knowledge.qa_count ?? "—"}</b><small>候选 QA</small></span></div>
               </article>
+              {pipelineError && <div className="pipeline-error"><strong>执行失败</strong><span>{pipelineError}</span></div>}
               <div className="pipeline-detail">
-                {["读取 OpenCode Session", "转换为 seCall Markdown", "提取 Issue Card", "生成候选 QA", "重建关键词与语义索引"].map((name, index) => (
-                  <article key={name} className={index < pipelineStep ? "complete" : index === pipelineStep ? "processing" : ""}>
-                    <span>{index < pipelineStep ? "✓" : index + 1}</span><div><strong>{name}</strong><small>{["读取 28 个消息与 7 次工具调用", "保留命令、路径和错误证据", "置信度 92% · 证据链完整", "已生成 5 条，等待人工审核", "同步 FTS5/BM25 关键词索引与 BGE-M3 向量索引"][index]}</small></div><time>{index < pipelineStep ? `${index * 3 + 2}s` : index === pipelineStep ? "运行中…" : "等待"}</time>
+                {(pipelineResult?.stages ?? [
+                  { name: "读取并验证会话", detail: "确认会话已通过预审核并读取正式 Vault 文档", duration_seconds: 0 },
+                  { name: "OpenCode 知识抽取", detail: "根据真实 Session 生成 Issue Card 与候选 QA", duration_seconds: 0 },
+                  { name: "写入知识库", detail: "保存知识卡片，并关联来源会话和候选 QA", duration_seconds: 0 },
+                  { name: "重建 seCall 索引", detail: "刷新会话全文索引", duration_seconds: 0 },
+                  { name: "重建关键词与语义索引", detail: "同步 FTS5/BM25 与 BGE-M3 向量索引", duration_seconds: 0 },
+                ]).map((stage, index) => (
+                  <article key={`${stage.name}-${index}`} className={pipelineStatus === "success" || index < pipelineStep ? "complete" : pipelineRunning && index === pipelineStep ? "processing" : ""}>
+                    <span>{pipelineStatus === "success" || index < pipelineStep ? "✓" : index + 1}</span>
+                    <div><strong>{stage.name}</strong><small>{stage.detail}</small></div>
+                    <time>{pipelineStatus === "success" ? `${stage.duration_seconds.toFixed(2)}s` : pipelineRunning && index === pipelineStep ? "运行中…" : "等待"}</time>
                   </article>
                 ))}
               </div>
@@ -1222,9 +1284,9 @@ export default function Home() {
               </select>
               {!approvedSessions.length && <small className="form-help">请先关闭窗口，在“研发会话”页面完成预审核。</small>}
             </label>
-            <div className="form-grid"><label>生成模型<select defaultValue=""><option value="">OpenCode 默认模型</option>{health?.models?.map((model) => <option value={model} key={model}>{model}</option>)}</select></label><label>知识语言<select><option>简体中文</option><option>English</option></select></label></div>
-            <div className="switch-row"><div><strong>生成候选 QA</strong><small>从 Issue Card 自动提取 3–10 条问答</small></div><input type="checkbox" defaultChecked aria-label="生成候选 QA" /></div>
-            <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" defaultChecked aria-label="完成后重建索引" /></div>
+            <div className="form-grid"><label>生成模型<select value={pipelineModel} onChange={(event) => setPipelineModel(event.target.value)}><option value="">OpenCode 默认模型</option>{health?.models?.map((model) => <option value={model} key={model}>{model}</option>)}</select></label><label>知识语言<select><option>简体中文</option><option>English</option></select></label></div>
+            <div className="switch-row"><div><strong>重新生成并覆盖知识</strong><small>关闭时会安全复用现有 Issue Card，避免重复 QA</small></div><input type="checkbox" checked={pipelineOverwrite} onChange={(event) => setPipelineOverwrite(event.target.checked)} aria-label="重新生成并覆盖知识" /></div>
+            <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" checked={pipelineReindex} onChange={(event) => setPipelineReindex(event.target.checked)} aria-label="完成后重建索引" /></div>
             <div className="modal-actions"><button onClick={() => setModal(false)}>取消</button><button className="primary-button" onClick={startPipeline}>启动流水线 <span>→</span></button></div>
           </section>
         </div>
