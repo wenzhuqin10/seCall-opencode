@@ -39,7 +39,7 @@ def test_graph_snapshot_enriches_session_and_project_labels(tmp_path: Path) -> N
     graph_dir.mkdir(parents=True)
     session_dir.mkdir(parents=True)
     (session_dir / "session-1.md").write_text(
-        "---\nsession_id: session-1\nproject: 无线研发\n---\n# 定位调度异常\n",
+        "---\nsession_id: session-1\nproject: 无线研发\n---\n# codex 세션: 定位调度异常\n",
         encoding="utf-8",
     )
     (graph_dir / "graph.json").write_text(
@@ -80,5 +80,5 @@ def test_graph_snapshot_enriches_session_and_project_labels(tmp_path: Path) -> N
             "issue": 0,
         },
     }
-    assert nodes["session:session-1"]["label"] == "定位调度异常"
+    assert nodes["session:session-1"]["label"] == "Codex 会话：定位调度异常"
     assert nodes["project:legacy"]["label"] == "无线研发"

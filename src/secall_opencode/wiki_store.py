@@ -23,6 +23,29 @@ HEADING = re.compile(r"(?m)^#\s+(.+?)\s*$")
 SECTION = re.compile(r"(?m)^##\s+(.+?)\s*$")
 WIKI_LINK = re.compile(r"\[\[([^\]|#]+)")
 MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+\.md)(?:#[^)]+)?\)")
+DISPLAY_TRANSLATIONS = {
+    "codex 세션": "Codex 会话",
+    "opencode 세션": "OpenCode 会话",
+    "chatgpt 세션": "ChatGPT 会话",
+    "세션": "会话",
+    "턴": "轮",
+    "프로젝트": "项目",
+    "사용자": "用户",
+    "어시스턴트": "助手",
+    "도구": "工具",
+    "요약": "摘要",
+    "알 수 없음": "未知",
+}
+
+
+def _localize_display_text(value: str) -> str:
+    result = value
+    for source, target in DISPLAY_TRANSLATIONS.items():
+        result = result.replace(source, target)
+    result = re.sub(r"(?i)^codex\s+会话\s*[:：]\s*", "Codex 会话：", result)
+    result = re.sub(r"(?i)^opencode\s+会话\s*[:：]\s*", "OpenCode 会话：", result)
+    result = re.sub(r"(?i)^chatgpt\s+会话\s*[:：]\s*", "ChatGPT 会话：", result)
+    return result
 
 
 def _wiki_root(config: Config) -> Path:
@@ -216,8 +239,10 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             session_id = metadata.get("session_id") or session_path.stem
             heading = HEADING.search(markdown)
             session_meta[session_id] = {
-                "title": heading.group(1).strip() if heading else session_path.stem,
-                "project": metadata.get("project") or "unknown",
+                "title": _localize_display_text(
+                    heading.group(1).strip() if heading else session_path.stem
+                ),
+                "project": _localize_display_text(metadata.get("project") or "unknown"),
             }
 
     node_map = {
@@ -226,6 +251,9 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
         if isinstance(node, dict) and node.get("id")
     }
     for node_id, node in node_map.items():
+        node["label"] = _localize_display_text(str(node.get("label") or node_id))
+        if node.get("project"):
+            node["project"] = _localize_display_text(str(node["project"]))
         if node.get("type") == "session":
             session_id = node_id.removeprefix("session:")
             metadata = session_meta.get(session_id)
