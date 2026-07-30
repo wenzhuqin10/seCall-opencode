@@ -7,7 +7,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .chatgpt import inspect_export, parse_export
 from .config import Config
@@ -25,6 +25,7 @@ from .knowledge_store import (
 from .opencode_client import OpenCodeClient, Runner
 from .rag import answer_with_rag
 from .search import HybridSearchService, build_search_service
+from .wiki_store import graph_snapshot, list_wiki_pages, read_wiki_page, rebuild_graph
 
 
 MAX_BODY_BYTES = 100 * 1024 * 1024
@@ -212,7 +213,7 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.4"
+    server_version = "seCallOpenCodeLocal/0.5"
 
     @property
     def config(self) -> Config:
@@ -307,10 +308,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 sessions = list_vault_sessions(self.config, limit=1000)
                 knowledge = list_knowledge(self.config, limit=1000)
                 qa = read_qa(self.config)
+                wiki = list_wiki_pages(self.config, limit=2000)
+                graph = graph_snapshot(self.config)
                 self._ok(
                     {
                         "ready": True,
-                        "api_version": "0.4.0",
+                        "api_version": "0.5.0",
                         "vault": str(self.config.vault),
                         "opencode_version": opencode_version,
                         "models": models,
@@ -319,6 +322,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "knowledge": len(knowledge),
                         "qa": len(qa),
                         "pending_qa": sum(item.get("review_status") == "pending" for item in qa),
+                        "wiki": wiki["count"],
+                        "graph": graph["stats"],
                         "semantic": self.search.semantic.status(),
                     }
                 )
@@ -328,6 +333,23 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":
                 self._ok(list_knowledge_trash(self.config))
+            elif parsed.path == "/api/wiki":
+                self._ok(
+                    list_wiki_pages(
+                        self.config,
+                        category=str(query.get("category", ["all"])[0]),
+                        query=str(query.get("q", [""])[0]),
+                        limit=limit,
+                    )
+                )
+            elif parsed.path.startswith("/api/wiki/"):
+                wiki_id = parsed.path.removeprefix("/api/wiki/")
+                parts = [unquote(part) for part in wiki_id.split("/", 1)]
+                if len(parts) != 2:
+                    raise FileNotFoundError("Wiki 页面地址无效。")
+                self._ok(read_wiki_page(self.config, parts[0], parts[1]))
+            elif parsed.path == "/api/graph":
+                self._ok(graph_snapshot(self.config))
             elif parsed.path.startswith("/api/knowledge/"):
                 knowledge_id = parsed.path.removeprefix("/api/knowledge/")
                 self._ok(read_knowledge_document(self.config, knowledge_id))
@@ -409,6 +431,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         timeout=int(body.get("timeout") or 600),
                     )
                 )
+            elif parsed.path == "/api/graph/rebuild":
+                result = rebuild_graph(self.config)
+                self._ok(result)
             elif parsed.path == "/api/qa/review":
                 qa_id = str(body.get("id") or "")
                 status = str(body.get("status") or "")

@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Protocol, Sequence
 from .config import Config
 from .knowledge_store import list_knowledge_documents, read_knowledge_document
 from .opencode_client import Runner
+from .wiki_store import iter_wiki_pages, read_wiki_page
 
 
 CJK_RUN = re.compile(r"[\u3400-\u9fff]+")
@@ -193,12 +194,28 @@ def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
         )
 
 
+def _wiki_documents(config: Config) -> Iterator[SearchDocument]:
+    # Issue pages are already represented by editable knowledge cards.
+    for item in iter_wiki_pages(config, include_issues=False):
+        detail = read_wiki_page(config, item["category"], item["slug"])
+        yield SearchDocument(
+            id=item["id"],
+            scope="wiki",
+            title=item["title"],
+            body=detail["markdown"],
+            project=item["project"],
+            source_session=item["source_session"],
+            review_status="published",
+        )
+
+
 def iter_search_documents(
     config: Config, include_sessions: bool = True
 ) -> Iterator[SearchDocument]:
     if include_sessions:
         yield from _session_documents(config)
     yield from _knowledge_and_qa_documents(config)
+    yield from _wiki_documents(config)
 
 
 def _tokens(text: str) -> str:
@@ -258,6 +275,7 @@ class KeywordSearchBackend:
 
     def rebuild(self) -> Dict[str, Any]:
         documents = list(_knowledge_and_qa_documents(self.config))
+        documents.extend(_wiki_documents(self.config))
         with self._connect() as connection:
             connection.execute("DELETE FROM documents")
             connection.execute("DELETE FROM documents_fts")
@@ -398,7 +416,7 @@ class KeywordSearchBackend:
             except Exception:
                 if scope == "session":
                     raise
-        if scope in {"all", "knowledge", "qa"}:
+        if scope in {"all", "knowledge", "wiki", "qa"}:
             result.extend(self._knowledge_search(query, scope, limit))
         result.sort(key=lambda item: item.score, reverse=True)
         return result[:limit]
@@ -482,7 +500,7 @@ class OnnxSemanticBackend:
             return False
 
     def supports_scope(self, scope: str) -> bool:
-        return scope in {"all", "knowledge", "qa"}
+        return scope in {"all", "knowledge", "wiki", "qa"}
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -539,7 +557,7 @@ class OnnxSemanticBackend:
             "dimensions": 1024,
             "indexed_documents": documents,
             "indexed_chunks": chunks,
-            "indexed_scopes": ["knowledge", "qa"],
+            "indexed_scopes": ["knowledge", "wiki", "qa"],
             "reason": None if ready else self._error,
         }
 
@@ -720,8 +738,8 @@ class HybridSearchService:
             scope = "session"
         if len(query) < 2:
             raise ValueError("搜索内容至少需要两个字符。")
-        if scope not in {"all", "session", "knowledge", "qa"}:
-            raise ValueError("scope 必须是 all、session、knowledge 或 qa。")
+        if scope not in {"all", "session", "knowledge", "wiki", "qa"}:
+            raise ValueError("scope 必须是 all、session、knowledge、wiki 或 qa。")
         if mode not in {"keyword", "semantic", "hybrid"}:
             raise ValueError("mode 必须是 keyword、semantic 或 hybrid。")
         limit = max(1, min(limit, 100))
@@ -737,7 +755,7 @@ class HybridSearchService:
         ):
             effective = "keyword"
             fallback = (
-                "原始 Session 当前使用 seCall/BM25 检索；知识卡片与已审核 QA "
+                "原始 Session 当前使用 seCall/BM25 检索；Wiki、知识卡片与已审核 QA "
                 "使用 BGE-M3 语义索引。"
                 if self.semantic.available
                 else str(self.semantic.status().get("reason") or "语义检索不可用。")

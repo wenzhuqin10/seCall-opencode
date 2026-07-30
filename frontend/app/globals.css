@@ -382,6 +382,99 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .rag-sources > button span em { color: #aaa5af; font-size: 7px; font-style: normal; margin-top: 5px; }
 .rag-sources > button > i { color: #aaa5af; font-style: normal; }
 
+.wiki-heading-stats { display: flex; align-items: baseline; gap: 7px; padding: 13px 17px; border: 1px solid var(--line); border-radius: 13px; background: white; }
+.wiki-heading-stats strong { font-size: 19px; }
+.wiki-heading-stats span { color: #918b98; font-size: 8px; }
+.wiki-heading-stats i { width: 1px; height: 24px; margin: 0 7px; background: var(--line); }
+.wiki-shell { min-height: 660px; display: grid; grid-template-columns: 290px 1fr; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: white; box-shadow: 0 18px 55px rgba(43,35,66,.06); }
+.wiki-browser { display: flex; flex-direction: column; min-width: 0; background: #f8f7fa; border-right: 1px solid var(--line); }
+.wiki-browser > label { height: 58px; margin: 16px 16px 6px; display: flex; align-items: center; gap: 8px; padding: 0 12px; border: 1px solid #e0dce5; border-radius: 11px; color: #9b95a2; background: white; }
+.wiki-browser > label input { min-width: 0; flex: 1; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 9px; }
+.wiki-browser > nav { padding: 7px 12px 13px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px; border-bottom: 1px solid var(--line); }
+.wiki-browser > nav button { min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 0 8px; border: 0; border-radius: 8px; color: #746f7b; background: transparent; font-size: 8px; text-align: left; }
+.wiki-browser > nav button span { color: #7864d8; }
+.wiki-browser > nav button em { margin-left: auto; color: #a7a2ac; font-size: 7px; font-style: normal; }
+.wiki-browser > nav button.active { color: #5540b3; background: #ebe6ff; font-weight: 750; }
+.wiki-page-list { min-height: 0; flex: 1; overflow-y: auto; padding: 9px; }
+.wiki-page-list > button { width: 100%; display: block; padding: 12px; border: 0; border-radius: 10px; color: inherit; background: transparent; text-align: left; }
+.wiki-page-list > button:hover { background: white; }
+.wiki-page-list > button.active { background: white; box-shadow: 0 7px 22px #2c203a0c; }
+.wiki-page-list strong, .wiki-page-list small, .wiki-page-list p { display: block; }
+.wiki-page-list strong { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.wiki-page-list small { margin-top: 5px; color: #9a95a1; font-size: 7px; }
+.wiki-page-list p { height: 31px; margin: 6px 0 0; overflow: hidden; color: #827d88; font-size: 7px; line-height: 1.55; }
+.wiki-empty { padding: 24px 10px; color: #a5a0aa; font-size: 8px; text-align: center; }
+.wiki-reader { min-width: 0; display: flex; flex-direction: column; background: #fff; }
+.wiki-reader > header { display: grid; grid-template-columns: 1fr 180px; gap: 35px; padding: 34px 42px 26px; border-bottom: 1px solid var(--line); background: linear-gradient(135deg, #fff 35%, #faf8ff); }
+.wiki-reader > header span { display: inline-block; padding: 5px 8px; border-radius: 8px; color: #624fc4; background: #eeeaff; font-size: 7px; font-weight: 750; }
+.wiki-reader > header h2 { margin: 12px 0 8px; font-size: 25px; letter-spacing: -.04em; }
+.wiki-reader > header p { max-width: 650px; margin: 0; color: #817b88; font-size: 9px; line-height: 1.65; }
+.wiki-reader > header aside { padding-left: 20px; display: grid; align-content: center; gap: 5px; border-left: 1px solid var(--line); }
+.wiki-reader > header aside small { color: #aaa5af; font-size: 7px; text-transform: uppercase; }
+.wiki-reader > header aside strong, .wiki-reader > header aside code { margin-bottom: 8px; overflow: hidden; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.wiki-reader-body { flex: 1; overflow-y: auto; padding: 34px 9% 60px; }
+.markdown-viewer { max-width: 820px; margin: 0 auto; }
+.markdown-viewer h1 { margin: 0 0 25px; font-size: 24px; }
+.markdown-viewer h2 { margin: 31px 0 12px; padding-bottom: 9px; border-bottom: 1px solid #ece9ef; font-size: 16px; }
+.markdown-viewer h3 { margin: 23px 0 9px; font-size: 12px; }
+.markdown-viewer p, .markdown-list, .markdown-viewer blockquote { color: #59545f; font-size: 10px; line-height: 1.9; }
+.markdown-viewer p { margin: 8px 0; white-space: pre-wrap; }
+.markdown-list { display: flex; gap: 9px; margin: 4px 0; }
+.markdown-list i { width: 5px; height: 5px; flex: 0 0 auto; margin-top: 7px; border-radius: 50%; background: var(--purple); }
+.markdown-viewer blockquote { margin: 15px 0; padding: 11px 15px; border-left: 3px solid #8a72e8; border-radius: 0 8px 8px 0; background: #f8f5ff; }
+.markdown-viewer pre { overflow-x: auto; margin: 15px 0; padding: 16px; border: 1px solid #2e2b36; border-radius: 11px; color: #e9e4f2; background: #17161c; font-size: 9px; line-height: 1.7; }
+.wiki-reader > footer { padding: 18px 42px 24px; border-top: 1px solid var(--line); background: #fbfafc; }
+.wiki-reader > footer h3 { margin: 0 0 9px; font-size: 9px; }
+.wiki-reader > footer div { display: flex; flex-wrap: wrap; gap: 6px; }
+.wiki-reader > footer button { padding: 7px 9px; border: 1px solid #ded9ea; border-radius: 8px; color: #6553bd; background: white; font-size: 7px; }
+.wiki-welcome { max-width: 650px; margin: auto; padding: 60px; text-align: center; }
+.wiki-welcome > span { width: 64px; height: 64px; margin: 0 auto 21px; display: grid; place-items: center; border-radius: 20px; color: white; background: linear-gradient(135deg, #8d77ed, #5b42cf); box-shadow: 0 14px 35px #7055d33d; font-size: 26px; }
+.wiki-welcome h2 { margin: 8px 0; font-size: 26px; }
+.wiki-welcome > p:not(.eyebrow) { color: #817b88; font-size: 10px; line-height: 1.8; }
+.wiki-welcome > div { margin-top: 28px; display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+.wiki-welcome > div button { padding: 12px 5px; border: 1px solid var(--line); border-radius: 11px; color: inherit; background: #faf9fb; }
+.wiki-welcome > div strong, .wiki-welcome > div span { display: block; }
+.wiki-welcome > div strong { color: #604bc1; font-size: 15px; }
+.wiki-welcome > div span { margin-top: 4px; color: #89838f; font-size: 7px; }
+
+.graph-toolbar { display: flex; align-items: center; gap: 15px; margin-bottom: 13px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 13px; background: white; }
+.graph-toolbar > label { width: 210px; display: flex; align-items: center; gap: 7px; padding: 0 10px; border: 1px solid #e2dee7; border-radius: 8px; }
+.graph-toolbar > label input { width: 100%; height: 32px; border: 0; outline: 0; color: var(--ink); background: transparent; font-size: 8px; }
+.graph-toolbar > div { display: flex; gap: 5px; }
+.graph-toolbar > div button { padding: 7px 9px; border: 0; border-radius: 8px; color: #7d7784; background: transparent; font-size: 8px; }
+.graph-toolbar > div button.active { color: #5b45be; background: #eeeaff; font-weight: 700; }
+.graph-toolbar button em { margin-left: 4px; color: #aaa4af; font-size: 7px; font-style: normal; }
+.graph-summary { margin-left: auto; color: #99939f; font-size: 8px; }
+.graph-shell { height: 680px; display: grid; grid-template-columns: minmax(0, 1fr) 270px; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: #121117; box-shadow: 0 25px 70px #1e182930; }
+.graph-canvas { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at center, #272134 0, #17141f 42%, #100f14 100%); }
+.graph-canvas::before { content: ""; position: absolute; inset: 0; opacity: .13; background-image: radial-gradient(#c3b7e6 1px, transparent 1px); background-size: 26px 26px; }
+.graph-canvas svg { position: relative; width: 100%; height: 100%; }
+.graph-links line { stroke: #8f80b8; stroke-width: .65; opacity: .24; }
+.graph-nodes g { cursor: pointer; transition: opacity .18s; }
+.graph-nodes g.dimmed { opacity: .12; }
+.graph-nodes circle { fill: #8b72e9; stroke: #d9d0ff; stroke-width: 1.5; filter: drop-shadow(0 0 8px #836ce888); transition: .18s; }
+.graph-nodes .project circle { fill: #eeaf63; stroke: #ffe0b6; filter: drop-shadow(0 0 9px #dd904f88); }
+.graph-nodes .tool circle { fill: #54c8b0; stroke: #b9fff0; filter: drop-shadow(0 0 8px #45b7a477); }
+.graph-nodes .agent circle { fill: #ed6d93; stroke: #ffd1df; filter: drop-shadow(0 0 8px #e65d8c88); }
+.graph-nodes g.selected circle { stroke-width: 4; transform: scale(1.25); }
+.graph-nodes text { fill: #cac3d5; font-size: 8px; text-anchor: middle; pointer-events: none; }
+.graph-legend { position: absolute; left: 18px; bottom: 16px; display: flex; gap: 13px; padding: 8px 10px; border: 1px solid #ffffff14; border-radius: 9px; color: #b6afbf; background: #111016cc; backdrop-filter: blur(8px); font-size: 7px; }
+.graph-legend span::before { content: ""; width: 7px; height: 7px; display: inline-block; margin-right: 5px; border-radius: 50%; background: #8b72e9; }
+.graph-legend .project::before { background: #eeaf63; }.graph-legend .tool::before { background: #54c8b0; }.graph-legend .agent::before { background: #ed6d93; }
+.graph-empty { position: absolute; inset: 0; display: grid; place-content: center; color: #d3cbdc; text-align: center; }
+.graph-empty > span { color: #8f78e8; font-size: 44px; }.graph-empty h3 { margin: 10px 0 4px; }.graph-empty p { color: #827a8e; font-size: 8px; }
+.graph-inspector { overflow-y: auto; padding: 25px 22px; color: #ece8f1; background: #19171f; border-left: 1px solid #ffffff12; }
+.graph-node-mark { display: block; color: #8b72e9; font-size: 30px; }.graph-node-mark.project { color: #eeaf63; }.graph-node-mark.tool { color: #54c8b0; }.graph-node-mark.agent { color: #ed6d93; }
+.graph-inspector h2 { margin: 7px 0 21px; font-size: 18px; line-height: 1.3; overflow-wrap: anywhere; }
+.graph-inspector dl { margin: 0 0 24px; padding: 12px 14px; border: 1px solid #ffffff12; border-radius: 11px; background: #ffffff05; }
+.graph-inspector dl div { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid #ffffff0d; font-size: 8px; }
+.graph-inspector dl div:last-child { border: 0; }.graph-inspector dt { color: #8f8998; }.graph-inspector dd { margin: 0; color: #ddd6e6; }
+.graph-inspector > h3 { font-size: 9px; }
+.neighbor-list { display: grid; gap: 5px; }
+.neighbor-list button { display: flex; justify-content: space-between; gap: 7px; padding: 9px; border: 0; border-radius: 8px; color: #d8d1e0; background: #ffffff08; text-align: left; font-size: 7px; }
+.neighbor-list button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.neighbor-list button em { flex: 0 0 auto; color: #8471d7; font-style: normal; }
+.inspector-empty { margin-top: 180px; color: #817a8c; text-align: center; }.inspector-empty span { color: #816bd9; font-size: 26px; }.inspector-empty h3 { color: #d8d1df; }.inspector-empty p { font-size: 8px; }
+
 .modal-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(16,14,23,.54); backdrop-filter: blur(7px); display: grid; place-items: center; padding: 20px; animation: fade .2s ease; }
 @keyframes fade { from { opacity: 0; } }
 .modal { width: min(490px, 100%); background: white; border-radius: 20px; padding: 27px; box-shadow: 0 30px 90px rgba(18,14,32,.3); position: relative; }
@@ -443,6 +536,8 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .dashboard-grid { grid-template-columns: 1fr; }
   .side-column { grid-template-columns: 1fr 1fr; }
   .knowledge-grid, .diagnostic-grid { grid-template-columns: repeat(2, 1fr); }
+  .wiki-shell { grid-template-columns: 250px 1fr; }
+  .graph-shell { grid-template-columns: minmax(0, 1fr) 230px; }
 }
 @media (max-width: 850px) {
   .sidebar { width: 72px; padding-inline: 10px; }
@@ -456,6 +551,11 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .content { width: calc(100% - 72px); margin-left: 72px; }
   .qa-layout { grid-template-columns: 1fr; }
   .rag-layout { grid-template-columns: 1fr; }
+  .wiki-shell { grid-template-columns: 210px 1fr; }
+  .wiki-reader > header { grid-template-columns: 1fr; padding: 25px; }
+  .wiki-reader > header aside { display: none; }
+  .graph-shell { grid-template-columns: 1fr; }
+  .graph-inspector { display: none; }
 }
 @media (max-width: 650px) {
   .sidebar { display: none; }
@@ -492,4 +592,16 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
   .rag-mode-row { flex-direction: column; }
   .semantic-state { display: none; }
   .toast { min-width: 0; right: 14px; left: 14px; bottom: 14px; }
+  .wiki-heading-stats { display: none; }
+  .wiki-shell { display: block; }
+  .wiki-browser { max-height: 330px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .wiki-reader { min-height: 520px; }
+  .wiki-reader-body { padding: 24px 18px 40px; }
+  .wiki-welcome { padding: 35px 20px; }
+  .wiki-welcome > div { grid-template-columns: repeat(2, 1fr); }
+  .graph-toolbar { flex-wrap: wrap; }
+  .graph-toolbar > label { width: 100%; }
+  .graph-toolbar > div { width: 100%; overflow-x: auto; }
+  .graph-summary { margin-left: 0; }
+  .graph-shell { height: 560px; }
 }

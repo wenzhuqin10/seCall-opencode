@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
-type View = "overview" | "sessions" | "pipeline" | "knowledge" | "rag" | "qa" | "diagnostics";
+type View = "overview" | "sessions" | "pipeline" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
 type SessionItem = {
   id: string; title: string; project: string; model: string; turns: number;
@@ -26,9 +26,27 @@ type TrashItem = {
   source_session: string; deleted_at: string; qa_count: number;
 };
 type SearchResult = {
-  id: string; scope: "session" | "knowledge" | "qa"; title: string;
+  id: string; scope: "session" | "knowledge" | "wiki" | "qa"; title: string;
   snippet: string; project: string; source_session: string; score: number;
   match_type: string; review_status: string;
+};
+type WikiPage = {
+  id: string; slug: string; category: string; category_label: string; title: string;
+  project: string; source_session: string; summary: string; updated: number;
+  word_count: number; path: string;
+};
+type WikiDetail = WikiPage & {
+  markdown: string; sections: Array<{ heading: string; content: string }>;
+  references: string[]; backlinks: Array<{ id: string; title: string; category: string }>;
+};
+type WikiResponse = {
+  count: number; counts: Record<string, number>; pages: WikiPage[];
+};
+type GraphNode = { id: string; label?: string; type?: string; project?: string };
+type GraphLink = { source: string; target: string; relation?: string; weight?: number };
+type GraphSnapshot = {
+  nodes: GraphNode[]; links: GraphLink[];
+  stats: { nodes: number; links: number; types: Record<string, number> };
 };
 type SearchResponse = {
   requested_mode: string; effective_mode: string; semantic_available: boolean;
@@ -43,6 +61,7 @@ type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
   knowledge: number; qa: number; pending_qa: number;
+  wiki?: number; graph?: { nodes: number; links: number; types: Record<string, number> };
   semantic?: {
     available: boolean; backend: string; model_dir: string;
     indexed_documents: number; indexed_chunks: number; reason?: string;
@@ -87,10 +106,76 @@ const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
   { id: "sessions", label: "会话", icon: "◫", badge: "12" },
   { id: "pipeline", label: "流水线", icon: "⌘", badge: "1" },
   { id: "knowledge", label: "知识库", icon: "◇" },
+  { id: "wiki", label: "Wiki 中心", icon: "▤" },
+  { id: "graph", label: "知识关系图", icon: "◎" },
   { id: "rag", label: "RAG 问答", icon: "✦" },
   { id: "qa", label: "QA 审核", icon: "✓", badge: "18" },
   { id: "diagnostics", label: "环境诊断", icon: "+" },
 ];
+
+const wikiCategories = [
+  ["all", "全部页面"],
+  ["overview", "知识总览"],
+  ["projects", "项目"],
+  ["topics", "技术主题"],
+  ["decisions", "设计决策"],
+  ["issues", "问题定位"],
+] as const;
+
+function MarkdownViewer({ markdown }: { markdown: string }) {
+  const body = markdown.replace(/^---[\s\S]*?\n---\s*/, "");
+  const blocks: Array<{ kind: string; value: string }> = [];
+  let code: string[] | null = null;
+  for (const raw of body.split("\n")) {
+    const line = raw.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (code) {
+        blocks.push({ kind: "code", value: code.join("\n") });
+        code = null;
+      } else code = [];
+      continue;
+    }
+    if (code) {
+      code.push(raw);
+      continue;
+    }
+    if (!line.trim()) continue;
+    if (line.startsWith("### ")) blocks.push({ kind: "h3", value: line.slice(4) });
+    else if (line.startsWith("## ")) blocks.push({ kind: "h2", value: line.slice(3) });
+    else if (line.startsWith("# ")) blocks.push({ kind: "h1", value: line.slice(2) });
+    else if (/^[-*]\s+/.test(line)) blocks.push({ kind: "li", value: line.replace(/^[-*]\s+/, "") });
+    else if (line.startsWith("> ")) blocks.push({ kind: "quote", value: line.slice(2) });
+    else blocks.push({ kind: "p", value: line });
+  }
+  return <div className="markdown-viewer">{blocks.map((block, index) => {
+    if (block.kind === "h1") return <h1 key={index}>{block.value}</h1>;
+    if (block.kind === "h2") return <h2 key={index}>{block.value}</h2>;
+    if (block.kind === "h3") return <h3 key={index}>{block.value}</h3>;
+    if (block.kind === "code") return <pre key={index}><code>{block.value}</code></pre>;
+    if (block.kind === "li") return <div className="markdown-list" key={index}><i />{block.value}</div>;
+    if (block.kind === "quote") return <blockquote key={index}>{block.value}</blockquote>;
+    return <p key={index}>{block.value}</p>;
+  })}</div>;
+}
+
+function graphPositions(nodes: GraphNode[]) {
+  const groups = new Map<string, GraphNode[]>();
+  nodes.forEach((node) => {
+    const type = node.type || "other";
+    groups.set(type, [...(groups.get(type) || []), node]);
+  });
+  const radii: Record<string, number> = { agent: 70, project: 170, tool: 265, session: 370 };
+  const fallback = 300;
+  const positions = new Map<string, { x: number; y: number }>();
+  Array.from(groups.entries()).forEach(([type, items], groupIndex) => {
+    const radius = radii[type] ?? fallback + groupIndex * 18;
+    items.forEach((node, index) => {
+      const angle = (index / Math.max(items.length, 1)) * Math.PI * 2 + groupIndex * 0.31;
+      positions.set(node.id, { x: 500 + Math.cos(angle) * radius, y: 390 + Math.sin(angle) * radius });
+    });
+  });
+  return positions;
+}
 
 function StatusPill({ status }: { status: string }) {
   const map: Record<string, string> = { ready: "已入库", review: "待审核", failed: "需处理" };
@@ -111,7 +196,7 @@ export default function Home() {
   const [active, setActive] = useState<View>("overview");
   const [query, setQuery] = useState("");
   const [searchMode, setSearchMode] = useState<"keyword" | "semantic" | "hybrid">("hybrid");
-  const [searchScope, setSearchScope] = useState<"all" | "session" | "knowledge" | "qa">("all");
+  const [searchScope, setSearchScope] = useState<"all" | "session" | "knowledge" | "wiki" | "qa">("all");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searching, setSearching] = useState(false);
@@ -136,17 +221,29 @@ export default function Home() {
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [showTrash, setShowTrash] = useState(false);
   const [ragQuestion, setRagQuestion] = useState("");
-  const [ragScope, setRagScope] = useState<"all" | "session" | "knowledge" | "qa">("all");
+  const [ragScope, setRagScope] = useState<"all" | "session" | "knowledge" | "wiki" | "qa">("all");
   const [ragMode, setRagMode] = useState<"keyword" | "semantic" | "hybrid">("hybrid");
   const [ragLoading, setRagLoading] = useState(false);
   const [ragResult, setRagResult] = useState<RagResponse | null>(null);
+  const [wikiPages, setWikiPages] = useState<WikiPage[]>([]);
+  const [wikiCounts, setWikiCounts] = useState<Record<string, number>>({});
+  const [wikiCategory, setWikiCategory] = useState("all");
+  const [wikiQuery, setWikiQuery] = useState("");
+  const [wikiDetail, setWikiDetail] = useState<WikiDetail | null>(null);
+  const [graph, setGraph] = useState<GraphSnapshot>({ nodes: [], links: [], stats: { nodes: 0, links: 0, types: {} } });
+  const [graphType, setGraphType] = useState("all");
+  const [graphQuery, setGraphQuery] = useState("");
+  const [graphSelected, setGraphSelected] = useState<GraphNode | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
 
   const refreshData = async () => {
-    const [healthResult, sessionResult, qaResult, knowledgeResult] = await Promise.all([
+    const [healthResult, sessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
       apiRequest<Health>("/api/health"),
       apiRequest<Array<Record<string, unknown>>>("/api/sessions?limit=300"),
       apiRequest<Array<Record<string, unknown>>>("/api/qa?limit=300"),
       apiRequest<KnowledgeItem[]>("/api/knowledge?limit=300"),
+      apiRequest<WikiResponse>("/api/wiki?limit=1000"),
+      apiRequest<GraphSnapshot>("/api/graph"),
     ]);
     const normalizedSessions = sessionResult.map((item) => ({
       id: String(item.id ?? ""),
@@ -174,6 +271,9 @@ export default function Home() {
     setSessionItems(normalizedSessions);
     setQaItems(normalizedQa);
     setKnowledgeItems(knowledgeResult);
+    setWikiPages(wikiResult.pages);
+    setWikiCounts(wikiResult.counts);
+    setGraph(graphResult);
     setApiConnected(true);
     if (normalizedSessions.length && !normalizedSessions.some((item) => item.id === selectedSession)) {
       setSelectedSession(normalizedSessions[0].id);
@@ -243,6 +343,49 @@ export default function Home() {
     [query, sessionItems],
   );
   const currentSession = sessionItems.find((item) => item.id === selectedSession) ?? sessionItems[0];
+  const filteredWiki = useMemo(
+    () => wikiPages.filter((page) => (
+      (wikiCategory === "all" || page.category === wikiCategory)
+      && `${page.title} ${page.summary} ${page.project}`.toLowerCase().includes(wikiQuery.toLowerCase())
+    )),
+    [wikiPages, wikiCategory, wikiQuery],
+  );
+  const graphPositionsMap = useMemo(() => graphPositions(graph.nodes), [graph.nodes]);
+  const graphNodes = useMemo(
+    () => graph.nodes.filter((node) => graphType === "all" || node.type === graphType),
+    [graph.nodes, graphType],
+  );
+  const graphNodeIds = useMemo(() => new Set(graphNodes.map((node) => node.id)), [graphNodes]);
+  const graphLinks = useMemo(
+    () => graph.links.filter((link) => graphNodeIds.has(String(link.source)) && graphNodeIds.has(String(link.target))),
+    [graph.links, graphNodeIds],
+  );
+
+  const openWiki = async (id: string) => {
+    const [category, slug] = id.split("/", 2);
+    try {
+      const detail = await apiRequest<WikiDetail>(`/api/wiki/${encodeURIComponent(category)}/${encodeURIComponent(slug)}`);
+      setWikiDetail(detail);
+      setActive("wiki");
+      setSearchOpen(false);
+    } catch (error) {
+      notify("无法打开 Wiki 页面", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const rebuildKnowledgeGraph = async () => {
+    setGraphLoading(true);
+    try {
+      const result = await apiRequest<{ graph: GraphSnapshot }>("/api/graph/rebuild", { method: "POST", body: "{}" });
+      setGraph(result.graph);
+      await refreshData();
+      notify("知识关系图已更新", `${result.graph.stats.nodes} 个节点，${result.graph.stats.links} 条关系`);
+    } catch (error) {
+      notify("关系图构建失败", error instanceof Error ? error.message : "请检查 seCall 图谱组件");
+    } finally {
+      setGraphLoading(false);
+    }
+  };
 
   const openKnowledge = async (id: string) => {
     try {
@@ -357,6 +500,8 @@ export default function Home() {
     } else if (item.scope === "knowledge") {
       setActive("knowledge");
       void openKnowledge(item.id);
+    } else if (item.scope === "wiki") {
+      void openWiki(item.id);
     } else {
       setActive("qa");
       setSearchOpen(false);
@@ -485,9 +630,9 @@ export default function Home() {
             {searchOpen && (
               <section className="search-popover" aria-label="搜索结果">
                 <div className="search-controls">
-                  <div>{(["all", "session", "knowledge", "qa"] as const).map((scope) => (
+                  <div>{(["all", "session", "knowledge", "wiki", "qa"] as const).map((scope) => (
                     <button className={searchScope === scope ? "active" : ""} key={scope} onClick={() => setSearchScope(scope)}>
-                      {{ all: "全部", session: "会话", knowledge: "知识", qa: "QA" }[scope]}
+                      {{ all: "全部", session: "会话", knowledge: "知识", wiki: "Wiki", qa: "QA" }[scope]}
                     </button>
                   ))}</div>
                   <select value={searchMode} onChange={(event) => setSearchMode(event.target.value as typeof searchMode)} aria-label="检索模式">
@@ -500,7 +645,7 @@ export default function Home() {
                 <div className="search-results">
                   {searching ? <p className="search-empty">正在检索…</p> : searchResults.length ? searchResults.map((item) => (
                     <button key={`${item.scope}-${item.id}`} onClick={() => openSearchResult(item)}>
-                      <span className={`result-icon ${item.scope}`}>{item.scope === "session" ? "会" : item.scope === "knowledge" ? "知" : "问"}</span>
+                      <span className={`result-icon ${item.scope}`}>{item.scope === "session" ? "会" : item.scope === "knowledge" ? "知" : item.scope === "wiki" ? "W" : "问"}</span>
                       <span><strong>{item.title}</strong><small>{item.snippet || "匹配到相关内容"}</small><em>{item.project} · {item.match_type === "keyword" ? "关键词匹配" : item.match_type}</em></span>
                       <b>›</b>
                     </button>
@@ -668,6 +813,116 @@ export default function Home() {
             </section>
           )}
 
+          {active === "wiki" && (
+            <section className="subpage wiki-page">
+              <div className="subpage-heading">
+                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>Wiki 知识中心</h1><p>按项目、主题、决策和问题定位组织研发知识，并保留来源会话与反向链接。</p></div>
+                <div className="wiki-heading-stats"><strong>{wikiPages.length}</strong><span>篇文档</span><i /><strong>{wikiCounts.projects ?? 0}</strong><span>个项目</span></div>
+              </div>
+              <div className="wiki-shell">
+                <aside className="wiki-browser">
+                  <label><span>⌕</span><input value={wikiQuery} onChange={(event) => setWikiQuery(event.target.value)} placeholder="筛选 Wiki…" /></label>
+                  <nav>
+                    {wikiCategories.map(([id, label]) => (
+                      <button key={id} className={wikiCategory === id ? "active" : ""} onClick={() => setWikiCategory(id)}>
+                        <span>{id === "all" ? "⌘" : id === "projects" ? "▦" : id === "topics" ? "◇" : id === "decisions" ? "✓" : id === "issues" ? "!" : "◎"}</span>
+                        {label}<em>{id === "all" ? wikiPages.length : wikiCounts[id] ?? 0}</em>
+                      </button>
+                    ))}
+                  </nav>
+                  <div className="wiki-page-list">
+                    {filteredWiki.map((page) => (
+                      <button key={page.id} className={wikiDetail?.id === page.id ? "active" : ""} onClick={() => void openWiki(page.id)}>
+                        <strong>{page.title}</strong><small>{page.category_label} · {page.project}</small><p>{page.summary || "打开查看文档内容"}</p>
+                      </button>
+                    ))}
+                    {!filteredWiki.length && <p className="wiki-empty">此分类暂无页面</p>}
+                  </div>
+                </aside>
+                <article className="wiki-reader">
+                  {wikiDetail ? (
+                    <>
+                      <header>
+                        <div><span>{wikiDetail.category_label}</span><h2>{wikiDetail.title}</h2><p>{wikiDetail.summary}</p></div>
+                        <aside><small>项目</small><strong>{wikiDetail.project}</strong><small>来源会话</small><code>{wikiDetail.source_session || "聚合文档"}</code></aside>
+                      </header>
+                      <div className="wiki-reader-body"><MarkdownViewer markdown={wikiDetail.markdown} /></div>
+                      {(wikiDetail.backlinks.length > 0 || wikiDetail.references.length > 0) && (
+                        <footer>
+                          <h3>关联知识</h3>
+                          <div>{wikiDetail.backlinks.map((item) => <button key={item.id} onClick={() => void openWiki(item.id)}>↗ {item.title}</button>)}</div>
+                        </footer>
+                      )}
+                    </>
+                  ) : (
+                    <div className="wiki-welcome">
+                      <span>▤</span><p className="eyebrow">LOCAL KNOWLEDGE BASE</p><h2>让研发知识形成结构</h2><p>从左侧选择一个页面。Wiki 会把会话中沉淀的问题、技术主题、项目脉络和设计决策组织成可阅读的知识网络。</p>
+                      <div>{wikiCategories.slice(1).map(([id, label]) => <button key={id} onClick={() => setWikiCategory(id)}><strong>{wikiCounts[id] ?? 0}</strong><span>{label}</span></button>)}</div>
+                    </div>
+                  )}
+                </article>
+              </div>
+            </section>
+          )}
+
+          {active === "graph" && (
+            <section className="subpage graph-page">
+              <div className="subpage-heading">
+                <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>探索会话、项目、工具与智能体之间的连接，发现跨会话复用的工程经验。</p></div>
+                <button className="primary-button" disabled={graphLoading} onClick={() => void rebuildKnowledgeGraph()}>{graphLoading ? "正在构建…" : "↻ 重建关系图"}</button>
+              </div>
+              <div className="graph-toolbar">
+                <label><span>⌕</span><input value={graphQuery} onChange={(event) => setGraphQuery(event.target.value)} placeholder="查找节点…" /></label>
+                <div>{["all", "session", "project", "tool", "agent"].map((type) => (
+                  <button key={type} className={graphType === type ? "active" : ""} onClick={() => setGraphType(type)}>
+                    {{ all: "全部", session: "会话", project: "项目", tool: "工具", agent: "智能体" }[type as "all" | "session" | "project" | "tool" | "agent"]}
+                    <em>{type === "all" ? graph.stats.nodes : graph.stats.types[type] ?? 0}</em>
+                  </button>
+                ))}</div>
+                <span className="graph-summary">{graph.stats.nodes} 节点 · {graph.stats.links} 关系</span>
+              </div>
+              <div className="graph-shell">
+                <div className="graph-canvas">
+                  {graph.nodes.length ? (
+                    <svg viewBox="0 0 1000 780" role="img" aria-label="知识关系图">
+                      <g className="graph-links">{graphLinks.map((link, index) => {
+                        const source = graphPositionsMap.get(String(link.source));
+                        const target = graphPositionsMap.get(String(link.target));
+                        if (!source || !target) return null;
+                        return <line key={`${link.source}-${link.target}-${index}`} x1={source.x} y1={source.y} x2={target.x} y2={target.y}><title>{link.relation || "关联"}</title></line>;
+                      })}</g>
+                      <g className="graph-nodes">{graphNodes.map((node) => {
+                        const position = graphPositionsMap.get(node.id);
+                        if (!position) return null;
+                        const matched = !graphQuery || `${node.label || node.id} ${node.project || ""}`.toLowerCase().includes(graphQuery.toLowerCase());
+                        return <g key={node.id} className={`${node.type || "other"} ${matched ? "matched" : "dimmed"} ${graphSelected?.id === node.id ? "selected" : ""}`} transform={`translate(${position.x} ${position.y})`} onClick={() => setGraphSelected(node)}>
+                          <circle r={node.type === "project" ? 16 : node.type === "agent" ? 15 : 10} />
+                          <text y={node.type === "session" ? 22 : 26}>{(node.label || node.id).slice(0, 16)}</text>
+                          <title>{node.label || node.id}</title>
+                        </g>;
+                      })}</g>
+                    </svg>
+                  ) : <div className="graph-empty"><span>◎</span><h3>关系图尚未构建</h3><p>点击“重建关系图”，从本地会话提取项目、工具和智能体关系。</p></div>}
+                  <div className="graph-legend"><span className="project">项目</span><span className="session">会话</span><span className="tool">工具</span><span className="agent">智能体</span></div>
+                </div>
+                <aside className="graph-inspector">
+                  {graphSelected ? (
+                    <>
+                      <span className={`graph-node-mark ${graphSelected.type}`}>●</span><p className="eyebrow">SELECTED NODE</p><h2>{graphSelected.label || graphSelected.id}</h2>
+                      <dl><div><dt>类型</dt><dd>{graphSelected.type || "其他"}</dd></div><div><dt>项目</dt><dd>{graphSelected.project || "—"}</dd></div><div><dt>关联数量</dt><dd>{graph.links.filter((link) => link.source === graphSelected.id || link.target === graphSelected.id).length}</dd></div></dl>
+                      <h3>直接关系</h3>
+                      <div className="neighbor-list">{graph.links.filter((link) => link.source === graphSelected.id || link.target === graphSelected.id).slice(0, 12).map((link, index) => {
+                        const neighborId = String(link.source === graphSelected.id ? link.target : link.source);
+                        const neighbor = graph.nodes.find((item) => item.id === neighborId);
+                        return <button key={`${neighborId}-${index}`} onClick={() => neighbor && setGraphSelected(neighbor)}><span>{neighbor?.label || neighborId}</span><em>{link.relation || "关联"}</em></button>;
+                      })}</div>
+                    </>
+                  ) : <div className="inspector-empty"><span>✦</span><h3>选择一个节点</h3><p>查看它的类型、所属项目和直接关系。</p></div>}
+                </aside>
+              </div>
+            </section>
+          )}
+
           {active === "rag" && (
             <section className="subpage rag-page">
               <div className="subpage-heading">
@@ -681,7 +936,7 @@ export default function Home() {
                   <div className="rag-mode-row">
                     <label>检索范围
                       <select value={ragScope} onChange={(event) => setRagScope(event.target.value as typeof ragScope)}>
-                        <option value="all">全部知识</option><option value="session">研发会话</option><option value="knowledge">知识卡片</option><option value="qa">已审核 QA</option>
+                        <option value="all">全部知识</option><option value="session">研发会话</option><option value="knowledge">知识卡片</option><option value="wiki">Wiki 文档</option><option value="qa">已审核 QA</option>
                       </select>
                     </label>
                     <label>召回方式

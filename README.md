@@ -104,6 +104,8 @@ secall-opencode serve
 - 统一搜索会话、知识卡片和审核通过的 QA；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
+- Wiki 知识中心，按总览、项目、主题、决策和问题定位分类浏览；
+- 会话、项目、工具与智能体的可交互知识关系图；
 - BGE-M3 ONNX 本地语义检索与 BM25 混合召回；
 - 带 `[S1]` 来源引用的 OpenCode RAG 知识问答；
 - `keyword`、`semantic`、`hybrid` 三种稳定搜索接口。
@@ -135,9 +137,18 @@ python -m pip install -e ".[semantic]"
 ```
 
 运行 `secall-opencode index` 会同步建立关键词索引和 BGE-M3 向量索引。
-知识卡片与已审核 QA 使用 1024 维本地向量；原始 Session 继续使用
+Wiki、知识卡片与已审核 QA 使用 1024 维本地向量；原始 Session 继续使用
 seCall/BM25，以避免大型工具输出导致首次索引耗时过长。`hybrid` 模式会融合
 两类召回结果。
+
+Wiki 与关系图接口：
+
+```text
+GET  /api/wiki
+GET  /api/wiki/{category}/{slug}
+GET  /api/graph
+POST /api/graph/rebuild
+```
 
 RAG 问答接口：
 

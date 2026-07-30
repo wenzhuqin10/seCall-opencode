@@ -161,6 +161,24 @@ def test_all_scope_keeps_knowledge_when_session_backend_has_no_results(
     assert "download-session-001" in {item.id for item in results}
 
 
+def test_wiki_pages_join_keyword_index(tmp_path: Path, monkeypatch) -> None:
+    config = _search_config(tmp_path, monkeypatch)
+    projects = tmp_path / "wiki" / "projects"
+    projects.mkdir(parents=True)
+    (projects / "radio.md").write_text(
+        "# 无线基带项目\n\n记录 HARQ 状态机与调度器排查方法。\n",
+        encoding="utf-8",
+    )
+    backend = KeywordSearchBackend(config)
+
+    rebuilt = backend.rebuild()
+    results = backend.search("状态机", scope="wiki", limit=10)
+
+    assert rebuilt["indexed"] == 3
+    assert results[0].id == "projects/radio"
+    assert results[0].scope == "wiki"
+
+
 def test_onnx_backend_builds_normalized_semantic_index(
     tmp_path: Path, monkeypatch
 ) -> None:
