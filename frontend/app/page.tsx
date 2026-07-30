@@ -7,6 +7,8 @@ type Toast = { title: string; detail: string } | null;
 type SessionItem = {
   id: string; title: string; project: string; model: string; turns: number;
   updated: string; status: string; source?: string; path?: string;
+  review_status?: "pending" | "approved" | "rejected";
+  review_note?: string; hidden?: boolean; reviewed_at?: string;
 };
 type QaItem = {
   id: string; question: string; answer: string; source: string;
@@ -182,6 +184,16 @@ function StatusPill({ status }: { status: string }) {
   return <span className={`status-pill ${status}`}><i />{map[status] ?? status}</span>;
 }
 
+function ReviewPill({ status }: { status?: string }) {
+  const value = status || "pending";
+  const labels: Record<string, string> = {
+    pending: "待预审核",
+    approved: "已通过",
+    rejected: "已拒绝",
+  };
+  return <span className={`review-pill ${value}`}><i />{labels[value] ?? value}</span>;
+}
+
 function MiniBars() {
   return (
     <div className="mini-bars" aria-label="近七日知识生成趋势">
@@ -207,6 +219,8 @@ export default function Home() {
   const [pipelineStep, setPipelineStep] = useState(4);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
+  const [hiddenSessionItems, setHiddenSessionItems] = useState<SessionItem[]>([]);
+  const [sessionReviewFilter, setSessionReviewFilter] = useState<"all" | "pending" | "approved" | "rejected" | "hidden">("all");
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
   const [health, setHealth] = useState<Health | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
@@ -237,15 +251,16 @@ export default function Home() {
   const [graphLoading, setGraphLoading] = useState(false);
 
   const refreshData = async () => {
-    const [healthResult, sessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
+    const [healthResult, sessionResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
       apiRequest<Health>("/api/health"),
       apiRequest<Array<Record<string, unknown>>>("/api/sessions?limit=300"),
+      apiRequest<Array<Record<string, unknown>>>("/api/sessions/hidden?limit=1000"),
       apiRequest<Array<Record<string, unknown>>>("/api/qa?limit=300"),
       apiRequest<KnowledgeItem[]>("/api/knowledge?limit=300"),
       apiRequest<WikiResponse>("/api/wiki?limit=1000"),
       apiRequest<GraphSnapshot>("/api/graph"),
     ]);
-    const normalizedSessions = sessionResult.map((item) => ({
+    const normalizeSession = (item: Record<string, unknown>): SessionItem => ({
       id: String(item.id ?? ""),
       title: String(item.title ?? "未命名会话"),
       project: String(item.project ?? "unknown"),
@@ -255,7 +270,13 @@ export default function Home() {
       status: String(item.status ?? "ready"),
       source: String(item.source ?? "unknown"),
       path: String(item.path ?? ""),
-    }));
+      review_status: String(item.review_status ?? "pending") as SessionItem["review_status"],
+      review_note: String(item.review_note ?? ""),
+      hidden: Boolean(item.hidden),
+      reviewed_at: String(item.reviewed_at ?? ""),
+    });
+    const normalizedSessions = sessionResult.map(normalizeSession);
+    const normalizedHiddenSessions = hiddenSessionResult.map(normalizeSession);
     const normalizedQa = qaResult.map((item, index) => ({
       id: String(item.id ?? `qa-${index}`),
       question: String(item.question ?? ""),
@@ -269,6 +290,7 @@ export default function Home() {
     }));
     setHealth(healthResult);
     setSessionItems(normalizedSessions);
+    setHiddenSessionItems(normalizedHiddenSessions);
     setQaItems(normalizedQa);
     setKnowledgeItems(knowledgeResult);
     setWikiPages(wikiResult.pages);
@@ -342,7 +364,22 @@ export default function Home() {
     () => sessionItems.filter((item) => `${item.title} ${item.project} ${item.id} ${item.source ?? ""}`.toLowerCase().includes(query.toLowerCase())),
     [query, sessionItems],
   );
+  const reviewedSessions = useMemo(() => {
+    const source = sessionReviewFilter === "hidden" ? hiddenSessionItems : sessionItems;
+    return source.filter((item) => {
+      const matchesQuery = `${item.title} ${item.project} ${item.id} ${item.source ?? ""}`.toLowerCase().includes(query.toLowerCase());
+      const matchesReview = sessionReviewFilter === "all"
+        || sessionReviewFilter === "hidden"
+        || item.review_status === sessionReviewFilter;
+      return matchesQuery && matchesReview;
+    });
+  }, [hiddenSessionItems, query, sessionItems, sessionReviewFilter]);
+  const approvedSessions = useMemo(
+    () => sessionItems.filter((item) => item.review_status === "approved"),
+    [sessionItems],
+  );
   const currentSession = sessionItems.find((item) => item.id === selectedSession) ?? sessionItems[0];
+  const pipelineSession = approvedSessions.find((item) => item.id === selectedSession) ?? approvedSessions[0];
   const filteredWiki = useMemo(
     () => wikiPages.filter((page) => (
       (wikiCategory === "all" || page.category === wikiCategory)
@@ -384,6 +421,52 @@ export default function Home() {
       notify("关系图构建失败", error instanceof Error ? error.message : "请检查 seCall 图谱组件");
     } finally {
       setGraphLoading(false);
+    }
+  };
+
+  const reviewSession = async (
+    session: SessionItem,
+    status: "pending" | "approved" | "rejected",
+  ) => {
+    const note = status === "rejected"
+      ? window.prompt("可选：填写拒绝原因，便于后续复核。", session.review_note || "") ?? session.review_note ?? ""
+      : session.review_note || "";
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(session.id)}/review`, {
+        method: "POST",
+        body: JSON.stringify({ status, note }),
+      });
+      await refreshData();
+      notify(
+        status === "approved" ? "会话已通过预审核" : status === "rejected" ? "会话已拒绝" : "会话已退回待审核",
+        status === "approved" ? "现在可以进入知识流水线" : "低质会话不会进入检索和流水线",
+      );
+    } catch (error) {
+      notify("审核保存失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const hideFrontendSession = async (session: SessionItem) => {
+    if (!window.confirm(`从前端隐藏“${session.title}”？\n\nOpenCode 原始会话和 Vault Session 不会被删除。`)) return;
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
+      await refreshData();
+      notify("会话已从前端隐藏", "原始 OpenCode 会话保持不变，可在“已隐藏”中恢复");
+    } catch (error) {
+      notify("隐藏失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const restoreFrontendSession = async (session: SessionItem) => {
+    try {
+      await apiRequest(`/api/sessions/${encodeURIComponent(session.id)}/restore`, {
+        method: "POST",
+        body: "{}",
+      });
+      await refreshData();
+      notify("会话已恢复显示", "原审核状态保持不变");
+    } catch (error) {
+      notify("恢复失败", error instanceof Error ? error.message : "请检查本地服务");
     }
   };
 
@@ -509,6 +592,10 @@ export default function Home() {
   };
 
   const startPipeline = async () => {
+    if (!pipelineSession) {
+      notify("暂无可运行会话", "请先在“研发会话”中通过至少一个会话的预审核");
+      return;
+    }
     setModal(false);
     setActive("pipeline");
     setPipelineRunning(true);
@@ -523,7 +610,7 @@ export default function Home() {
       if (!apiConnected) throw new Error("本地 API 未连接，请先启动本地服务。");
       const result = await apiRequest<{ knowledge: { qa_count: number } }>("/api/pipeline", {
         method: "POST",
-        body: JSON.stringify({ session_id: selectedSession, reindex: true }),
+        body: JSON.stringify({ session_id: pipelineSession.id, reindex: true }),
       });
       window.clearInterval(timer);
       setPipelineStep(5);
@@ -746,16 +833,46 @@ export default function Home() {
 
           {active === "sessions" && (
             <section className="subpage">
-              <div className="subpage-heading"><div><p className="eyebrow">SESSION ARCHIVE</p><h1>研发会话</h1><p>管理 OpenCode 与 ChatGPT 会话，并选择需要沉淀的内容。</p></div><div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div></div>
-              <div className="filter-bar"><button className="active">全部 {sessionItems.length}</button><button>ChatGPT {sessionItems.filter((item) => item.source === "chatgpt").length}</button><button>OpenCode {sessionItems.filter((item) => item.source === "opencode").length}</button><span /><select aria-label="项目筛选"><option>全部项目</option>{Array.from(new Set(sessionItems.map((item) => item.project))).map((project) => <option key={project}>{project}</option>)}</select></div>
+              <div className="subpage-heading"><div><p className="eyebrow">SESSION PRE-REVIEW</p><h1>研发会话</h1><p>先审核会话质量，再进入知识流水线；隐藏操作不会删除 OpenCode 原始会话。</p></div><div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div></div>
+              <div className="session-review-summary">
+                <article><span className="pending">●</span><strong>{sessionItems.filter((item) => item.review_status === "pending").length}</strong><small>待预审核</small></article>
+                <article><span className="approved">●</span><strong>{sessionItems.filter((item) => item.review_status === "approved").length}</strong><small>已通过</small></article>
+                <article><span className="rejected">●</span><strong>{sessionItems.filter((item) => item.review_status === "rejected").length}</strong><small>已拒绝</small></article>
+                <article><span className="hidden">●</span><strong>{hiddenSessionItems.length}</strong><small>前端隐藏</small></article>
+                <p><b>安全说明</b> 审核和隐藏仅影响当前知识工作台，不修改 OpenCode 数据库和原始 Session Markdown。</p>
+              </div>
+              <div className="filter-bar review-filter">
+                {([
+                  ["all", `全部 ${sessionItems.length}`],
+                  ["pending", `待审核 ${sessionItems.filter((item) => item.review_status === "pending").length}`],
+                  ["approved", `已通过 ${sessionItems.filter((item) => item.review_status === "approved").length}`],
+                  ["rejected", `已拒绝 ${sessionItems.filter((item) => item.review_status === "rejected").length}`],
+                  ["hidden", `已隐藏 ${hiddenSessionItems.length}`],
+                ] as const).map(([id, label]) => <button key={id} className={sessionReviewFilter === id ? "active" : ""} onClick={() => setSessionReviewFilter(id)}>{label}</button>)}
+                <span /><select aria-label="项目筛选"><option>全部项目</option>{Array.from(new Set(sessionItems.map((item) => item.project))).map((project) => <option key={project}>{project}</option>)}</select>
+              </div>
               <article className="panel table-panel">
                 <div className="data-table">
-                  <div className="table-row table-head"><span>会话名称</span><span>模型</span><span>轮次</span><span>状态</span><span>更新时间</span><span /></div>
-                  {filteredSessions.map((session) => (
-                    <button className={`table-row ${selectedSession === session.id ? "selected" : ""}`} key={session.id} onClick={() => setSelectedSession(session.id)}>
-                      <span className="title-cell"><i>{session.project === "seCall" ? "SC" : "WB"}</i><b>{session.title}<small>{session.id} · {session.project}</small></b></span><span>{session.model}</span><span>{session.turns}</span><StatusPill status={session.status} /><span>{session.updated}</span><span>•••</span>
-                    </button>
+                  <div className="table-row session-review-row table-head"><span>会话名称</span><span>模型</span><span>轮次</span><span>预审核</span><span>更新时间</span><span>操作</span></div>
+                  {reviewedSessions.map((session) => (
+                    <div className={`table-row session-review-row ${selectedSession === session.id ? "selected" : ""}`} key={session.id} onClick={() => setSelectedSession(session.id)}>
+                      <span className="title-cell"><i>{session.project === "seCall" ? "SC" : "WB"}</i><b>{session.title}<small>{session.id} · {session.project}{session.review_note ? ` · ${session.review_note}` : ""}</small></b></span>
+                      <span>{session.model}</span><span>{session.turns}</span><ReviewPill status={session.review_status} /><span>{session.updated}</span>
+                      <span className="session-review-actions" onClick={(event) => event.stopPropagation()}>
+                        {session.hidden ? (
+                          <button className="restore" onClick={() => void restoreFrontendSession(session)}>恢复显示</button>
+                        ) : (
+                          <>
+                            {session.review_status !== "approved" && <button className="approve" onClick={() => void reviewSession(session, "approved")}>通过</button>}
+                            {session.review_status !== "rejected" && <button className="reject" onClick={() => void reviewSession(session, "rejected")}>拒绝</button>}
+                            {session.review_status !== "pending" && <button onClick={() => void reviewSession(session, "pending")}>待审</button>}
+                            <button className="hide" onClick={() => void hideFrontendSession(session)}>隐藏</button>
+                          </>
+                        )}
+                      </span>
+                    </div>
                   ))}
+                  {!reviewedSessions.length && <div className="empty-state">当前筛选条件下没有会话</div>}
                 </div>
               </article>
             </section>
@@ -1023,7 +1140,13 @@ export default function Home() {
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="pipeline-title">
             <button className="modal-close" onClick={() => setModal(false)} aria-label="关闭">×</button>
             <div className="modal-mark">⌘</div><p className="eyebrow">NEW PIPELINE</p><h2 id="pipeline-title">创建知识流水线</h2><p>选择一个 OpenCode Session，生成可审核的工程知识。</p>
-            <label>选择会话<select value={selectedSession} onChange={(event) => setSelectedSession(event.target.value)}>{sessionItems.map((item) => <option value={item.id} key={item.id}>{item.source === "chatgpt" ? "ChatGPT · " : ""}{item.title}</option>)}</select></label>
+            <label>选择已通过预审核的会话
+              <select value={pipelineSession?.id ?? ""} onChange={(event) => setSelectedSession(event.target.value)} disabled={!approvedSessions.length}>
+                {!approvedSessions.length && <option value="">暂无已通过会话</option>}
+                {approvedSessions.map((item) => <option value={item.id} key={item.id}>{item.source === "chatgpt" ? "ChatGPT · " : ""}{item.title}</option>)}
+              </select>
+              {!approvedSessions.length && <small className="form-help">请先关闭窗口，在“研发会话”页面完成预审核。</small>}
+            </label>
             <div className="form-grid"><label>生成模型<select defaultValue=""><option value="">OpenCode 默认模型</option>{health?.models?.map((model) => <option value={model} key={model}>{model}</option>)}</select></label><label>知识语言<select><option>简体中文</option><option>English</option></select></label></div>
             <div className="switch-row"><div><strong>生成候选 QA</strong><small>从 Issue Card 自动提取 3–10 条问答</small></div><input type="checkbox" defaultChecked aria-label="生成候选 QA" /></div>
             <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" defaultChecked aria-label="完成后重建索引" /></div>

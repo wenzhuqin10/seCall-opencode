@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Protocol, Sequence
 from .config import Config
 from .knowledge_store import list_knowledge_documents, read_knowledge_document
 from .opencode_client import Runner
+from .session_review_store import excluded_session_ids
 from .wiki_store import iter_wiki_pages, read_wiki_page
 
 
@@ -135,11 +136,14 @@ def _session_documents(config: Config) -> Iterator[SearchDocument]:
     root = config.vault / "raw" / ".sessions"
     if not root.exists():
         return
+    excluded = excluded_session_ids(config)
     for path in root.rglob("*.md"):
         body = path.read_text(encoding="utf-8", errors="replace")
         meta = _frontmatter(body)
         title_match = TITLE_PATTERN.search(body)
         session_id = meta.get("session_id") or path.stem
+        if session_id in excluded:
+            continue
         yield SearchDocument(
             id=session_id,
             scope="session",
@@ -383,7 +387,7 @@ class KeywordSearchBackend:
             if not isinstance(item, dict):
                 continue
             session_id = str(item.get("session_id") or "")
-            if not session_id or session_id in seen:
+            if not session_id or session_id in seen or session_id not in sessions:
                 continue
             seen.add(session_id)
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}

@@ -25,6 +25,13 @@ from .knowledge_store import (
 from .opencode_client import OpenCodeClient, Runner
 from .rag import answer_with_rag
 from .search import HybridSearchService, build_search_service
+from .session_review_store import (
+    annotate_sessions,
+    get_session_review,
+    hide_session,
+    restore_session,
+    update_session_review,
+)
 from .wiki_store import graph_snapshot, list_wiki_pages, read_wiki_page, rebuild_graph
 
 
@@ -95,13 +102,18 @@ def _safe_vault_path(vault: Path, path: Path) -> Path:
     return candidate
 
 
-def list_vault_sessions(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
+def list_vault_sessions(
+    config: Config,
+    limit: int = 200,
+    *,
+    include_hidden: bool = False,
+) -> List[Dict[str, Any]]:
     root = config.vault / "raw" / ".sessions"
     if not root.exists():
         return []
     result: List[Dict[str, Any]] = []
     files = sorted(root.rglob("*.md"), key=lambda item: item.stat().st_mtime, reverse=True)
-    for path in files[: max(1, min(limit, 1000))]:
+    for path in files[:1000]:
         text = path.read_text(encoding="utf-8", errors="replace")
         meta = _frontmatter(text)
         title_match = re.search(r"(?m)^#\s+(.+)$", text)
@@ -120,7 +132,8 @@ def list_vault_sessions(config: Config, limit: int = 200) -> List[Dict[str, Any]
                 "updated": int(path.stat().st_mtime * 1000),
             }
         )
-    return result
+    annotated = annotate_sessions(config, result, include_hidden=include_hidden)
+    return annotated[: max(1, min(limit, 1000))]
 
 
 def list_knowledge(config: Config, limit: int = 200) -> List[Dict[str, Any]]:
@@ -180,10 +193,15 @@ def run_session_pipeline(
     overwrite: bool = False,
     timeout: int = 1800,
 ) -> Dict[str, Any]:
-    sessions = list_vault_sessions(config, limit=1000)
+    sessions = list_vault_sessions(config, limit=1000, include_hidden=True)
     match = next((item for item in sessions if item["id"] == session_id), None)
     if not match:
         raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+    review = get_session_review(config, session_id)
+    if review["hidden"]:
+        raise ValueError("该会话已在前端隐藏，请先恢复后再运行流水线。")
+    if review["review_status"] != "approved":
+        raise ValueError("该会话尚未通过预审核，只有“已通过”的会话可以运行流水线。")
     session_path = _safe_vault_path(config.vault, Path(match["path"]))
     prompt = Path(__file__).parent / "prompts" / "issue-card.md"
     generated = OpenCodeClient(config.opencode_command).run_generation(
@@ -213,7 +231,7 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.5"
+    server_version = "seCallOpenCodeLocal/0.6"
 
     @property
     def config(self) -> Config:
@@ -313,7 +331,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(
                     {
                         "ready": True,
-                        "api_version": "0.5.0",
+                        "api_version": "0.6.0",
                         "vault": str(self.config.vault),
                         "opencode_version": opencode_version,
                         "models": models,
@@ -329,6 +347,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 )
             elif parsed.path == "/api/sessions":
                 self._ok(list_vault_sessions(self.config, limit))
+            elif parsed.path == "/api/sessions/hidden":
+                hidden = [
+                    item
+                    for item in list_vault_sessions(
+                        self.config, limit=1000, include_hidden=True
+                    )
+                    if item["hidden"]
+                ]
+                self._ok(hidden[: max(1, min(limit, 1000))])
             elif parsed.path == "/api/knowledge":
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":
@@ -434,6 +461,39 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/graph/rebuild":
                 result = rebuild_graph(self.config)
                 self._ok(result)
+            elif (
+                parsed.path.startswith("/api/sessions/")
+                and parsed.path.endswith("/review")
+            ):
+                session_id = unquote(
+                    parsed.path.removeprefix("/api/sessions/").removesuffix("/review")
+                ).rstrip("/")
+                known = {
+                    item["id"]
+                    for item in list_vault_sessions(
+                        self.config, limit=1000, include_hidden=True
+                    )
+                }
+                if session_id not in known:
+                    raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+                result = update_session_review(
+                    self.config,
+                    session_id,
+                    str(body.get("status") or ""),
+                    str(body.get("note") or ""),
+                )
+                self._refresh_search()
+                self._ok(result)
+            elif (
+                parsed.path.startswith("/api/sessions/")
+                and parsed.path.endswith("/restore")
+            ):
+                session_id = unquote(
+                    parsed.path.removeprefix("/api/sessions/").removesuffix("/restore")
+                ).rstrip("/")
+                result = restore_session(self.config, session_id)
+                self._refresh_search()
+                self._ok(result)
             elif parsed.path == "/api/qa/review":
                 qa_id = str(body.get("id") or "")
                 status = str(body.get("status") or "")
@@ -493,6 +553,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:  # noqa: N802
         try:
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/sessions/"):
+                session_id = unquote(parsed.path.removeprefix("/api/sessions/"))
+                known = {
+                    item["id"]
+                    for item in list_vault_sessions(
+                        self.config, limit=1000, include_hidden=True
+                    )
+                }
+                if session_id not in known:
+                    raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+                hidden = hide_session(self.config, session_id)
+                self._refresh_search()
+                self._ok(hidden)
+                return
             if not parsed.path.startswith("/api/knowledge/"):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = parsed.path.removeprefix("/api/knowledge/")
