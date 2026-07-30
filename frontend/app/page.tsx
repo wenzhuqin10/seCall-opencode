@@ -289,6 +289,7 @@ export default function Home() {
   const [graphQuery, setGraphQuery] = useState("");
   const [graphSelected, setGraphSelected] = useState<GraphNode | null>(null);
   const [graphLoading, setGraphLoading] = useState(false);
+  const [clock, setClock] = useState(() => new Date());
 
   const refreshData = async () => {
     const [healthResult, sessionResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
@@ -361,6 +362,11 @@ export default function Home() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(new Date()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const notify = (title: string, detail: string) => {
     setToast({ title, detail });
     window.setTimeout(() => setToast(null), 3200);
@@ -429,12 +435,31 @@ export default function Home() {
     [sessionItems],
   );
   const pipelineSession = approvedSessions.find((item) => item.id === selectedSession) ?? approvedSessions[0];
-  const hour = new Date().getHours();
-  const greeting = hour >= 5 && hour < 12 ? "早上好" : hour < 14 ? "中午好" : hour < 18 ? "下午好" : "晚上好";
-  const today = new Date();
-  const todayDay = today.getDate();
-  const todayWeekday = new Intl.DateTimeFormat("zh-CN", { weekday: "long" }).format(today);
-  const todayMonth = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long" }).format(today);
+  const hour = Number(new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    hour: "2-digit",
+    hourCycle: "h23",
+  }).format(clock));
+  const greeting = hour >= 5 && hour < 12
+    ? "早上好"
+    : hour >= 12 && hour < 14
+      ? "中午好"
+      : hour >= 14 && hour < 18
+        ? "下午好"
+        : "晚上好";
+  const todayDay = Number(new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    day: "numeric",
+  }).format(clock));
+  const todayWeekday = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    weekday: "long",
+  }).format(clock);
+  const todayMonth = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "long",
+  }).format(clock);
   const filteredWiki = useMemo(
     () => wikiPages.filter((page) => (
       (wikiCategory === "all" || page.category === wikiCategory)
@@ -1060,18 +1085,16 @@ export default function Home() {
                   )) : <div className="empty-state">回收站为空</div>}
                 </div>
               ) : <div className="knowledge-grid">
-                {(knowledgeItems.length ? knowledgeItems : [
-                  { id: "demo-k1", title: "HARQ timeout 问题定位", project: "Scheduler", summary: "定位 HARQ 状态异常路径并记录验证方法。", confidence: "high", source_session: "ses_demo", review_status: "pending" },
-                  { id: "demo-k2", title: "Wiki 页面未生成排查手册", project: "seCall", summary: "从 Session 导出、Vault 写入到索引重建的诊断流程。", confidence: "medium", source_session: "ses_demo", review_status: "pending" },
-                ]).map((item) => {
+                {knowledgeItems.map((item) => {
                   const score = ({ high: 96, medium: 82, low: 58 } as Record<string, number>)[item.confidence] ?? 75;
                   return (
-                  <article className="knowledge-card" key={item.id} tabIndex={0} onClick={() => { if (!item.id.startsWith("demo-")) void openKnowledge(item.id); }} onKeyDown={(event) => { if (event.key === "Enter" && !item.id.startsWith("demo-")) void openKnowledge(item.id); }}>
+                  <article className="knowledge-card" key={item.id} tabIndex={0} onClick={() => void openKnowledge(item.id)} onKeyDown={(event) => { if (event.key === "Enter") void openKnowledge(item.id); }}>
                     <div className="knowledge-top"><span>◇</span><em>{item.project}</em><button aria-label={`查看 ${item.title}`}>查看</button></div><h3>{item.title}</h3><p>{item.summary || "该知识卡片已写入本地 Vault。"}</p>
                     <div className="knowledge-meta"><span><i style={{ width: `${score}%` }} /></span><b>{score}% 置信度</b><small>{item.source_session}</small></div>
                   </article>
                   );
                 })}
+                {!knowledgeItems.length && <div className="empty-state knowledge-empty"><strong>知识库当前为空</strong><span>请先通过会话预审核，再运行知识流水线生成真实知识卡片。</span></div>}
               </div>}
             </section>
           )}

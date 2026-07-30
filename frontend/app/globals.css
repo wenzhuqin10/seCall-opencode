@@ -336,6 +336,9 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .trash-list small { color: #96919c; font-size: 8px; margin-top: 5px; }
 .trash-list button { border: 0; border-radius: 9px; padding: 8px 13px; color: #5f49c9; background: var(--lilac); font-size: 9px; font-weight: 700; }
 .empty-state { padding: 70px 20px; text-align: center; color: #9b96a1; background: white; border: 1px dashed #dcd7e4; border-radius: 14px; font-size: 10px; }
+.knowledge-empty { grid-column: 1 / -1; display: grid; gap: 8px; }
+.knowledge-empty strong { color: #4f4958; font-size: 14px; }
+.knowledge-empty span { color: #918a9b; }
 .review-count { display: flex; align-items: baseline; gap: 7px; color: var(--purple); }
 .review-count strong { font-size: 28px; }
 .review-count span { color: #8e8a94; font-size: 9px; }
