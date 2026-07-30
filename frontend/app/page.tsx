@@ -789,7 +789,7 @@ export default function Home() {
                         <div className="job-progress"><strong>{pipelineRunning ? "处理中" : "80%"}</strong><span>预计剩余 18 秒</span></div>
                       </div>
                       <div className="stepper">
-                        {["会话导出", "格式转换", "知识抽取", "QA 生成", "索引入库"].map((step, index) => (
+                        {["会话导出", "格式转换", "知识抽取", "QA 生成", "混合索引"].map((step, index) => (
                           <div key={step} className={index < pipelineStep ? "done" : index === pipelineStep ? "current" : ""}>
                             <span>{index < pipelineStep ? "✓" : index + 1}</span><small>{step}</small>
                             {index < 4 && <i />}
@@ -886,9 +886,9 @@ export default function Home() {
                 <div className="hero-metrics"><span><b>{pipelineStep}/5</b><small>完成步骤</small></span><span><b>00:18</b><small>运行耗时</small></span><span><b>5</b><small>候选 QA</small></span></div>
               </article>
               <div className="pipeline-detail">
-                {["读取 OpenCode Session", "转换为 seCall Markdown", "提取 Issue Card", "生成候选 QA", "重建知识索引"].map((name, index) => (
+                {["读取 OpenCode Session", "转换为 seCall Markdown", "提取 Issue Card", "生成候选 QA", "重建关键词与语义索引"].map((name, index) => (
                   <article key={name} className={index < pipelineStep ? "complete" : index === pipelineStep ? "processing" : ""}>
-                    <span>{index < pipelineStep ? "✓" : index + 1}</span><div><strong>{name}</strong><small>{["读取 28 个消息与 7 次工具调用", "保留命令、路径和错误证据", "置信度 92% · 证据链完整", "已生成 5 条，等待人工审核", "写入 FTS5 / BM25 索引"][index]}</small></div><time>{index < pipelineStep ? `${index * 3 + 2}s` : index === pipelineStep ? "运行中…" : "等待"}</time>
+                    <span>{index < pipelineStep ? "✓" : index + 1}</span><div><strong>{name}</strong><small>{["读取 28 个消息与 7 次工具调用", "保留命令、路径和错误证据", "置信度 92% · 证据链完整", "已生成 5 条，等待人工审核", "同步 FTS5/BM25 关键词索引与 BGE-M3 向量索引"][index]}</small></div><time>{index < pipelineStep ? `${index * 3 + 2}s` : index === pipelineStep ? "运行中…" : "等待"}</time>
                   </article>
                 ))}
               </div>
