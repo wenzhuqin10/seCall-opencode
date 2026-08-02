@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from .structured_knowledge import build_session_events, events_path, store_session_events
+
 
 def _dict(value: Any) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
@@ -51,6 +53,8 @@ class ConversionResult:
     tools: Tuple[str, ...]
     created: bool
     markdown: str
+    events_path: Optional[Path] = None
+    event_count: int = 0
 
     def as_dict(self, include_markdown: bool = False) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -61,6 +65,8 @@ class ConversionResult:
             "turns": self.turns,
             "tools": list(self.tools),
             "created": self.created,
+            "events_path": str(self.events_path) if self.events_path else "",
+            "event_count": self.event_count,
         }
         if include_markdown:
             result["markdown"] = self.markdown
@@ -250,6 +256,7 @@ def convert_export(
     destination_dir: str = "raw/.sessions",
 ) -> ConversionResult:
     markdown, meta = render_markdown(data)
+    events = build_session_events(data)
     info = _dict(data.get("info"))
     source = _safe_name(str(info.get("source") or info.get("agent") or "opencode"))
     short_id = _safe_name(meta["session_id"])[:16]
@@ -259,10 +266,15 @@ def convert_export(
     if exists and not overwrite:
         existing = output_path.read_text(encoding="utf-8")
         if existing == markdown:
+            sidecar = events_path(vault, meta["session_id"])
+            if not dry_run and not sidecar.exists():
+                sidecar = store_session_events(vault, meta["session_id"], events)
             return ConversionResult(
                 output_path=output_path,
                 created=False,
                 markdown=markdown,
+                events_path=sidecar,
+                event_count=len(events),
                 **meta,
             )
         raise FileExistsError(
@@ -271,9 +283,14 @@ def convert_export(
     if not dry_run:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(markdown, encoding="utf-8")
+        sidecar = store_session_events(vault, meta["session_id"], events)
+    else:
+        sidecar = events_path(vault, meta["session_id"])
     return ConversionResult(
         output_path=output_path,
         created=not exists,
         markdown=markdown,
+        events_path=sidecar,
+        event_count=len(events),
         **meta,
     )

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "harq-timeout",
+    "question": "Scheduler 出现 HARQ timeout 时应如何定位？",
+    "expected_ids": [
+      "wireless-baseband-ses_test_001"
+    ],
+    "scope": "knowledge",
+    "mode": "hybrid",
+    "limit": 5
+  }
+]

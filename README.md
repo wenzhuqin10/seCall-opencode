@@ -29,8 +29,10 @@ powershell -ExecutionPolicy Bypass -File scripts\stop-local.ps1
 OpenCode Session
   → 本地导出
   → seCall Session Markdown
-  → OpenCode/GLM 知识抽取
-  → Issue Card + QA JSONL
+  → 可追溯 Event 事件流
+  → OpenCode/GLM 结构化 SessionKnowledge
+  → Issue Card + Runbook + QA JSONL
+  → 质量评分与代码实体关联
   → seCall 重建索引
 ```
 
@@ -53,6 +55,8 @@ ChatGPT conversations.json
 <vault>/staging/rejected/YYYY-MM-DD/   # 预审核拒绝、隔离保留
 <vault>/wiki/issues/
 <vault>/knowledge/qa/candidates.jsonl
+<vault>/knowledge/events/{session-id}.json       # 确定性事件 sidecar
+<vault>/knowledge/structured/{session-id}.json  # 结构化运行知识与质量评分
 ```
 
 ## 安装
@@ -109,8 +113,16 @@ secall-opencode serve
 - OpenCode 会话后台增量监听、稳定窗口和手动立即同步；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
+- 知识写操作后自动同步 Wiki 卡片索引、关系图、关键词索引和向量索引；
+- 删除知识卡片时同时移出候选与已审核 QA，并兼容旧版截断 Session ID；
 - Wiki 知识中心，按总览、项目、主题、决策和问题定位分类浏览；
+- 项目、主题和决策 Wiki 支持软归档、冲突安全恢复、二次确认永久删除和清空回收站；
+- Wiki 总览也可归档且不会被同步任务自动重建；问题定位页仍由知识卡片统一管理；
+- 关系图采用“核心实体 + 证据属性”两层模型：项目、知识卡片、模块、来源会话和 Wiki 页面作为节点；文件、函数、提交、根因与测试用例保留在知识卡片节点的证据面板，不再生成大量一次性叶子节点；
+- 知识库提供“清空知识派生数据”操作：输入固定确认语句后永久清除知识卡片及回收站、Wiki、QA、结构化知识、关系图和知识检索索引，同时保留正式、待审核和拒绝的原始 Session；
 - 知识卡片、来源会话、项目、工具与智能体的可交互知识关系图；
+- 事件时间线、状态转换、诊断假设、无效尝试、根因证据和修复验证视图；
+- Issue 与模块、文件、函数、Commit、根因和测试用例的双向关联；
 - BGE-M3 ONNX 本地语义检索与 BM25 混合召回；
 - 带 `[S1]` 来源引用的 OpenCode RAG 知识问答；
 - `keyword`、`semantic`、`hybrid` 三种稳定搜索接口。
@@ -119,6 +131,13 @@ secall-opencode serve
 
 ```text
 GET /api/search?q=断点续传&scope=all&mode=keyword&limit=20
+```
+
+可选筛选参数包括 `project`、`module`、`confidence`、`review_status` 和
+`knowledge_type`，例如：
+
+```text
+GET /api/search?q=timeout&scope=knowledge&mode=hybrid&module=Scheduler&confidence=high
 ```
 
 安装本地语义检索依赖：
@@ -145,6 +164,33 @@ python -m pip install -e ".[semantic]"
 Wiki、知识卡片与已审核 QA 使用 1024 维本地向量；原始 Session 继续使用
 seCall/BM25，以避免大型工具输出导致首次索引耗时过长。`hybrid` 模式会融合
 两类召回结果。
+
+关键词索引对标题、诊断字段和代码实体分别加权；向量索引会同时消费结构化
+根因、排查步骤、修复验证和代码关联信息。旧版知识卡片不会被修改，启动本地
+API 时会为缺少 sidecar 的旧卡片生成低置信度兼容结构化记录。
+
+固定检索测试集可以使用以下格式：
+
+```json
+[
+  {
+    "id": "harq-timeout",
+    "question": "HARQ timeout 如何定位？",
+    "expected_ids": ["wireless-baseband-ses_test_001"],
+    "scope": "knowledge",
+    "mode": "hybrid",
+    "limit": 5
+  }
+]
+```
+
+运行 Benchmark：
+
+```powershell
+secall-opencode --json benchmark benchmark.json --mode hybrid --limit 5
+```
+
+输出包含 Hit@K、MRR、平均检索耗时、每条用例排名和实际检索模式。
 
 Wiki 与关系图接口：
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
+from .benchmark import load_benchmark, run_retrieval_benchmark
 from .chatgpt import inspect_export as inspect_chatgpt_export
 from .chatgpt import load_chatgpt_export, parse_export as parse_chatgpt_export
 from .config import Config, default_config_path, load_config, save_config
@@ -17,6 +18,7 @@ from .knowledge import store_knowledge
 from .opencode_client import OpenCodeClient, Runner
 from .search import build_search_service
 from .server import import_chatgpt, serve
+from .wiki_store import graph_snapshot, sync_wiki_knowledge_views
 
 
 def _configure_stdio() -> None:
@@ -256,7 +258,12 @@ def command_generate(args: argparse.Namespace) -> Dict[str, Any]:
         cfg.qa_file,
         overwrite=args.overwrite,
     )
-    return result.as_dict()
+    payload = result.as_dict()
+    payload["derivatives"] = {
+        "wiki": sync_wiki_knowledge_views(cfg),
+        "graph": graph_snapshot(cfg)["stats"],
+    }
+    return payload
 
 
 def command_index(args: argparse.Namespace) -> Dict[str, Any]:
@@ -284,6 +291,18 @@ def command_index(args: argparse.Namespace) -> Dict[str, Any]:
         "keyword": keyword,
         "semantic": semantic,
     }
+
+
+def command_benchmark(args: argparse.Namespace) -> Dict[str, Any]:
+    cfg = _config(args)
+    cases = load_benchmark(Path(args.cases).expanduser().resolve())
+    service = build_search_service(cfg)
+    return run_retrieval_benchmark(
+        service,
+        cases,
+        default_mode=args.mode,
+        default_limit=args.limit,
+    )
 
 
 def _pipeline_one(
@@ -338,6 +357,12 @@ def command_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     results = [_pipeline_one(session_id, cfg, args, client) for session_id in ids]
 
     indexed = False
+    derivatives: Dict[str, Any] = {}
+    if not args.dry_run and not args.skip_generate:
+        derivatives = {
+            "wiki": sync_wiki_knowledge_views(cfg),
+            "graph": graph_snapshot(cfg)["stats"],
+        }
     if not args.skip_index and not args.dry_run:
         Runner(cfg.secall_command).run("reindex", "--from-vault", timeout=args.timeout)
         indexed = True
@@ -346,6 +371,7 @@ def command_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
         "session_ids": ids,
         "indexed": indexed,
         "dry_run": args.dry_run,
+        "derivatives": derivatives,
         "items": results,
     }
 
@@ -478,6 +504,19 @@ def build_parser() -> argparse.ArgumentParser:
     index.add_argument("--timeout", type=int, default=600)
     index.add_argument("--dry-run", action="store_true")
     index.set_defaults(func=command_index)
+
+    benchmark = sub.add_parser(
+        "benchmark",
+        help="运行固定检索测试集，输出 Hit@K、MRR 和平均耗时。",
+    )
+    benchmark.add_argument("cases", help="Benchmark JSON 文件。")
+    benchmark.add_argument(
+        "--mode",
+        choices=("keyword", "semantic", "hybrid"),
+        default="hybrid",
+    )
+    benchmark.add_argument("--limit", type=int, default=5)
+    benchmark.set_defaults(func=command_benchmark)
 
     local_server = sub.add_parser(
         "serve",

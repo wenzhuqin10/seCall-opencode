@@ -7,12 +7,16 @@ import re
 import sqlite3
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Protocol, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Protocol, Sequence
 
 from .config import Config
 from .knowledge_store import list_knowledge_documents, read_knowledge_document
 from .opencode_client import Runner
 from .session_review_store import excluded_session_ids
+from .structured_knowledge import (
+    read_structured_knowledge,
+    structured_search_text,
+)
 from .wiki_store import iter_wiki_pages, read_wiki_page
 
 
@@ -52,6 +56,8 @@ class SearchDocument:
     project: str
     source_session: str
     review_status: str
+    diagnosis: str = ""
+    code_context: str = ""
 
     @property
     def content_hash(self) -> str:
@@ -167,6 +173,23 @@ def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
                 for section in detail["sections"]
             ]
         )
+        structured = (
+            read_structured_knowledge(config.vault, item["source_session"])
+            if item["source_session"]
+            else None
+        )
+        if structured:
+            body = body + "\n\n" + structured_search_text(structured)
+        diagnosis = ""
+        code_context = ""
+        if structured:
+            diagnosis = "\n".join(
+                json.dumps(structured.get(field) or {}, ensure_ascii=False)
+                for field in ("symptoms", "hypotheses", "troubleshooting_steps", "root_cause")
+            )
+            code_context = json.dumps(
+                structured.get("code_entities") or {}, ensure_ascii=False
+            )
         yield SearchDocument(
             id=item["id"],
             scope="knowledge",
@@ -175,6 +198,8 @@ def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
             project=item["project"],
             source_session=item["source_session"],
             review_status=item["review_status"],
+            diagnosis=diagnosis,
+            code_context=code_context,
         )
 
     qa_path = config.vault / config.qa_file
@@ -266,11 +291,13 @@ class KeywordSearchBackend:
                 review_status TEXT NOT NULL,
                 content_hash TEXT NOT NULL
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+            CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts_v2 USING fts5(
                 id UNINDEXED,
                 scope UNINDEXED,
                 title_tokens,
                 body_tokens,
+                diagnosis_tokens,
+                code_tokens,
                 tokenize='unicode61'
             );
             """
@@ -282,7 +309,7 @@ class KeywordSearchBackend:
         documents.extend(_wiki_documents(self.config))
         with self._connect() as connection:
             connection.execute("DELETE FROM documents")
-            connection.execute("DELETE FROM documents_fts")
+            connection.execute("DELETE FROM documents_fts_v2")
             for item in documents:
                 connection.execute(
                     """
@@ -303,14 +330,17 @@ class KeywordSearchBackend:
                 )
                 connection.execute(
                     """
-                    INSERT INTO documents_fts
-                    (id, scope, title_tokens, body_tokens) VALUES (?, ?, ?, ?)
+                    INSERT INTO documents_fts_v2
+                    (id, scope, title_tokens, body_tokens, diagnosis_tokens, code_tokens)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item.id,
                         item.scope,
                         _tokens(item.title),
                         _tokens(item.body),
+                        _tokens(item.diagnosis),
+                        _tokens(item.code_context),
                     ),
                 )
         return {"indexed": len(documents), "path": str(self.db_path)}
@@ -318,7 +348,7 @@ class KeywordSearchBackend:
     def remove(self, document_id: str) -> None:
         with self._connect() as connection:
             connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
-            connection.execute("DELETE FROM documents_fts WHERE id = ?", (document_id,))
+            connection.execute("DELETE FROM documents_fts_v2 WHERE id = ?", (document_id,))
 
     def _knowledge_search(
         self, query: str, scope: str, limit: int
@@ -337,10 +367,10 @@ class KeywordSearchBackend:
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
-                SELECT d.*, bm25(documents_fts, 4.0, 1.0) AS rank
-                FROM documents_fts
-                JOIN documents d ON d.id = documents_fts.id
-                WHERE documents_fts MATCH ? {conditions}
+                SELECT d.*, bm25(documents_fts_v2, 4.0, 1.0, 3.0, 2.5) AS rank
+                FROM documents_fts_v2
+                JOIN documents d ON d.id = documents_fts_v2.id
+                WHERE documents_fts_v2 MATCH ? {conditions}
                 ORDER BY rank ASC
                 LIMIT ?
                 """,
@@ -736,6 +766,7 @@ class HybridSearchService:
         scope: str = "all",
         mode: str = "keyword",
         limit: int = 20,
+        filters: Mapping[str, str] | None = None,
     ) -> Dict[str, Any]:
         query = query.strip()
         if scope == "sessions":
@@ -747,6 +778,12 @@ class HybridSearchService:
         if mode not in {"keyword", "semantic", "hybrid"}:
             raise ValueError("mode 必须是 keyword、semantic 或 hybrid。")
         limit = max(1, min(limit, 100))
+        normalized_filters = {
+            str(key): str(value).strip()
+            for key, value in (filters or {}).items()
+            if str(value).strip()
+        }
+        retrieval_limit = min(100, limit * 4) if normalized_filters else limit
         fallback = None
         effective = mode
         supports_scope = getattr(self.semantic, "supports_scope", lambda _scope: True)
@@ -765,15 +802,60 @@ class HybridSearchService:
                 else str(self.semantic.status().get("reason") or "语义检索不可用。")
             )
         if effective == "keyword":
-            results = self.keyword.search(query, scope, limit)
+            results = self.keyword.search(query, scope, retrieval_limit)
         elif effective == "semantic":
-            results = list(self.semantic.search(query, scope, limit))
+            results = list(self.semantic.search(query, scope, retrieval_limit))
         else:
             results = _rrf_merge(
-                self.keyword.search(query, scope, limit * 2),
-                self.semantic.search(query, scope, limit * 2),
-                limit,
+                self.keyword.search(query, scope, min(100, retrieval_limit * 2)),
+                self.semantic.search(query, scope, min(100, retrieval_limit * 2)),
+                retrieval_limit,
             )
+        if normalized_filters:
+            structured_cache: Dict[str, Dict[str, Any]] = {}
+
+            def matches(item: SearchResult) -> bool:
+                project = normalized_filters.get("project")
+                if project and item.project.lower() != project.lower():
+                    return False
+                result_type = normalized_filters.get("knowledge_type")
+                if result_type and item.scope != result_type:
+                    return False
+                review = normalized_filters.get("review_status")
+                if review and item.review_status != review:
+                    return False
+                module = normalized_filters.get("module")
+                confidence = normalized_filters.get("confidence")
+                if module or confidence:
+                    if item.source_session not in structured_cache:
+                        structured_cache[item.source_session] = (
+                            read_structured_knowledge(
+                                self.keyword.config.vault, item.source_session
+                            )
+                            or {}
+                        )
+                    structured = structured_cache[item.source_session]
+                    if module:
+                        entities = structured.get("code_entities")
+                        modules = (
+                            entities.get("modules", [])
+                            if isinstance(entities, dict)
+                            else []
+                        )
+                        if module.lower() not in {
+                            str(value).lower() for value in modules
+                        }:
+                            return False
+                    if confidence:
+                        quality = structured.get("quality")
+                        if not isinstance(quality, dict) or str(
+                            quality.get("level") or ""
+                        ) != confidence:
+                            return False
+                return True
+
+            results = [item for item in results if matches(item)]
+        results = results[:limit]
         return {
             "query": query,
             "scope": scope,
@@ -781,6 +863,7 @@ class HybridSearchService:
             "effective_mode": effective,
             "semantic_available": self.semantic.available,
             "fallback_reason": fallback,
+            "filters": normalized_filters,
             "count": len(results),
             "results": [item.as_dict() for item in results],
         }

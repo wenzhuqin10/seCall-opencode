@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from secall_opencode.knowledge import split_document_and_qa, store_knowledge
@@ -40,6 +41,10 @@ class KnowledgeTests(unittest.TestCase):
             self.assertEqual(first.qa_count, 1)
             self.assertEqual(second.qa_count, 0)
             self.assertTrue(first.issue_path.exists())
+            qa_record = json.loads(
+                first.qa_path.read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(qa_record["knowledge_id"], first.issue_path.stem)
 
     def test_rejects_unmarked_output(self):
         document, qa = split_document_and_qa("# ordinary markdown")

@@ -12,6 +12,7 @@ from secall_opencode.search import (
     SearchResult,
     UnavailableSemanticBackend,
 )
+from secall_opencode.structured_knowledge import store_structured_knowledge
 
 
 def _search_config(tmp_path: Path, monkeypatch) -> Config:
@@ -100,6 +101,45 @@ def test_semantic_mode_falls_back_without_model(tmp_path: Path, monkeypatch) -> 
     assert result["effective_mode"] == "keyword"
     assert result["semantic_available"] is False
     assert result["results"][0]["match_type"] == "keyword"
+
+
+def test_search_supports_structured_module_and_quality_filters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = _search_config(tmp_path, monkeypatch)
+    store_structured_knowledge(
+        tmp_path,
+        {
+            "source_session": "session-001",
+            "code_entities": {"modules": ["Scheduler"]},
+            "root_cause": {"conclusion": "状态未清零"},
+            "quality": {"level": "high"},
+        },
+    )
+    keyword = KeywordSearchBackend(config)
+    keyword.rebuild()
+    service = HybridSearchService(
+        keyword,
+        UnavailableSemanticBackend(tmp_path / "missing-model"),
+    )
+
+    matched = service.search(
+        "断点续传",
+        scope="knowledge",
+        mode="keyword",
+        filters={"module": "Scheduler", "confidence": "high"},
+    )
+    missing = service.search(
+        "断点续传",
+        scope="knowledge",
+        mode="keyword",
+        filters={"module": "PHY"},
+    )
+
+    assert [item["id"] for item in matched["results"]] == [
+        "download-session-001"
+    ]
+    assert missing["results"] == []
 
 
 class FakeSemanticBackend:

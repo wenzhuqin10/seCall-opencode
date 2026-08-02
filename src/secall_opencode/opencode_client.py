@@ -108,8 +108,8 @@ class OpenCodeClient:
         if model:
             args.extend(["--model", model])
         args.append(
-            "依据附件中的中文规则分析 Session。只输出最终 Issue Card 与 QA 标记块，"
-            "不要修改任何文件。"
+            "依据附件中的中文规则分析 Session。只输出结构化 SessionKnowledge、"
+            "最终 Issue Card 与 QA 标记块，不要修改任何文件。"
         )
         raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
         return extract_generation_text(raw)

@@ -28,9 +28,34 @@ type KnowledgeItem = {
   confidence: string; source_session: string; review_status: string;
 };
 type KnowledgeSection = { heading: string; content: string };
+type KnowledgeEvent = {
+  event_id: string; sequence: number; timestamp: string; actor: string; type: string;
+  content: string; tool?: string; input?: string; output?: string; source_turn: number;
+};
+type StructuredKnowledge = {
+  context?: Record<string, unknown>;
+  symptoms?: Array<Record<string, unknown>>;
+  timeline?: Array<Record<string, unknown>>;
+  state_transitions?: Array<Record<string, unknown>>;
+  message_flows?: Array<Record<string, unknown>>;
+  parameter_changes?: Array<Record<string, unknown>>;
+  hypotheses?: Array<Record<string, unknown>>;
+  troubleshooting_steps?: Array<Record<string, unknown>>;
+  root_cause?: Record<string, unknown>;
+  fix?: Record<string, unknown>;
+  verification?: Record<string, unknown>;
+  lessons?: Record<string, unknown>;
+  code_entities?: Record<string, unknown>;
+  quality?: {
+    overall?: number; level?: string; completeness?: number; evidence_coverage?: number;
+    event_coverage?: number; warnings?: string[];
+  };
+};
 type KnowledgeDetail = KnowledgeItem & {
   heading: string; type: string; intro: string; sections: KnowledgeSection[];
   markdown: string; version: string; updated: number;
+  structured: StructuredKnowledge; quality: StructuredKnowledge["quality"];
+  events: KnowledgeEvent[];
 };
 type TrashItem = {
   trash_id: string; knowledge_id: string; title: string; project: string;
@@ -53,11 +78,23 @@ type WikiDetail = WikiPage & {
 type WikiResponse = {
   count: number; counts: Record<string, number>; pages: WikiPage[];
 };
-type GraphNode = { id: string; label?: string; type?: string; project?: string };
+type WikiArchiveItem = {
+  trash_id: string; wiki_id: string; category: string; category_label: string;
+  slug: string; title: string; project: string; source_session: string;
+  archived_at: string;
+};
+type GraphEvidence = {
+  files?: string[]; functions?: string[]; commits?: string[];
+  root_causes?: string[]; test_cases?: string[];
+};
+type GraphNode = {
+  id: string; label?: string; type?: string; project?: string; source_session?: string;
+  evidence?: GraphEvidence; evidence_counts?: Record<string, number>;
+};
 type GraphLink = { source: string; target: string; relation?: string; weight?: number };
 type GraphSnapshot = {
   nodes: GraphNode[]; links: GraphLink[];
-  stats: { nodes: number; links: number; types: Record<string, number> };
+  stats: { nodes: number; links: number; types: Record<string, number>; evidence?: Record<string, number> };
 };
 type SearchResponse = {
   requested_mode: string; effective_mode: string; semantic_available: boolean;
@@ -171,6 +208,7 @@ function MarkdownViewer({ markdown }: { markdown: string }) {
       code.push(raw);
       continue;
     }
+    if (line.trim().startsWith("<!--") || line.trim().endsWith("-->")) continue;
     if (!line.trim()) continue;
     if (line.startsWith("### ")) blocks.push({ kind: "h3", value: line.slice(4) });
     else if (line.startsWith("## ")) blocks.push({ kind: "h2", value: line.slice(3) });
@@ -190,13 +228,76 @@ function MarkdownViewer({ markdown }: { markdown: string }) {
   })}</div>;
 }
 
+const structuredLabels: Record<string, string> = {
+  conclusion: "结论", confidence: "置信度", description: "说明", component: "组件",
+  type: "类型", message: "消息", impact: "影响", action: "操作", command: "命令",
+  result: "结果", effective: "是否有效", reason: "原因", status: "状态",
+  before: "前置状态", trigger: "触发事件", expected: "预期", actual: "实际",
+  sender: "发送方", receiver: "接收方", transaction_id: "事务 ID",
+  name: "参数", previous_value: "前值", current_value: "当前值",
+  expected_range: "预期范围", abnormal: "是否异常", evidence_event_ids: "证据事件",
+  workaround: "临时规避", final_fix: "正式修复", files: "文件", functions: "函数",
+  commits: "提交", modules: "模块", test_cases: "测试用例", results: "验证结果",
+  regression: "回归测试", side_effects: "副作用", diagnostic_rules: "诊断规则",
+  runbook_steps: "排查手册", prevention: "预防措施",
+};
+
+const graphTypeLabels: Record<string, string> = {
+  all: "全部", issue: "知识卡片", session: "会话", project: "项目",
+  tool: "工具", agent: "智能体", module: "模块", file: "文件",
+  function: "函数", commit: "提交", root_cause: "根因",
+  test_case: "测试用例", topic: "主题", wiki_page: "Wiki 页面",
+};
+
+function StructuredObject({ value, empty = "暂无结构化信息" }: { value?: Record<string, unknown>; empty?: string }) {
+  const entries = Object.entries(value || {}).filter(([, item]) => item !== "" && item !== null && item !== undefined && (!Array.isArray(item) || item.length > 0));
+  if (!entries.length) return <p className="structured-empty">{empty}</p>;
+  return <dl className="structured-object">{entries.map(([key, item]) => (
+    <div key={key}>
+      <dt>{structuredLabels[key] || key.replaceAll("_", " ")}</dt>
+      <dd>{typeof item === "object" ? JSON.stringify(item, null, 2) : String(item)}</dd>
+    </div>
+  ))}</dl>;
+}
+
+function StructuredList({ items, empty = "暂无记录" }: { items?: Array<Record<string, unknown>>; empty?: string }) {
+  if (!items?.length) return <p className="structured-empty">{empty}</p>;
+  return <div className="structured-list">{items.map((item, index) => (
+    <article key={String(item.event_id || item.description || index)}>
+      <span>{String(index + 1).padStart(2, "0")}</span>
+      <StructuredObject value={item} />
+    </article>
+  ))}</div>;
+}
+
+const graphEvidenceLabels: Record<string, string> = {
+  files: "文件", functions: "函数", commits: "提交",
+  root_causes: "根因", test_cases: "测试用例",
+};
+
+function GraphEvidencePanel({ evidence }: { evidence?: GraphEvidence }) {
+  if (!evidence || !Object.values(evidence).some((items) => items?.length)) return null;
+  return <div className="graph-evidence-panel">
+    <h3>技术证据（不展开为节点）</h3>
+    <div className="graph-evidence">{Object.entries(evidence).map(([type, items]) => items?.length ? (
+      <section key={type}>
+        <header><strong>{graphEvidenceLabels[type] || type}</strong><span>{items.length}</span></header>
+        {items.slice(0, 8).map((item) => <code key={item}>{item}</code>)}
+        {items.length > 8 && <small>另有 {items.length - 8} 条，请在知识卡片详情中查看</small>}
+      </section>
+    ) : null)}</div>
+  </div>;
+}
+
 function graphPositions(nodes: GraphNode[]) {
   const groups = new Map<string, GraphNode[]>();
   nodes.forEach((node) => {
     const type = node.type || "other";
     groups.set(type, [...(groups.get(type) || []), node]);
   });
-  const radii: Record<string, number> = { agent: 70, project: 170, tool: 255, issue: 320, session: 390 };
+  const radii: Record<string, number> = {
+    project: 70, issue: 145, wiki_page: 200, topic: 220, module: 270, session: 345,
+  };
   const fallback = 300;
   const positions = new Map<string, { x: number; y: number }>();
   Array.from(groups.entries()).forEach(([type, items], groupIndex) => {
@@ -270,6 +371,7 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null);
+  const [knowledgeTab, setKnowledgeTab] = useState<"overview" | "timeline" | "diagnosis" | "code" | "evidence">("overview");
   const [editingKnowledge, setEditingKnowledge] = useState(false);
   const [savingKnowledge, setSavingKnowledge] = useState(false);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
@@ -284,6 +386,8 @@ export default function Home() {
   const [wikiCategory, setWikiCategory] = useState("all");
   const [wikiQuery, setWikiQuery] = useState("");
   const [wikiDetail, setWikiDetail] = useState<WikiDetail | null>(null);
+  const [wikiArchiveItems, setWikiArchiveItems] = useState<WikiArchiveItem[]>([]);
+  const [showWikiArchive, setShowWikiArchive] = useState(false);
   const [graph, setGraph] = useState<GraphSnapshot>({ nodes: [], links: [], stats: { nodes: 0, links: 0, types: {} } });
   const [graphType, setGraphType] = useState("all");
   const [graphQuery, setGraphQuery] = useState("");
@@ -468,6 +572,10 @@ export default function Home() {
     [wikiPages, wikiCategory, wikiQuery],
   );
   const graphPositionsMap = useMemo(() => graphPositions(graph.nodes), [graph.nodes]);
+  const graphTypeOptions = useMemo(
+    () => ["all", ...Object.keys(graph.stats.types).filter((type) => (graph.stats.types[type] ?? 0) > 0)],
+    [graph.stats.types],
+  );
   const graphNodes = useMemo(
     () => graph.nodes.filter((node) => graphType === "all" || node.type === graphType),
     [graph.nodes, graphType],
@@ -487,6 +595,92 @@ export default function Home() {
       setSearchOpen(false);
     } catch (error) {
       notify("无法打开 Wiki 页面", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const loadWikiArchive = async () => {
+    try {
+      const items = await apiRequest<WikiArchiveItem[]>("/api/wiki/trash");
+      setWikiArchiveItems(items);
+      setShowWikiArchive(true);
+      setWikiDetail(null);
+    } catch (error) {
+      notify("无法打开 Wiki 回收站", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const archiveWiki = async () => {
+    if (!wikiDetail || wikiDetail.category === "issues") return;
+    if (!window.confirm(`将 Wiki 页面“${wikiDetail.title}”移入回收站？`)) return;
+    try {
+      await apiRequest(
+        `/api/wiki/${encodeURIComponent(wikiDetail.category)}/${encodeURIComponent(wikiDetail.slug)}`,
+        { method: "DELETE" },
+      );
+      setWikiDetail(null);
+      await refreshData();
+      notify("Wiki 已归档", "页面已移入 Wiki 回收站，关系图和检索索引已同步更新");
+    } catch (error) {
+      notify("Wiki 归档失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const restoreWiki = async (trashId: string) => {
+    try {
+      await apiRequest(`/api/wiki/trash/${encodeURIComponent(trashId)}/restore`, {
+        method: "POST",
+        body: "{}",
+      });
+      const items = await apiRequest<WikiArchiveItem[]>("/api/wiki/trash");
+      setWikiArchiveItems(items);
+      await refreshData();
+      notify("Wiki 已恢复", "页面、关系图和检索索引已恢复");
+    } catch (error) {
+      notify("Wiki 恢复失败", error instanceof Error ? error.message : "可能存在同名 Wiki 页面");
+    }
+  };
+
+  const purgeWiki = async (item: WikiArchiveItem) => {
+    const confirmation = window.prompt(
+      `永久删除后无法恢复。请输入页面标题确认：\n${item.title}`,
+    );
+    if (confirmation === null) return;
+    if (confirmation.trim() !== item.title) {
+      notify("未执行永久删除", "输入的页面标题不一致");
+      return;
+    }
+    try {
+      await apiRequest(
+        `/api/wiki/trash/${encodeURIComponent(item.trash_id)}?confirm=permanent`,
+        { method: "DELETE" },
+      );
+      const items = await apiRequest<WikiArchiveItem[]>("/api/wiki/trash");
+      setWikiArchiveItems(items);
+      notify("Wiki 已永久删除", "归档副本已清除，原始 Session 保持不变");
+    } catch (error) {
+      notify("永久删除失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const clearWikiArchive = async () => {
+    if (!wikiArchiveItems.length) return;
+    const confirmation = window.prompt(
+      `即将永久删除 Wiki 回收站中的 ${wikiArchiveItems.length} 篇页面。\n请输入“永久删除”确认：`,
+    );
+    if (confirmation === null) return;
+    if (confirmation.trim() !== "永久删除") {
+      notify("未清空回收站", "确认文字不正确");
+      return;
+    }
+    try {
+      const result = await apiRequest<{ purged: number }>(
+        "/api/wiki/trash?confirm=clear",
+        { method: "DELETE" },
+      );
+      setWikiArchiveItems([]);
+      notify("Wiki 回收站已清空", `已永久删除 ${result.purged} 篇归档页面`);
+    } catch (error) {
+      notify("清空回收站失败", error instanceof Error ? error.message : "请检查本地服务");
     }
   };
 
@@ -591,6 +785,7 @@ export default function Home() {
     try {
       const detail = await apiRequest<KnowledgeDetail>(`/api/knowledge/${encodeURIComponent(id)}`);
       setKnowledgeDetail(detail);
+      setKnowledgeTab("overview");
       setEditingKnowledge(false);
       setSearchOpen(false);
     } catch (error) {
@@ -663,6 +858,55 @@ export default function Home() {
       notify("索引已刷新", `关键词 ${result.search.keyword.indexed} 份，向量 ${result.search.semantic.indexed_chunks} 个分块`);
     } catch (error) {
       notify("索引刷新失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const syncKnowledgeDerivatives = async () => {
+    try {
+      const result = await apiRequest<{
+        wiki: { knowledge_count: number; updated_pages: string[]; wiki_count: number };
+        graph: { nodes: number; links: number };
+      }>("/api/knowledge/sync", { method: "POST", body: "{}" });
+      await refreshData();
+      notify(
+        "派生数据已同步",
+        `Wiki ${result.wiki.wiki_count} 篇，知识卡片 ${result.wiki.knowledge_count} 张，关系图 ${result.graph.nodes} 个节点`,
+      );
+    } catch (error) {
+      notify("派生数据同步失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const purgeKnowledgeDerivatives = async () => {
+    const confirmation = window.prompt(
+      "这会永久删除全部知识卡片及回收站、Wiki、QA、结构化知识、关系图和知识检索索引。原始会话不会删除。\n\n请输入“清空派生数据”继续：",
+    );
+    if (confirmation === null) return;
+    if (confirmation.trim() !== "清空派生数据") {
+      notify("未执行清理", "确认文字不匹配，任何数据都没有删除");
+      return;
+    }
+    try {
+      const result = await apiRequest<{
+        removed_files: number;
+        preserved_sessions: number;
+        wiki: { count: number };
+        graph: { nodes: number; links: number };
+      }>("/api/knowledge/derivatives/purge", {
+        method: "POST",
+        body: JSON.stringify({ confirm: "PURGE_DERIVED" }),
+      });
+      setShowTrash(false);
+      setShowWikiArchive(false);
+      setWikiArchiveItems([]);
+      setTrashItems([]);
+      await refreshData();
+      notify(
+        "知识派生数据已清空",
+        `已删除 ${result.removed_files} 个派生文件，保留 ${result.preserved_sessions} 个原始会话`,
+      );
+    } catch (error) {
+      notify("清空失败", error instanceof Error ? error.message : "请检查本地服务");
     }
   };
 
@@ -1072,7 +1316,9 @@ export default function Home() {
                 <div><p className="eyebrow">KNOWLEDGE VAULT</p><h1>{showTrash ? "知识回收站" : "知识库"}</h1><p>{showTrash ? "恢复误删的知识卡片及其关联 QA。" : "可查看、修改、删除和检索的本地工程知识。"}</p></div>
                 <div className="heading-actions">
                   {showTrash ? <button className="secondary-button" onClick={() => setShowTrash(false)}>← 返回知识库</button> : <button className="secondary-button" onClick={() => void loadTrash()}>♲ 回收站</button>}
+                  {!showTrash && <button className="secondary-button" onClick={() => void syncKnowledgeDerivatives()}>⟳ 同步派生数据</button>}
                   {!showTrash && <button className="secondary-button" onClick={() => void refreshIndex()}>↻ 刷新索引</button>}
+                  {!showTrash && <button className="danger-button" onClick={() => void purgeKnowledgeDerivatives()}>清空知识派生数据</button>}
                 </div>
               </div>
               {showTrash ? (
@@ -1102,10 +1348,27 @@ export default function Home() {
           {active === "wiki" && (
             <section className="subpage wiki-page">
               <div className="subpage-heading">
-                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>Wiki 知识中心</h1><p>按项目、主题、决策和问题定位组织研发知识，并保留来源会话与反向链接。</p></div>
-                <div className="wiki-heading-stats"><strong>{wikiPages.length}</strong><span>篇文档</span><i /><strong>{wikiCounts.projects ?? 0}</strong><span>个项目</span></div>
+                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>{showWikiArchive ? "Wiki 回收站" : "Wiki 知识中心"}</h1><p>{showWikiArchive ? "恢复误归档的项目、主题和设计决策页面。" : "按项目、主题、决策和问题定位组织研发知识，并保留来源会话与反向链接。"}</p></div>
+                <div className="heading-actions">
+                  {showWikiArchive && wikiArchiveItems.length > 0 && <button className="danger-button" onClick={() => void clearWikiArchive()}>清空回收站</button>}
+                  {showWikiArchive
+                    ? <button className="secondary-button" onClick={() => setShowWikiArchive(false)}>← 返回 Wiki</button>
+                    : <button className="secondary-button" onClick={() => void loadWikiArchive()}>♲ Wiki 回收站</button>}
+                  {!showWikiArchive && <div className="wiki-heading-stats"><strong>{wikiPages.length}</strong><span>篇文档</span><i /><strong>{wikiCounts.projects ?? 0}</strong><span>个项目</span></div>}
+                </div>
               </div>
-              <div className="wiki-shell">
+              {showWikiArchive ? (
+                <div className="trash-list wiki-trash-list">
+                  {wikiArchiveItems.length ? wikiArchiveItems.map((item) => (
+                    <article key={item.trash_id}>
+                      <span>♲</span>
+                      <div><strong>{item.title}</strong><small>{item.category_label} · {item.project} · 归档于 {formatUpdated(new Date(item.archived_at).getTime())}</small></div>
+                      <button onClick={() => void restoreWiki(item.trash_id)}>恢复</button>
+                      <button className="danger-button" onClick={() => void purgeWiki(item)}>永久删除</button>
+                    </article>
+                  )) : <div className="empty-state">Wiki 回收站为空</div>}
+                </div>
+              ) : <div className="wiki-shell">
                 <aside className="wiki-browser">
                   <label><span>⌕</span><input value={wikiQuery} onChange={(event) => setWikiQuery(event.target.value)} placeholder="筛选 Wiki…" /></label>
                   <nav>
@@ -1132,6 +1395,11 @@ export default function Home() {
                         <div><span>{wikiDetail.category_label}</span><h2>{wikiDetail.title}</h2><p>{wikiDetail.summary}</p></div>
                         <aside><small>项目</small><strong>{wikiDetail.project}</strong><small>来源会话</small><code>{wikiDetail.source_session || "聚合文档"}</code></aside>
                       </header>
+                      {wikiDetail.category !== "issues" && (
+                        <div className="wiki-reader-actions">
+                          <button className="danger-button" onClick={() => void archiveWiki()}>归档此页面</button>
+                        </div>
+                      )}
                       <div className="wiki-reader-body"><MarkdownViewer markdown={wikiDetail.markdown} /></div>
                       {(wikiDetail.backlinks.length > 0 || wikiDetail.references.length > 0) && (
                         <footer>
@@ -1147,25 +1415,26 @@ export default function Home() {
                     </div>
                   )}
                 </article>
-              </div>
+              </div>}
             </section>
           )}
 
           {active === "graph" && (
             <section className="subpage graph-page">
               <div className="subpage-heading">
-                <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>探索知识卡片、来源会话、项目、工具与智能体之间的连接。</p></div>
+                <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>聚焦项目、知识卡片、模块和来源会话之间可复用的工程知识关系。</p></div>
                 <button className="primary-button" disabled={graphLoading} onClick={() => void rebuildKnowledgeGraph()}>{graphLoading ? "正在构建…" : "↻ 重建关系图"}</button>
               </div>
+              <div className="graph-design-note">默认只展示项目、知识卡片、模块与来源会话。文件、函数、提交、根因和测试用例保留为卡片证据，避免图谱被一次性叶子节点淹没。</div>
               <div className="graph-toolbar">
                 <label><span>⌕</span><input value={graphQuery} onChange={(event) => setGraphQuery(event.target.value)} placeholder="查找节点…" /></label>
-                <div>{["all", "issue", "session", "project", "tool", "agent"].map((type) => (
+                <div>{graphTypeOptions.map((type) => (
                   <button key={type} className={graphType === type ? "active" : ""} onClick={() => setGraphType(type)}>
-                    {{ all: "全部", issue: "知识卡片", session: "会话", project: "项目", tool: "工具", agent: "智能体" }[type as "all" | "issue" | "session" | "project" | "tool" | "agent"]}
+                    {graphTypeLabels[type] || type}
                     <em>{type === "all" ? graph.stats.nodes : graph.stats.types[type] ?? 0}</em>
                   </button>
                 ))}</div>
-                <span className="graph-summary">{graph.stats.nodes} 节点 · {graph.stats.links} 关系</span>
+                <span className="graph-summary">{graph.stats.nodes} 个核心节点 · {graph.stats.links} 条关系 · {Object.values(graph.stats.evidence || {}).reduce((sum, value) => sum + value, 0)} 条技术证据</span>
               </div>
               <div className="graph-shell">
                 <div className="graph-canvas">
@@ -1189,13 +1458,16 @@ export default function Home() {
                       })}</g>
                     </svg>
                   ) : <div className="graph-empty"><span>◎</span><h3>关系图尚未构建</h3><p>点击“重建关系图”，从本地会话提取项目、工具和智能体关系。</p></div>}
-                  <div className="graph-legend"><span className="issue">知识卡片</span><span className="project">项目</span><span className="session">会话</span><span className="tool">工具</span><span className="agent">智能体</span></div>
+                  <div className="graph-legend">{graphTypeOptions.filter((type) => type !== "all").map((type) => (
+                    <span key={type} className={type}>{graphTypeLabels[type] || type}</span>
+                  ))}</div>
                 </div>
                 <aside className="graph-inspector">
                   {graphSelected ? (
                     <>
                       <span className={`graph-node-mark ${graphSelected.type}`}>●</span><p className="eyebrow">SELECTED NODE</p><h2>{graphSelected.label || graphSelected.id}</h2>
-                      <dl><div><dt>类型</dt><dd>{graphSelected.type || "其他"}</dd></div><div><dt>项目</dt><dd>{graphSelected.project || "—"}</dd></div><div><dt>关联数量</dt><dd>{graph.links.filter((link) => link.source === graphSelected.id || link.target === graphSelected.id).length}</dd></div></dl>
+                      <dl><div><dt>类型</dt><dd>{graphTypeLabels[graphSelected.type || ""] || graphSelected.type || "其他"}</dd></div><div><dt>项目</dt><dd>{graphSelected.project || "—"}</dd></div><div><dt>关联数量</dt><dd>{graph.links.filter((link) => link.source === graphSelected.id || link.target === graphSelected.id).length}</dd></div></dl>
+                      <GraphEvidencePanel evidence={graphSelected.evidence} />
                       <h3>直接关系</h3>
                       <div className="neighbor-list">{graph.links.filter((link) => link.source === graphSelected.id || link.target === graphSelected.id).slice(0, 12).map((link, index) => {
                         const neighborId = String(link.source === graphSelected.id ? link.target : link.source);
@@ -1409,13 +1681,62 @@ export default function Home() {
               </div>
             ) : (
               <div className="knowledge-preview">
-                <div className="detail-badges"><span>{knowledgeDetail.project}</span><span>{knowledgeDetail.confidence === "high" ? "高置信度" : knowledgeDetail.confidence === "medium" ? "中置信度" : "低置信度"}</span><span>{knowledgeDetail.review_status === "approved" ? "已通过" : "待审核"}</span></div>
-                {knowledgeDetail.sections.map((section, index) => <section key={`${section.heading}-${index}`}><h3>{section.heading}</h3><p>{section.content || "暂无内容"}</p></section>)}
+                <div className="detail-badges">
+                  <span>{knowledgeDetail.project}</span>
+                  <span>{knowledgeDetail.confidence === "high" ? "高置信度" : knowledgeDetail.confidence === "medium" ? "中置信度" : "低置信度"}</span>
+                  <span>{knowledgeDetail.review_status === "approved" ? "已通过" : "待审核"}</span>
+                  {knowledgeDetail.quality?.overall !== undefined && <span>质量 {Math.round(knowledgeDetail.quality.overall * 100)}%</span>}
+                </div>
+                <nav className="knowledge-tabs" aria-label="知识详情分区">
+                  {([
+                    ["overview", "文档概览"],
+                    ["timeline", "事件与状态"],
+                    ["diagnosis", "诊断过程"],
+                    ["code", "修复与代码"],
+                    ["evidence", "证据来源"],
+                  ] as const).map(([id, label]) => <button key={id} className={knowledgeTab === id ? "active" : ""} onClick={() => setKnowledgeTab(id)}>{label}</button>)}
+                </nav>
+                {knowledgeTab === "overview" && <>
+                  {knowledgeDetail.quality?.warnings?.length ? <div className="quality-warning"><strong>质量提示</strong>{knowledgeDetail.quality.warnings.map((warning) => <span key={warning}>{warning}</span>)}</div> : null}
+                  {knowledgeDetail.sections.map((section, index) => <section key={`${section.heading}-${index}`}><h3>{section.heading}</h3><p>{section.content || "暂无内容"}</p></section>)}
+                </>}
+                {knowledgeTab === "timeline" && <>
+                  <section><h3>运行上下文</h3><StructuredObject value={knowledgeDetail.structured?.context} /></section>
+                  <section><h3>问题现象</h3><StructuredList items={knowledgeDetail.structured?.symptoms} /></section>
+                  <section><h3>事件时间线</h3><StructuredList items={knowledgeDetail.structured?.timeline} /></section>
+                  <section><h3>状态转换</h3><StructuredList items={knowledgeDetail.structured?.state_transitions} /></section>
+                  <section><h3>消息与调用链</h3><StructuredList items={knowledgeDetail.structured?.message_flows} /></section>
+                  <section><h3>参数变化</h3><StructuredList items={knowledgeDetail.structured?.parameter_changes} /></section>
+                </>}
+                {knowledgeTab === "diagnosis" && <>
+                  <section><h3>诊断假设</h3><StructuredList items={knowledgeDetail.structured?.hypotheses} /></section>
+                  <section><h3>排查步骤与无效尝试</h3><StructuredList items={knowledgeDetail.structured?.troubleshooting_steps} /></section>
+                  <section><h3>根因与证据</h3><StructuredObject value={knowledgeDetail.structured?.root_cause} /></section>
+                  <section><h3>经验规则</h3><StructuredObject value={knowledgeDetail.structured?.lessons} /></section>
+                </>}
+                {knowledgeTab === "code" && <>
+                  <section><h3>修复方案</h3><StructuredObject value={knowledgeDetail.structured?.fix} /></section>
+                  <section><h3>验证与回归</h3><StructuredObject value={knowledgeDetail.structured?.verification} /></section>
+                  <section><h3>相关代码实体</h3><StructuredObject value={knowledgeDetail.structured?.code_entities} /></section>
+                </>}
+                {knowledgeTab === "evidence" && <div className="evidence-list">
+                  {knowledgeDetail.events?.length ? knowledgeDetail.events.map((event) => (
+                    <article key={event.event_id}>
+                      <span>{event.event_id}</span>
+                      <div><strong>第 {event.source_turn} 轮 · {event.type}</strong><p>{event.output || event.content || event.input || "空事件"}</p></div>
+                    </article>
+                  )) : <p className="structured-empty">该卡片由旧版流水线生成，尚无事件 sidecar；重新运行流水线可补齐证据。</p>}
+                </div>}
               </div>
             )}
             <footer>
               <button className="danger-button" onClick={() => void deleteKnowledge()}>删除</button>
               <span />
+              {!editingKnowledge && <button onClick={() => {
+                const source = [...sessionItems, ...hiddenSessionItems].find((item) => item.id === knowledgeDetail.source_session);
+                if (source) { setKnowledgeDetail(null); void openSessionPreview(source); }
+                else notify("未找到来源会话", "来源会话可能已被移出当前 Vault");
+              }}>查看来源会话</button>}
               {editingKnowledge ? <><button onClick={() => void openKnowledge(knowledgeDetail.id)}>取消</button><button className="primary-button" disabled={savingKnowledge} onClick={() => void saveKnowledge()}>{savingKnowledge ? "正在保存…" : "保存修改"}</button></> : <button className="primary-button" onClick={() => setEditingKnowledge(true)}>编辑知识</button>}
             </footer>
           </aside>

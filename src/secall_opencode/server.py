@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from . import __version__
 from .chatgpt import inspect_export, parse_export
 from .config import Config
 from .converter import convert_export
@@ -19,7 +20,9 @@ from .knowledge_store import (
     delete_knowledge_document,
     list_knowledge_documents,
     list_knowledge_trash,
+    purge_all_knowledge_derivatives,
     read_knowledge_document,
+    reconcile_qa_with_knowledge_trash,
     restore_knowledge_document,
     update_knowledge_document,
 )
@@ -34,7 +37,27 @@ from .session_review_store import (
 )
 from .session_lifecycle import iter_session_files, migrate_legacy_sessions, move_session_file
 from .session_sync import SessionSyncWorker
-from .wiki_store import graph_snapshot, list_wiki_pages, read_wiki_page, rebuild_graph
+from .structured_knowledge import (
+    build_events_from_markdown,
+    derive_legacy_structure,
+    read_session_events,
+    read_structured_knowledge,
+    store_session_events,
+    store_structured_knowledge,
+    structured_path,
+)
+from .wiki_store import (
+    archive_wiki_page,
+    graph_snapshot,
+    list_wiki_archive,
+    list_wiki_pages,
+    purge_all_wiki_archive,
+    purge_wiki_archive,
+    read_wiki_page,
+    rebuild_graph,
+    restore_wiki_page,
+    sync_wiki_knowledge_views,
+)
 
 
 MAX_BODY_BYTES = 100 * 1024 * 1024
@@ -152,6 +175,9 @@ def read_vault_session(config: Config, session_id: str) -> Dict[str, Any]:
         raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
     path = _safe_vault_path(config.vault, Path(match["path"]))
     markdown = path.read_text(encoding="utf-8", errors="replace")
+    events = read_session_events(config.vault, session_id)
+    if not events:
+        events = build_events_from_markdown(markdown)
     metadata = _frontmatter(markdown)
     localized = localize_display_text(markdown)
     full_length = len(localized)
@@ -214,6 +240,8 @@ def read_vault_session(config: Config, session_id: str) -> Dict[str, Any]:
             "assistant_turns": assistant_turns,
             "has_conclusion": has_conclusion,
         },
+        "events": events,
+        "event_count": len(events),
     }
 
 
@@ -234,6 +262,51 @@ def read_qa(config: Config) -> List[Dict[str, Any]]:
         if isinstance(item, dict):
             result.append(item)
     return result
+
+
+def backfill_structured_knowledge(
+    config: Config,
+    *,
+    source_session: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create sidecars for legacy cards without changing their Markdown or QA."""
+    sessions = {
+        item["id"]: item
+        for item in list_vault_sessions(config, limit=1000, include_hidden=True)
+    }
+    qa_by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for item in read_qa(config):
+        qa_by_session.setdefault(str(item.get("source_session") or ""), []).append(item)
+    created = 0
+    skipped = 0
+    for summary in list_knowledge_documents(config, limit=10000):
+        session_id = str(summary.get("source_session") or "")
+        if not session_id or (source_session and session_id != source_session):
+            continue
+        if read_structured_knowledge(config.vault, session_id):
+            skipped += 1
+            continue
+        detail = read_knowledge_document(config, summary["id"])
+        events = read_session_events(config.vault, session_id)
+        session = sessions.get(session_id)
+        source_markdown = ""
+        if session:
+            source_path = _safe_vault_path(config.vault, Path(session["path"]))
+            source_markdown = source_path.read_text(encoding="utf-8", errors="replace")
+        if not events and source_markdown:
+            events = build_events_from_markdown(source_markdown)
+            if events:
+                store_session_events(config.vault, session_id, events)
+        structured = derive_legacy_structure(
+            detail["markdown"],
+            qa_by_session.get(session_id, []),
+            session_id=session_id,
+            project=detail["project"],
+            events=events,
+        )
+        store_structured_knowledge(config.vault, structured)
+        created += 1
+    return {"created": created, "skipped": skipped}
 
 
 def write_qa(config: Config, items: List[Dict[str, Any]]) -> None:
@@ -300,6 +373,13 @@ def run_session_pipeline(
     source_markdown = session_path.read_text(encoding="utf-8")
     record_stage("读取并验证会话", stage_started, f"{match['turns']} 轮消息，预审核已通过")
 
+    events = read_session_events(config.vault, session_id)
+    if not events:
+        events = build_events_from_markdown(source_markdown)
+        if events:
+            store_session_events(config.vault, session_id, events)
+    stages[-1]["detail"] += f"，已建立 {len(events)} 个可追溯事件"
+
     existing_issue: Optional[Path] = None
     for issue_path in (config.vault / config.knowledge_dir).glob("*.md"):
         if _frontmatter(issue_path.read_text(encoding="utf-8")).get("source_session") == session_id:
@@ -322,6 +402,8 @@ def run_session_pipeline(
 
     reused = existing_issue is not None and not overwrite
     if reused:
+        backfill_structured_knowledge(config, source_session=session_id)
+        structured = read_structured_knowledge(config.vault, session_id) or {}
         stages.append(
             {
                 "name": "OpenCode 知识抽取",
@@ -341,6 +423,10 @@ def run_session_pipeline(
             "qa_path": str(config.vault / config.qa_file),
             "qa_count": qa_count_for_session(),
             "new_qa_count": 0,
+            "structured_path": (
+                str(structured_path(config.vault, session_id)) if structured else ""
+            ),
+            "quality": dict(structured.get("quality") or {}),
         }
     else:
         stage_started = time.monotonic()
@@ -388,7 +474,7 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.6"
+    server_version = "seCallOpenCodeLocal/0.7"
 
     @property
     def config(self) -> Config:
@@ -463,6 +549,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         )
         return {"keyword": keyword, "semantic": semantic}
 
+    def _sync_knowledge_derivatives(self) -> Dict[str, Any]:
+        qa = reconcile_qa_with_knowledge_trash(self.config)
+        wiki = sync_wiki_knowledge_views(self.config)
+        graph = graph_snapshot(self.config)
+        search = self._refresh_search()
+        return {
+            "qa": qa,
+            "wiki": wiki,
+            "graph": graph["stats"],
+            "search": search,
+        }
+
     def do_OPTIONS(self) -> None:  # noqa: N802
         if self._origin() not in ALLOWED_ORIGINS:
             self._send(HTTPStatus.FORBIDDEN, {"ok": False, "error": {"message": "不允许的来源。"}})
@@ -488,7 +586,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(
                     {
                         "ready": True,
-                        "api_version": "0.6.0",
+                        "api_version": __version__,
                         "vault": str(self.config.vault),
                         "opencode_version": opencode_version,
                         "models": models,
@@ -530,6 +628,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         limit=limit,
                     )
                 )
+            elif parsed.path == "/api/wiki/trash":
+                self._ok(list_wiki_archive(self.config))
             elif parsed.path.startswith("/api/wiki/"):
                 wiki_id = parsed.path.removeprefix("/api/wiki/")
                 parts = [unquote(part) for part in wiki_id.split("/", 1)]
@@ -550,6 +650,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         scope=str(query.get("scope", ["all"])[0]),
                         mode=str(query.get("mode", ["keyword"])[0]),
                         limit=limit,
+                        filters={
+                            key: str(query.get(key, [""])[0])
+                            for key in (
+                                "project",
+                                "module",
+                                "confidence",
+                                "review_status",
+                                "knowledge_type",
+                            )
+                            if str(query.get(key, [""])[0]).strip()
+                        },
                     )
                 )
             elif parsed.path == "/api/search/status":
@@ -595,6 +706,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     overwrite=bool(body.get("overwrite")),
                     timeout=int(body.get("timeout") or 1800),
                 )
+                wiki_sync = sync_wiki_knowledge_views(self.config)
                 if reindex_requested:
                     search_started = time.monotonic()
                     search_result = self._refresh_search()
@@ -627,6 +739,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                             },
                         ]
                     )
+                result["derivatives"] = {
+                    "wiki": wiki_sync,
+                    "graph": graph_snapshot(self.config)["stats"],
+                }
                 self._ok(result)
             elif parsed.path == "/api/index":
                 result = Runner(self.config.secall_command).run(
@@ -640,6 +756,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "search": search_result,
                     }
                 )
+            elif parsed.path == "/api/knowledge/sync":
+                self._ok(self._sync_knowledge_derivatives())
+            elif parsed.path == "/api/knowledge/derivatives/purge":
+                if str(body.get("confirm") or "") != "PURGE_DERIVED":
+                    raise ValueError("清空全部知识派生数据需要明确确认。")
+                result = purge_all_knowledge_derivatives(self.config)
+                result["search"] = self._refresh_search()
+                result["wiki"] = list_wiki_pages(self.config, limit=2000)
+                result["graph"] = graph_snapshot(self.config)["stats"]
+                self._ok(result)
             elif parsed.path == "/api/sync/now":
                 self._ok(self.server.sync_worker.scan(force=True))  # type: ignore[attr-defined]
             elif parsed.path == "/api/rag/query":
@@ -709,6 +835,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 matched = False
                 for item in items:
                     if str(item.get("id")) == qa_id:
+                        if status == "approved" and not (
+                            item.get("evidence")
+                            or item.get("evidence_event_ids")
+                        ):
+                            raise ValueError(
+                                "该 QA 缺少来源证据，补充 evidence 或"
+                                " evidence_event_ids 后才能通过审核。"
+                            )
                         item["review_status"] = status
                         matched = True
                         break
@@ -728,8 +862,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     self.config,
                     unquote(trash_id.rstrip("/")),
                 )
-                self._refresh_search()
+                restored["derivatives"] = self._sync_knowledge_derivatives()
                 self._ok(restored)
+            elif (
+                parsed.path.startswith("/api/wiki/trash/")
+                and parsed.path.endswith("/restore")
+            ):
+                trash_id = parsed.path.removeprefix("/api/wiki/trash/").removesuffix(
+                    "/restore"
+                )
+                restored_wiki = restore_wiki_page(
+                    self.config,
+                    unquote(trash_id.rstrip("/")),
+                )
+                restored_wiki["derivatives"] = self._sync_knowledge_derivatives()
+                self._ok(restored_wiki)
             else:
                 self._fail(FileNotFoundError("接口不存在。"), HTTPStatus.NOT_FOUND)
         except FileNotFoundError as exc:
@@ -747,7 +894,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))
             updated = update_knowledge_document(self.config, knowledge_id, body)
-            self._refresh_search()
+            updated["derivatives"] = self._sync_knowledge_derivatives()
             self._ok(updated)
         except FileNotFoundError as exc:
             self._fail(exc, HTTPStatus.NOT_FOUND)
@@ -777,11 +924,33 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._refresh_search()
                 self._ok(hidden)
                 return
+            if parsed.path == "/api/wiki/trash":
+                query = parse_qs(parsed.query)
+                if query.get("confirm", [""])[0] != "clear":
+                    raise ValueError("清空 Wiki 回收站需要 confirm=clear。")
+                self._ok(purge_all_wiki_archive(self.config))
+                return
+            if parsed.path.startswith("/api/wiki/trash/"):
+                query = parse_qs(parsed.query)
+                if query.get("confirm", [""])[0] != "permanent":
+                    raise ValueError("永久删除 Wiki 需要 confirm=permanent。")
+                trash_id = unquote(parsed.path.removeprefix("/api/wiki/trash/"))
+                self._ok(purge_wiki_archive(self.config, trash_id))
+                return
+            if parsed.path.startswith("/api/wiki/"):
+                wiki_id = parsed.path.removeprefix("/api/wiki/")
+                parts = [unquote(part) for part in wiki_id.split("/", 1)]
+                if len(parts) != 2:
+                    raise ValueError("Wiki 页面 ID 必须包含分类和页面名。")
+                archived = archive_wiki_page(self.config, parts[0], parts[1])
+                archived["derivatives"] = self._sync_knowledge_derivatives()
+                self._ok(archived)
+                return
             if not parsed.path.startswith("/api/knowledge/"):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))
             deleted = delete_knowledge_document(self.config, knowledge_id)
-            self._refresh_search()
+            deleted["derivatives"] = self._sync_knowledge_derivatives()
             self._ok(deleted)
         except FileNotFoundError as exc:
             self._fail(exc, HTTPStatus.NOT_FOUND)
@@ -803,15 +972,22 @@ def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError("本地 API 默认只允许绑定回环地址。")
     migration = migrate_legacy_sessions(config)
+    structured_migration = backfill_structured_knowledge(config)
     if migration.get("staged"):
         try:
             Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
         except Exception as exc:
             print(f"迁移后的 seCall 索引刷新失败，可稍后在前端手动重建：{exc}")
     server = LocalAPIServer((host, port), config)
+    if structured_migration.get("created"):
+        server.search.keyword.rebuild()
+        semantic_sync = getattr(server.search.semantic, "sync", None)
+        if server.search.semantic.available and callable(semantic_sync):
+            semantic_sync()
     server.sync_worker.start()
     print(f"seCall OpenCode Local API: http://{host}:{port}")
     print(f"会话生命周期迁移：{migration}")
+    print(f"结构化知识兼容迁移：{structured_migration}")
     print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()

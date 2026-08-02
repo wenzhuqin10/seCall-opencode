@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 
 from .config import Config
+from .structured_knowledge import (
+    read_session_events,
+    read_structured_knowledge,
+    score_session_knowledge,
+    store_structured_knowledge,
+    structured_path,
+)
 
 
 SAFE_ID = re.compile(r"^[0-9A-Za-z\u4e00-\u9fff._+-]+$")
@@ -77,12 +84,18 @@ def read_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, Any]
     intro, sections = _sections(body)
     heading_match = re.search(r"(?m)^#\s+(.+?)\s*$", intro)
     heading = heading_match.group(1).strip() if heading_match else metadata.get("title", path.stem)
+    source_session = metadata.get("source_session") or ""
+    structured = (
+        read_structured_knowledge(config.vault, source_session)
+        if source_session
+        else None
+    )
     return {
         "id": path.stem,
         "title": metadata.get("title") or heading,
         "heading": heading,
         "project": metadata.get("project") or "unknown",
-        "source_session": metadata.get("source_session") or "",
+        "source_session": source_session,
         "confidence": metadata.get("confidence") or "unknown",
         "review_status": metadata.get("review_status") or "pending",
         "type": metadata.get("type") or "issue",
@@ -91,6 +104,13 @@ def read_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, Any]
         "markdown": markdown,
         "version": _document_version(markdown),
         "updated": int(path.stat().st_mtime * 1000),
+        "structured": structured or {},
+        "quality": dict((structured or {}).get("quality") or {}),
+        "events": (
+            read_session_events(config.vault, source_session)
+            if source_session
+            else []
+        ),
     }
 
 
@@ -120,6 +140,7 @@ def list_knowledge_documents(config: Config, limit: int = 200) -> List[Dict[str,
                 "review_status": document["review_status"],
                 "summary": summary,
                 "updated": document["updated"],
+                "quality": document["quality"],
             }
         )
     return result
@@ -203,6 +224,51 @@ def update_knowledge_document(
         raise RuntimeError("知识卡片已被其他操作修改，请刷新后重试。")
     markdown = _render_document(existing, payload)
     atomic_write_text(_find_knowledge_path(config, knowledge_id), markdown)
+    structured = read_structured_knowledge(
+        config.vault, existing["source_session"]
+    )
+    if structured:
+        section_map = {
+            str(item.get("heading") or ""): str(item.get("content") or "")
+            for item in payload.get("sections", [])
+            if isinstance(item, dict)
+        }
+
+        def sync_record_list(field: str, section: str) -> None:
+            if section not in section_map:
+                return
+            records = structured.get(field)
+            if isinstance(records, list) and records and isinstance(records[0], dict):
+                records[0]["description"] = section_map[section]
+            elif section_map[section]:
+                structured[field] = [
+                    {"description": section_map[section], "evidence_event_ids": []}
+                ]
+
+        sync_record_list("symptoms", "问题现象")
+        sync_record_list("timeline", "事件时间线")
+        sync_record_list("troubleshooting_steps", "定位过程")
+        root_cause = structured.setdefault("root_cause", {})
+        if isinstance(root_cause, dict) and "根因分析" in section_map:
+            root_cause["conclusion"] = section_map["根因分析"]
+        fix = structured.setdefault("fix", {})
+        if isinstance(fix, dict):
+            if "修复方案" in section_map:
+                fix["final_fix"] = section_map["修复方案"]
+            if "代码变更" in section_map:
+                fix["code_changes"] = section_map["代码变更"]
+        verification = structured.setdefault("verification", {})
+        if isinstance(verification, dict) and "验证方法" in section_map:
+            verification["results"] = section_map["验证方法"]
+        lessons = structured.setdefault("lessons", {})
+        if isinstance(lessons, dict) and "经验总结" in section_map:
+            lessons["diagnostic_rules"] = section_map["经验总结"]
+        structured["project"] = str(payload.get("project") or existing["project"])
+        structured["quality"] = score_session_knowledge(
+            structured,
+            read_session_events(config.vault, existing["source_session"]),
+        )
+        store_structured_knowledge(config.vault, structured)
     return read_knowledge_document(config, knowledge_id)
 
 
@@ -225,6 +291,29 @@ def _write_qa_records(path: Path, items: Iterable[Dict[str, Any]]) -> None:
     atomic_write_text(path, payload)
 
 
+def _session_aliases(value: str) -> set[str]:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return set()
+    aliases = {normalized}
+    for token in re.findall(r"[0-9a-f]{8,}", normalized):
+        aliases.add(token)
+        aliases.add(token[:8])
+    return aliases
+
+
+def _qa_matches_knowledge(
+    item: Dict[str, Any],
+    *,
+    knowledge_id: str,
+    source_session: str,
+) -> bool:
+    if str(item.get("knowledge_id") or "") == knowledge_id:
+        return True
+    qa_source = str(item.get("source_session") or item.get("source") or "")
+    return bool(_session_aliases(qa_source) & _session_aliases(source_session))
+
+
 def delete_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, Any]:
     document = read_knowledge_document(config, knowledge_id)
     path = _find_knowledge_path(config, knowledge_id)
@@ -238,11 +327,17 @@ def delete_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, An
     linked = [
         item
         for item in records
-        if document["source_session"]
-        and str(item.get("source_session") or "") == document["source_session"]
+        if _qa_matches_knowledge(
+            item,
+            knowledge_id=knowledge_id,
+            source_session=document["source_session"],
+        )
     ]
     kept = [item for item in records if item not in linked]
     shutil.copy2(path, trash_dir / "document.md")
+    structured = structured_path(config.vault, document["source_session"])
+    if document["source_session"] and structured.exists():
+        shutil.copy2(structured, trash_dir / "structured.json")
     if linked:
         _write_qa_records(trash_dir / "qa.jsonl", linked)
     manifest = {
@@ -254,6 +349,7 @@ def delete_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, An
         "project": document["project"],
         "deleted_at": datetime.now(timezone.utc).isoformat(),
         "qa_count": len(linked),
+        "has_structured": (trash_dir / "structured.json").exists(),
     }
     atomic_write_text(
         trash_dir / "manifest.json",
@@ -262,7 +358,140 @@ def delete_knowledge_document(config: Config, knowledge_id: str) -> Dict[str, An
     if qa_path.exists():
         _write_qa_records(qa_path, kept)
     path.unlink()
+    if document["source_session"] and structured.exists():
+        structured.unlink()
     return manifest
+
+
+def reconcile_qa_with_knowledge_trash(config: Config) -> Dict[str, Any]:
+    """Move QA left behind by legacy session IDs into the matching knowledge trash."""
+
+    qa_path = config.vault / config.qa_file
+    records = _read_qa_records(qa_path)
+    if not records:
+        return {"moved": 0, "remaining": 0}
+    manifests = list_knowledge_trash(config)
+    if not manifests:
+        return {"moved": 0, "remaining": len(records)}
+
+    moved = 0
+    remaining: List[Dict[str, Any]] = []
+    for item in records:
+        matched = next(
+            (
+                manifest
+                for manifest in manifests
+                if _qa_matches_knowledge(
+                    item,
+                    knowledge_id=str(manifest.get("knowledge_id") or ""),
+                    source_session=str(manifest.get("source_session") or ""),
+                )
+            ),
+            None,
+        )
+        if not matched:
+            remaining.append(item)
+            continue
+        trash_dir = (
+            config.vault
+            / ".trash"
+            / "knowledge"
+            / str(matched["trash_id"])
+        )
+        trash_qa = trash_dir / "qa.jsonl"
+        archived = _read_qa_records(trash_qa)
+        archived_ids = {
+            str(record.get("id"))
+            for record in archived
+            if record.get("id")
+        }
+        if not item.get("id") or str(item.get("id")) not in archived_ids:
+            archived.append(item)
+            _write_qa_records(trash_qa, archived)
+        manifest_path = trash_dir / "manifest.json"
+        matched["qa_count"] = len(archived)
+        atomic_write_text(
+            manifest_path,
+            json.dumps(matched, ensure_ascii=False, indent=2) + "\n",
+        )
+        moved += 1
+    if moved:
+        _write_qa_records(qa_path, remaining)
+    return {"moved": moved, "remaining": len(remaining)}
+
+
+def purge_all_knowledge_derivatives(config: Config) -> Dict[str, Any]:
+    """Permanently remove generated knowledge while preserving source sessions.
+
+    The raw, staging and rejected session trees are deliberately outside the
+    removal set. Search databases are rebuilt by the API layer after this
+    function returns, so stale keyword and semantic entries are removed too.
+    """
+
+    vault = config.vault.resolve()
+
+    def safe_target(path: Path) -> Path:
+        resolved = path.resolve()
+        if resolved == vault or vault not in resolved.parents:
+            raise ValueError(f"拒绝清理 Vault 之外的路径：{resolved}")
+        return resolved
+
+    def inventory(path: Path) -> Tuple[int, int]:
+        if not path.exists():
+            return 0, 0
+        if path.is_file():
+            return 1, path.stat().st_size
+        files = [item for item in path.rglob("*") if item.is_file()]
+        return len(files), sum(item.stat().st_size for item in files)
+
+    targets = [
+        vault / "wiki",
+        vault / "graph" / "graph.json",
+        vault / config.qa_file,
+        vault / "knowledge" / "events",
+        vault / "knowledge" / "structured",
+        vault / ".trash" / "wiki",
+        vault / ".trash" / "knowledge",
+    ]
+    # A custom knowledge directory may live outside the default wiki/issues path.
+    targets.append(vault / config.knowledge_dir)
+
+    unique_targets: List[Path] = []
+    for raw_target in targets:
+        target = safe_target(raw_target)
+        if any(target == known or known in target.parents for known in unique_targets):
+            continue
+        unique_targets = [
+            known for known in unique_targets if target not in known.parents
+        ]
+        unique_targets.append(target)
+
+    removed_files = 0
+    removed_bytes = 0
+    removed_paths: List[str] = []
+    for target in unique_targets:
+        files, size = inventory(target)
+        if not target.exists():
+            continue
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        removed_files += files
+        removed_bytes += size
+        removed_paths.append(str(target.relative_to(vault)).replace("\\", "/"))
+
+    raw_root = vault / "raw" / ".sessions"
+    preserved_sessions = (
+        sum(1 for path in raw_root.rglob("*.md")) if raw_root.exists() else 0
+    )
+    return {
+        "purged": True,
+        "removed_files": removed_files,
+        "removed_bytes": removed_bytes,
+        "removed_paths": removed_paths,
+        "preserved_sessions": preserved_sessions,
+    }
 
 
 def list_knowledge_trash(config: Config) -> List[Dict[str, Any]]:
@@ -291,8 +520,21 @@ def restore_knowledge_document(config: Config, trash_id: str) -> Dict[str, Any]:
     target = config.vault / str(manifest["original_path"])
     if target.exists():
         raise FileExistsError(f"知识卡片已存在，无法覆盖恢复：{target.stem}")
+    structured_trash = trash_dir / "structured.json"
+    source_session = str(manifest.get("source_session") or "")
+    structured_target = (
+        structured_path(config.vault, source_session) if source_session else None
+    )
+    if structured_trash.exists() and structured_target and structured_target.exists():
+        raise FileExistsError(
+            f"结构化知识已存在，无法覆盖恢复：{source_session}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(document_path), str(target))
+
+    if structured_trash.exists() and structured_target:
+        structured_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(structured_trash), str(structured_target))
 
     qa_trash = trash_dir / "qa.jsonl"
     if qa_trash.exists():
