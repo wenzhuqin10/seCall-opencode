@@ -4,8 +4,10 @@ from secall_opencode.config import Config
 from secall_opencode.server import (
     list_vault_sessions,
     localize_display_text,
+    paginate_vault_sessions,
     read_vault_session,
 )
+from secall_opencode.session_review_store import hide_session
 
 
 def test_localize_legacy_korean_session_title() -> None:
@@ -71,3 +73,43 @@ turns: 4
     assert detail["quality"]["tool_calls"] == 1
     assert detail["quality"]["has_conclusion"] is True
     assert path.read_text(encoding="utf-8") == original
+
+
+def test_session_pagination_filters_hidden_before_slicing(tmp_path: Path) -> None:
+    session_dir = tmp_path / "staging" / "sessions" / "2026-08-04"
+    session_dir.mkdir(parents=True)
+    for index in range(25):
+        (session_dir / f"session-{index:02d}.md").write_text(
+            f"""---
+session_id: session-{index:02d}
+project: radio
+agent: opencode
+turns: 3
+---
+
+# 会话 {index:02d}
+""",
+            encoding="utf-8",
+        )
+    hide_session(Config(vault=tmp_path), "session-00")
+
+    page = paginate_vault_sessions(
+        Config(vault=tmp_path), page=3, page_size=10, review_status="all"
+    )
+
+    assert page["total"] == 24
+    assert page["total_pages"] == 3
+    assert len(page["items"]) == 4
+    assert page["counts"] == {
+        "all": 24,
+        "pending": 24,
+        "approved": 0,
+        "rejected": 0,
+        "hidden": 1,
+    }
+
+    hidden = paginate_vault_sessions(
+        Config(vault=tmp_path), page=1, page_size=10, review_status="hidden"
+    )
+    assert hidden["total"] == 1
+    assert hidden["items"][0]["id"] == "session-00"

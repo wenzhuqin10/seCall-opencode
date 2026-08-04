@@ -4,6 +4,10 @@ import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react"
 
 type View = "overview" | "sessions" | "pipeline" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
+type ImportFailure = {
+  file: string; size: string; stage: string; code: string; reason: string;
+  suggestion: string; errorType?: string; status?: number; details?: Record<string, unknown>;
+};
 type SessionItem = {
   id: string; title: string; project: string; model: string; turns: number;
   updated: string; status: string; source?: string; path?: string;
@@ -18,6 +22,17 @@ type SessionDetail = SessionItem & {
     tool_calls: number; user_turns: number; assistant_turns: number;
     has_conclusion: boolean;
   };
+};
+type SessionPageResponse = {
+  items: Array<Record<string, unknown>>;
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  has_previous: boolean;
+  has_next: boolean;
+  counts: Record<"all" | "pending" | "approved" | "rejected" | "hidden", number>;
+  projects: string[];
 };
 type QaItem = {
   id: string; question: string; answer: string; source: string;
@@ -144,16 +159,67 @@ const qaSeed: QaItem[] = [
   { id: "demo-3", question: "OpenCode 的 --sanitize 参数是否适合知识抽取？", answer: "不适合。该参数会隐藏正文和工具结果，只建议用于分享或转换链路诊断。", source: "ses_c1138a", confidence: 99, type: "使用说明", state: "pending" },
 ];
 
+class ApiError extends Error {
+  status: number;
+  type: string;
+  code: string;
+  stage: string;
+  hint: string;
+  details: Record<string, unknown>;
+
+  constructor(message: string, status: number, error: Record<string, unknown> = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.type = String(error.type ?? "ApiError");
+    this.code = String(error.code ?? `HTTP_${status}`);
+    this.stage = String(error.stage ?? "后端处理");
+    this.hint = String(error.hint ?? "请检查本地服务日志后重试。");
+    this.details = typeof error.details === "object" && error.details !== null
+      ? error.details as Record<string, unknown>
+      : {};
+  }
+}
+
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
   });
-  const payload = await response.json();
+  const raw = await response.text();
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    throw new ApiError(
+      raw.trim().slice(0, 500) || "本地服务返回了无法解析的响应。",
+      response.status,
+      { code: "INVALID_API_RESPONSE", stage: "读取后端响应", hint: "请重启本地服务后重试。" },
+    );
+  }
   if (!response.ok || !payload.ok) {
-    throw new Error(payload?.error?.message ?? `请求失败（${response.status}）`);
+    const error = typeof payload.error === "object" && payload.error !== null
+      ? payload.error as Record<string, unknown>
+      : {};
+    throw new ApiError(String(error.message ?? `请求失败（${response.status}）`), response.status, error);
   }
   return payload.result as T;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function jsonErrorLocation(message: string, source: string): string {
+  const match = message.match(/position\s+(\d+)/i);
+  if (!match) return message;
+  const position = Number(match[1]);
+  const before = source.slice(0, position);
+  const line = before.split("\n").length;
+  const column = position - before.lastIndexOf("\n");
+  return `${message}（第 ${line} 行，第 ${column} 列）`;
 }
 
 function formatUpdated(value: number | string): string {
@@ -357,18 +423,29 @@ export default function Home() {
   const [pipelineReindex, setPipelineReindex] = useState(true);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
+  const [pipelineSessionItems, setPipelineSessionItems] = useState<SessionItem[]>([]);
   const [hiddenSessionItems, setHiddenSessionItems] = useState<SessionItem[]>([]);
   const [sessionReviewFilter, setSessionReviewFilter] = useState<"all" | "pending" | "approved" | "rejected" | "hidden">("all");
+  const [sessionProject, setSessionProject] = useState("");
+  const [sessionPage, setSessionPage] = useState(1);
+  const [sessionTotal, setSessionTotal] = useState(0);
+  const [sessionTotalPages, setSessionTotalPages] = useState(1);
+  const [sessionCounts, setSessionCounts] = useState({ all: 0, pending: 0, approved: 0, rejected: 0, hidden: 0 });
+  const [sessionProjects, setSessionProjects] = useState<string[]>([]);
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null);
   const [sessionPreviewLoading, setSessionPreviewLoading] = useState(false);
   const [syncingSessions, setSyncingSessions] = useState(false);
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
   const [health, setHealth] = useState<Health | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
+  const [connectingService, setConnectingService] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [importFailure, setImportFailure] = useState<ImportFailure | null>(null);
   const [importProject, setImportProject] = useState("chatgpt-import");
+  const [externalOpenCodeProject, setExternalOpenCodeProject] = useState("external-opencode");
   const [selectedSession, setSelectedSession] = useState("ses_0598ac");
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const externalOpenCodeFileInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null);
   const [knowledgeTab, setKnowledgeTab] = useState<"overview" | "timeline" | "diagnosis" | "code" | "evidence">("overview");
@@ -396,9 +473,16 @@ export default function Home() {
   const [clock, setClock] = useState(() => new Date());
 
   const refreshData = async () => {
-    const [healthResult, sessionResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
+    const sessionParams = new URLSearchParams({
+      page: String(sessionPage),
+      page_size: "10",
+      review_status: sessionReviewFilter,
+    });
+    if (sessionProject) sessionParams.set("project", sessionProject);
+    const [healthResult, sessionResult, pipelineSessionsResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
       apiRequest<Health>("/api/health"),
-      apiRequest<Array<Record<string, unknown>>>("/api/sessions?limit=300"),
+      apiRequest<SessionPageResponse>(`/api/sessions?${sessionParams}`),
+      apiRequest<SessionPageResponse>("/api/sessions?page=1&page_size=1000&review_status=approved"),
       apiRequest<Array<Record<string, unknown>>>("/api/sessions/hidden?limit=1000"),
       apiRequest<Array<Record<string, unknown>>>("/api/qa?limit=300"),
       apiRequest<KnowledgeItem[]>("/api/knowledge?limit=300"),
@@ -421,7 +505,8 @@ export default function Home() {
       reviewed_at: String(item.reviewed_at ?? ""),
       storage_state: String(item.storage_state ?? "pending") as SessionItem["storage_state"],
     });
-    const normalizedSessions = sessionResult.map(normalizeSession);
+    const normalizedSessions = sessionResult.items.map(normalizeSession);
+    const normalizedPipelineSessions = pipelineSessionsResult.items.map(normalizeSession);
     const normalizedHiddenSessions = hiddenSessionResult.map(normalizeSession);
     const normalizedQa = qaResult.map((item, index) => ({
       id: String(item.id ?? `qa-${index}`),
@@ -436,7 +521,13 @@ export default function Home() {
     }));
     setHealth(healthResult);
     setSessionItems(normalizedSessions);
+    setPipelineSessionItems(normalizedPipelineSessions);
     setHiddenSessionItems(normalizedHiddenSessions);
+    setSessionTotal(sessionResult.total);
+    setSessionTotalPages(sessionResult.total_pages);
+    setSessionCounts(sessionResult.counts);
+    setSessionProjects(sessionResult.projects);
+    if (sessionResult.page !== sessionPage) setSessionPage(sessionResult.page);
     setQaItems(normalizedQa);
     setKnowledgeItems(knowledgeResult);
     setWikiPages(wikiResult.pages);
@@ -452,7 +543,7 @@ export default function Home() {
       current && !graphResult.nodes.some((item) => item.id === current.id) ? null : current
     ));
     setApiConnected(true);
-    if (normalizedSessions.length && !normalizedSessions.some((item) => item.id === selectedSession)) {
+    if (!selectedSession && normalizedSessions.length) {
       setSelectedSession(normalizedSessions[0].id);
     }
   };
@@ -464,7 +555,17 @@ export default function Home() {
     // The selected session is intentionally reconciled inside refreshData.
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [sessionPage, sessionProject, sessionReviewFilter]);
+
+  useEffect(() => {
+    if (apiConnected) return;
+    const timer = window.setInterval(() => {
+      void apiRequest<Health>("/api/health").then(() => refreshData()).catch(() => undefined);
+    }, 5_000);
+    return () => window.clearInterval(timer);
+    // refreshData is intentionally kept outside the dependency list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiConnected]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
@@ -474,6 +575,34 @@ export default function Home() {
   const notify = (title: string, detail: string) => {
     setToast({ title, detail });
     window.setTimeout(() => setToast(null), 3200);
+  };
+
+  const connectLocalService = async () => {
+    if (connectingService) return;
+    setConnectingService(true);
+    try {
+      await refreshData();
+      notify("连接成功", "本地服务已连接，数据已刷新。");
+      setConnectingService(false);
+      return;
+    } catch {
+      window.location.href = "secall-opencode://start";
+      notify("正在启动本地服务", "已调用本地启动器，页面将自动检测连接状态。");
+    }
+
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1_000));
+      try {
+        await refreshData();
+        notify("启动成功", "本地 API 已连接，工作区数据已恢复。");
+        setConnectingService(false);
+        return;
+      } catch {
+        // Keep waiting while the local process starts.
+      }
+    }
+    setConnectingService(false);
+    notify("未能启动本地服务", "请运行 scripts\\start-local.ps1 完成首次启动器注册。");
   };
 
   const runSearch = async () => {
@@ -524,21 +653,17 @@ export default function Home() {
     () => sessionItems.filter((item) => `${item.title} ${item.project} ${item.id} ${item.source ?? ""}`.toLowerCase().includes(query.toLowerCase())),
     [query, sessionItems],
   );
-  const reviewedSessions = useMemo(() => {
-    const source = sessionReviewFilter === "hidden" ? hiddenSessionItems : sessionItems;
-    return source.filter((item) => {
-      const matchesQuery = `${item.title} ${item.project} ${item.id} ${item.source ?? ""}`.toLowerCase().includes(query.toLowerCase());
-      const matchesReview = sessionReviewFilter === "all"
-        || sessionReviewFilter === "hidden"
-        || item.review_status === sessionReviewFilter;
-      return matchesQuery && matchesReview;
-    });
-  }, [hiddenSessionItems, query, sessionItems, sessionReviewFilter]);
+  const reviewedSessions = sessionItems;
   const approvedSessions = useMemo(
-    () => sessionItems.filter((item) => item.review_status === "approved"),
-    [sessionItems],
+    () => pipelineSessionItems.filter((item) => item.review_status === "approved"),
+    [pipelineSessionItems],
   );
   const pipelineSession = approvedSessions.find((item) => item.id === selectedSession) ?? approvedSessions[0];
+  const sessionPageNumbers = useMemo(() => {
+    const start = Math.max(1, Math.min(sessionPage - 2, sessionTotalPages - 4));
+    const end = Math.min(sessionTotalPages, start + 4);
+    return Array.from({ length: Math.max(0, end - start + 1) }, (_, index) => start + index);
+  }, [sessionPage, sessionTotalPages]);
   const hour = Number(new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     hour: "2-digit",
@@ -1023,25 +1148,143 @@ export default function Home() {
 
   const importChatGPTFile = async (file: File) => {
     setImporting(true);
+    setImportFailure(null);
+    let stage = "检查本地服务";
+    let source = "";
     try {
       if (!apiConnected) throw new Error("本地 API 未连接，请先运行启动脚本。");
-      const payload = JSON.parse(await file.text());
+      if (!file.name.toLowerCase().endsWith(".json")) {
+        throw new Error("请选择 ChatGPT 官方导出的 conversations.json 文件。");
+      }
+      if (!file.size) throw new Error("所选文件为空，无法导入。");
+      if (file.size > 95 * 1024 * 1024) {
+        throw new Error("文件超过 95 MB，无法通过本地导入接口处理。");
+      }
+      stage = "读取文件";
+      source = await file.text();
+      stage = "解析 JSON";
+      let payload: unknown;
+      try {
+        payload = JSON.parse(source.replace(/^\uFEFF/, ""));
+      } catch (error) {
+        if (error instanceof SyntaxError) {
+          throw new SyntaxError(jsonErrorLocation(error.message, source));
+        }
+        throw error;
+      }
+      stage = "验证会话结构";
       const inspected = await apiRequest<{ conversation_count: number; message_count: number }>("/api/chatgpt/inspect", {
         method: "POST",
         body: JSON.stringify({ payload }),
       });
+      if (!inspected.conversation_count || !inspected.message_count) {
+        throw new Error("文件中没有可导入的有效会话或文本消息。");
+      }
+      stage = "写入会话 Vault";
       const result = await apiRequest<{ imported: number }>("/api/chatgpt/import", {
         method: "POST",
-        body: JSON.stringify({ payload, project: importProject }),
+        body: JSON.stringify({ payload, project: importProject.trim() || "chatgpt-import" }),
       });
+      stage = "刷新工作区数据";
       await refreshData();
       setActive("sessions");
       notify("ChatGPT 会话导入完成", `导入 ${result.imported} 个会话，共 ${inspected.message_count} 条消息`);
     } catch (error) {
-      notify("ChatGPT 导入失败", error instanceof Error ? error.message : "文件格式不受支持");
+      const apiError = error instanceof ApiError ? error : null;
+      const reason = error instanceof Error ? error.message : "发生未知导入错误。";
+      const isConnectionError = error instanceof TypeError || reason.includes("API 未连接") || reason.includes("Failed to fetch");
+      const suggestion = apiError?.hint || (
+        isConnectionError
+          ? "点击左下角“启动”连接本地服务，然后重新选择文件。"
+          : error instanceof SyntaxError
+            ? "请重新从 ChatGPT 导出数据，不要手动编辑、截断或复制 JSON 内容。"
+            : stage === "读取文件"
+              ? "确认文件未被占用、具有读取权限，并重新选择该文件。"
+              : stage === "刷新工作区数据"
+                ? "会话可能已经写入成功，请刷新页面或进入“研发会话”检查。"
+                : "确认文件为 ChatGPT 官方 conversations.json，并查看下方服务返回信息。"
+      );
+      setImportFailure({
+        file: file.name,
+        size: formatFileSize(file.size),
+        stage: apiError?.stage || stage,
+        code: apiError?.code || (error instanceof SyntaxError ? "INVALID_JSON" : isConnectionError ? "SERVICE_UNAVAILABLE" : "IMPORT_FAILED"),
+        reason,
+        suggestion,
+        errorType: apiError?.type || (error instanceof Error ? error.name : "UnknownError"),
+        status: apiError?.status,
+        details: apiError?.details,
+      });
+      notify("ChatGPT 导入失败", `${apiError?.stage || stage}：${reason.slice(0, 120)}`);
     } finally {
       setImporting(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  };
+
+  const importExternalOpenCodeFile = async (file: File) => {
+    setImporting(true);
+    setImportFailure(null);
+    let stage = "检查本地服务";
+    let source = "";
+    try {
+      if (!apiConnected) throw new Error("本地 API 未连接，请先启动本地服务。");
+      if (!file.name.toLowerCase().endsWith(".json")) {
+        throw new Error("请选择由 OpenCode 或 codeagent export 导出的 JSON 文件。");
+      }
+      if (!file.size) throw new Error("所选文件为空，无法导入。");
+      if (file.size > 95 * 1024 * 1024) {
+        throw new Error("文件超过 95 MB，无法通过本地导入接口处理。");
+      }
+      stage = "读取文件";
+      source = await file.text();
+      stage = "解析 JSON";
+      let payload: unknown;
+      try {
+        payload = JSON.parse(source.replace(/^\uFEFF/, ""));
+      } catch (error) {
+        if (error instanceof SyntaxError) throw new SyntaxError(jsonErrorLocation(error.message, source));
+        throw error;
+      }
+      stage = "验证 OpenCode 导出结构";
+      const project = externalOpenCodeProject.trim() || "external-opencode";
+      const inspected = await apiRequest<{ session_id: string; title: string; turns: number; message_count: number }>("/api/opencode/inspect", {
+        method: "POST", body: JSON.stringify({ payload, project }),
+      });
+      if (!inspected.session_id || !inspected.message_count) {
+        throw new Error("文件中没有可导入的 OpenCode 会话消息。");
+      }
+      stage = "写入会话 Vault";
+      await apiRequest<{ imported: number }>("/api/opencode/import", {
+        method: "POST", body: JSON.stringify({ payload, project }),
+      });
+      stage = "刷新工作区数据";
+      await refreshData();
+      setActive("sessions");
+      notify("OpenCode 会话导入完成", `已导入“${inspected.title}”，共 ${inspected.turns} 轮，等待预审核。`);
+    } catch (error) {
+      const apiError = error instanceof ApiError ? error : null;
+      const reason = error instanceof Error ? error.message : "发生未知导入错误。";
+      const isConnectionError = error instanceof TypeError || reason.includes("API 未连接") || reason.includes("Failed to fetch");
+      const suggestion = apiError?.hint || (
+        isConnectionError
+          ? "点击左下角“启动”连接本地服务，然后重新选择文件。"
+          : error instanceof SyntaxError
+            ? "请重新从外部 OpenCode 环境执行 export，避免手动截断、编辑或拼接 JSON。"
+            : stage === "读取文件"
+              ? "确认文件未被占用、具有读取权限，并重新选择该文件。"
+              : "请确认文件由 OpenCode/codeagent 的 export 命令生成，且包含 info 和 messages 字段。"
+      );
+      setImportFailure({
+        file: file.name, size: formatFileSize(file.size), stage: apiError?.stage || stage,
+        code: apiError?.code || (error instanceof SyntaxError ? "INVALID_JSON" : isConnectionError ? "SERVICE_UNAVAILABLE" : "OPENCODE_IMPORT_FAILED"),
+        reason, suggestion, errorType: apiError?.type || (error instanceof Error ? error.name : "UnknownError"),
+        status: apiError?.status, details: apiError?.details,
+      });
+      notify("OpenCode 导入失败", `${apiError?.stage || stage}：${reason.slice(0, 120)}`);
+    } finally {
+      setImporting(false);
+      if (externalOpenCodeFileInputRef.current) externalOpenCodeFileInputRef.current.value = "";
     }
   };
 
@@ -1077,6 +1320,15 @@ export default function Home() {
           <div className="local-card">
             <span className={`pulse-dot ${apiConnected ? "" : "offline"}`} />
             <div><strong>{apiConnected ? "本地服务运行中" : "本地服务未连接"}</strong><small>127.0.0.1:8765</small></div>
+            <button
+              type="button"
+              className={apiConnected ? "connected" : ""}
+              onClick={() => void connectLocalService()}
+              disabled={connectingService}
+              title={apiConnected ? "检测连接并刷新数据" : "启动并连接本地服务"}
+            >
+              {connectingService ? "连接中" : apiConnected ? "刷新" : "启动"}
+            </button>
           </div>
           <button className="profile">
             <span className="profile-avatar">QL</span>
@@ -1229,25 +1481,26 @@ export default function Home() {
                 <div className="session-heading-actions">
                   <span className={`sync-state ${health?.sync?.running ? "running" : ""}`}><i />{health?.sync?.syncing ? "正在监听…" : health?.sync?.running ? "实时监听中" : "监听未启动"}</span>
                   <button className="secondary-button" onClick={() => void syncOpenCodeSessions()} disabled={syncingSessions}>↻ {syncingSessions ? "同步中…" : "立即同步"}</button>
-                  <div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div>
+                  <div className="import-actions"><input value={importProject} onChange={(event) => setImportProject(event.target.value)} placeholder="ChatGPT 项目名称" aria-label="ChatGPT 导入项目名称" /><button className="primary-button" onClick={() => fileInputRef.current?.click()} disabled={importing}>＋ {importing ? "正在导入…" : "导入 ChatGPT"}</button></div>
+                  <div className="import-actions"><input value={externalOpenCodeProject} onChange={(event) => setExternalOpenCodeProject(event.target.value)} placeholder="OpenCode 项目名称" aria-label="外部 OpenCode 导入项目名称" /><button className="secondary-button" onClick={() => externalOpenCodeFileInputRef.current?.click()} disabled={importing}>＋ 导入 OpenCode</button></div>
                 </div>
               </div>
               <div className="session-review-summary">
-                <article><span className="pending">●</span><strong>{sessionItems.filter((item) => item.review_status === "pending").length}</strong><small>待预审核</small></article>
-                <article><span className="approved">●</span><strong>{sessionItems.filter((item) => item.review_status === "approved").length}</strong><small>已通过</small></article>
-                <article><span className="rejected">●</span><strong>{sessionItems.filter((item) => item.review_status === "rejected").length}</strong><small>已拒绝</small></article>
-                <article><span className="hidden">●</span><strong>{hiddenSessionItems.length}</strong><small>前端隐藏</small></article>
+                <article><span className="pending">●</span><strong>{sessionCounts.pending}</strong><small>待预审核</small></article>
+                <article><span className="approved">●</span><strong>{sessionCounts.approved}</strong><small>已通过</small></article>
+                <article><span className="rejected">●</span><strong>{sessionCounts.rejected}</strong><small>已拒绝</small></article>
+                <article><span className="hidden">●</span><strong>{sessionCounts.hidden}</strong><small>前端隐藏</small></article>
                 <p><b>会话生命周期</b> 待审核存放在暂存区；通过后移入正式 Vault；拒绝后移入隔离区。OpenCode 原始数据始终不变。</p>
               </div>
               <div className="filter-bar review-filter">
                 {([
-                  ["all", `全部 ${sessionItems.length}`],
-                  ["pending", `待审核 ${sessionItems.filter((item) => item.review_status === "pending").length}`],
-                  ["approved", `已通过 ${sessionItems.filter((item) => item.review_status === "approved").length}`],
-                  ["rejected", `已拒绝 ${sessionItems.filter((item) => item.review_status === "rejected").length}`],
-                  ["hidden", `已隐藏 ${hiddenSessionItems.length}`],
-                ] as const).map(([id, label]) => <button key={id} className={sessionReviewFilter === id ? "active" : ""} onClick={() => setSessionReviewFilter(id)}>{label}</button>)}
-                <span /><select aria-label="项目筛选"><option>全部项目</option>{Array.from(new Set(sessionItems.map((item) => item.project))).map((project) => <option key={project}>{project}</option>)}</select>
+                  ["all", `全部 ${sessionCounts.all}`],
+                  ["pending", `待审核 ${sessionCounts.pending}`],
+                  ["approved", `已通过 ${sessionCounts.approved}`],
+                  ["rejected", `已拒绝 ${sessionCounts.rejected}`],
+                  ["hidden", `已隐藏 ${sessionCounts.hidden}`],
+                ] as const).map(([id, label]) => <button key={id} className={sessionReviewFilter === id ? "active" : ""} onClick={() => { setSessionReviewFilter(id); setSessionPage(1); }}>{label}</button>)}
+                <span /><select aria-label="项目筛选" value={sessionProject} onChange={(event) => { setSessionProject(event.target.value); setSessionPage(1); }}><option value="">全部项目</option>{sessionProjects.map((project) => <option value={project} key={project}>{project}</option>)}</select>
               </div>
               <article className="panel table-panel">
                 <div className="data-table">
@@ -1272,6 +1525,14 @@ export default function Home() {
                   ))}
                   {!reviewedSessions.length && <div className="empty-state">当前筛选条件下没有会话</div>}
                 </div>
+                <footer className="session-pagination">
+                  <span>每页 10 条，共 {sessionTotal} 条</span>
+                  <div>
+                    <button disabled={sessionPage <= 1} onClick={() => setSessionPage((page) => Math.max(1, page - 1))}>上一页</button>
+                    {sessionPageNumbers.map((page) => <button className={page === sessionPage ? "active" : ""} aria-current={page === sessionPage ? "page" : undefined} key={page} onClick={() => setSessionPage(page)}>{page}</button>)}
+                    <button disabled={sessionPage >= sessionTotalPages} onClick={() => setSessionPage((page) => Math.min(sessionTotalPages, page + 1))}>下一页</button>
+                  </div>
+                </footer>
               </article>
               {sessionPreviewLoading && <div className="preview-loading"><span>◌</span>正在读取会话内容…</div>}
             </section>
@@ -1743,7 +2004,49 @@ export default function Home() {
         </div>
       )}
 
+      {importFailure && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setImportFailure(null)}>
+          <aside className="modal import-error-modal" role="alertdialog" aria-modal="true" aria-labelledby="import-error-title" onClick={(event) => event.stopPropagation()}>
+            <button className="modal-close" aria-label="关闭导入错误详情" onClick={() => setImportFailure(null)}>×</button>
+            <div className="import-error-mark">!</div>
+            <p className="eyebrow">IMPORT DIAGNOSTICS</p>
+            <h2 id="import-error-title">会话导入未完成</h2>
+            <p>系统已保留完整的失败阶段和错误信息，便于定位问题。</p>
+            <dl className="import-error-details">
+              <div><dt>失败阶段</dt><dd>{importFailure.stage}</dd></div>
+              <div><dt>错误代码</dt><dd><code>{importFailure.code}</code></dd></div>
+              <div><dt>导入文件</dt><dd>{importFailure.file} · {importFailure.size}</dd></div>
+              {importFailure.status ? <div><dt>服务状态</dt><dd>HTTP {importFailure.status} · {importFailure.errorType}</dd></div> : null}
+            </dl>
+            <section className="import-error-reason"><strong>具体原因</strong><p>{importFailure.reason}</p></section>
+            <section className="import-error-hint"><strong>处理建议</strong><p>{importFailure.suggestion}</p></section>
+            {importFailure.details && Object.keys(importFailure.details).length > 0
+              ? <details className="import-error-raw"><summary>查看服务返回详情</summary><pre>{JSON.stringify(importFailure.details, null, 2)}</pre></details>
+              : null}
+            <div className="modal-actions">
+              <button onClick={() => setImportFailure(null)}>关闭</button>
+              <button className="primary-button" onClick={() => {
+                const report = [
+                  `文件：${importFailure.file}（${importFailure.size}）`,
+                  `阶段：${importFailure.stage}`,
+                  `代码：${importFailure.code}`,
+                  `类型：${importFailure.errorType || "UnknownError"}`,
+                  importFailure.status ? `HTTP：${importFailure.status}` : "",
+                  `原因：${importFailure.reason}`,
+                  `建议：${importFailure.suggestion}`,
+                  importFailure.details ? `详情：${JSON.stringify(importFailure.details, null, 2)}` : "",
+                ].filter(Boolean).join("\n");
+                void navigator.clipboard.writeText(report).then(
+                  () => notify("错误详情已复制", "可将该信息发送给维护人员进一步排查。"),
+                  () => notify("复制失败", "浏览器未授予剪贴板权限，请手动选择错误信息。"),
+                );
+              }}>复制错误详情</button>
+            </div>
+          </aside>
+        </div>
+      )}
       <input ref={fileInputRef} className="file-input" type="file" accept=".json,application/json" aria-label="选择 ChatGPT conversations.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importChatGPTFile(file); }} />
+      <input ref={externalOpenCodeFileInputRef} className="file-input" type="file" accept=".json,application/json" aria-label="选择外部 OpenCode Session JSON" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importExternalOpenCodeFile(file); }} />
       {toast && <div className="toast"><span>✓</span><div><strong>{toast.title}</strong><small>{toast.detail}</small></div><button onClick={() => setToast(null)}>×</button></div>}
     </main>
   );

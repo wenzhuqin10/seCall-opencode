@@ -108,7 +108,9 @@ def render_markdown(data: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     agent = str(info.get("agent") or source)
     session_id = str(info["id"])
     directory = str(info.get("directory") or "")
-    project = Path(directory).name if directory else str(info.get("title") or "unknown")
+    # An imported external export can supply a logical project without losing
+    # the original working directory kept in ``cwd``.
+    project = str(info.get("project") or (Path(directory).name if directory else info.get("title") or "unknown"))
     project = project or "unknown"
     start = _ms_datetime(_dict(info.get("time")).get("created"))
     if start is None:

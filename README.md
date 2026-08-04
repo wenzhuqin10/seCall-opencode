@@ -14,6 +14,11 @@ powershell -ExecutionPolicy Bypass -File scripts\start-local.ps1
 浏览器会打开 `http://localhost:3000`。本地 API 仅监听
 `127.0.0.1:8765`，不会向局域网开放。
 
+首次运行该脚本会注册 `secall-opencode://` 本地启动协议。此后前端左下角
+“本地服务”卡片提供一键启动/重新连接按钮；后端意外停止时，页面也会每 5 秒
+自动检测并恢复连接。该协议只执行本仓库的 `scripts/connect-local.ps1`，且服务仍
+仅监听本机地址。
+
 停止服务：
 
 ```powershell
@@ -109,6 +114,7 @@ secall-opencode serve
 
 - 统一搜索会话、知识卡片和审核通过的 QA；
 - 只读会话内容预览、辅助质量信号、预审核和低质会话拒绝；
+- 研发会话采用服务端分页，每页 10 条；审核状态与项目筛选后重新统计总数，隐藏会话不会占用当前页名额；
 - 不删除 OpenCode 原始数据的前端隐藏与恢复；
 - OpenCode 会话后台增量监听、稳定窗口和手动立即同步；
 - FTS5/BM25 关键词检索与中文字符二元组匹配；

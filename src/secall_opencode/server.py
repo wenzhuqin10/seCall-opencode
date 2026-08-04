@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import __version__
 from .chatgpt import inspect_export, parse_export
 from .config import Config
-from .converter import convert_export
+from .converter import convert_export, render_markdown
 from .knowledge import store_knowledge
 from .knowledge_store import (
     atomic_write_text,
@@ -131,7 +131,7 @@ def _safe_vault_path(vault: Path, path: Path) -> Path:
 
 def list_vault_sessions(
     config: Config,
-    limit: int = 200,
+    limit: Optional[int] = 200,
     *,
     include_hidden: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -144,7 +144,7 @@ def list_vault_sessions(
         key=lambda item: item[1].stat().st_mtime,
         reverse=True,
     )
-    for storage_state, path in files[:1000]:
+    for storage_state, path in files:
         text = path.read_text(encoding="utf-8", errors="replace")
         meta = _frontmatter(text)
         title_match = re.search(r"(?m)^#\s+(.+)$", text)
@@ -165,11 +165,85 @@ def list_vault_sessions(
             }
         )
     annotated = annotate_sessions(config, result, include_hidden=include_hidden)
+    if limit is None:
+        return annotated
     return annotated[: max(1, min(limit, 1000))]
 
 
+def paginate_vault_sessions(
+    config: Config,
+    *,
+    page: int = 1,
+    page_size: int = 10,
+    review_status: str = "all",
+    project: str = "",
+    query: str = "",
+) -> Dict[str, Any]:
+    sessions = list_vault_sessions(config, limit=None, include_hidden=True)
+    projects = sorted(
+        {
+            str(item.get("project") or "unknown")
+            for item in sessions
+            if not item.get("hidden")
+        },
+        key=str.lower,
+    )
+    normalized_project = project.strip()
+    normalized_query = query.strip().lower()
+
+    def matches_base(item: Dict[str, Any]) -> bool:
+        if normalized_project and str(item.get("project") or "").lower() != normalized_project.lower():
+            return False
+        if normalized_query:
+            searchable = " ".join(
+                str(item.get(key) or "")
+                for key in ("title", "project", "id", "source", "model")
+            ).lower()
+            if normalized_query not in searchable:
+                return False
+        return True
+
+    scoped = [item for item in sessions if matches_base(item)]
+    visible = [item for item in scoped if not item.get("hidden")]
+    hidden = [item for item in scoped if item.get("hidden")]
+    counts = {
+        "all": len(visible),
+        "pending": sum(item.get("review_status") == "pending" for item in visible),
+        "approved": sum(item.get("review_status") == "approved" for item in visible),
+        "rejected": sum(item.get("review_status") == "rejected" for item in visible),
+        "hidden": len(hidden),
+    }
+    if review_status == "hidden":
+        filtered = hidden
+    elif review_status == "all":
+        filtered = visible
+    elif review_status in {"pending", "approved", "rejected"}:
+        filtered = [
+            item for item in visible if item.get("review_status") == review_status
+        ]
+    else:
+        raise ValueError("review_status 必须是 all、pending、approved、rejected 或 hidden。")
+
+    page_size = max(1, min(page_size, 1000))
+    total = len(filtered)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    return {
+        "items": filtered[start : start + page_size],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "has_previous": page > 1,
+        "has_next": page < total_pages,
+        "counts": counts,
+        "projects": projects,
+    }
+
+
 def read_vault_session(config: Config, session_id: str) -> Dict[str, Any]:
-    sessions = list_vault_sessions(config, limit=1000, include_hidden=True)
+    sessions = list_vault_sessions(config, limit=None, include_hidden=True)
     match = next((item for item in sessions if item["id"] == session_id), None)
     if not match:
         raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
@@ -272,7 +346,7 @@ def backfill_structured_knowledge(
     """Create sidecars for legacy cards without changing their Markdown or QA."""
     sessions = {
         item["id"]: item
-        for item in list_vault_sessions(config, limit=1000, include_hidden=True)
+        for item in list_vault_sessions(config, limit=None, include_hidden=True)
     }
     qa_by_session: Dict[str, List[Dict[str, Any]]] = {}
     for item in read_qa(config):
@@ -316,6 +390,32 @@ def write_qa(config: Config, items: List[Dict[str, Any]]) -> None:
     atomic_write_text(path, payload)
 
 
+class ChatGPTImportFailure(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        imported: int,
+        conversation_id: str,
+        conversation_title: str,
+        conversation_index: int,
+        original: Exception,
+    ) -> None:
+        super().__init__(message)
+        self.imported = imported
+        self.conversation_id = conversation_id
+        self.conversation_title = conversation_title
+        self.conversation_index = conversation_index
+        self.original = original
+
+
+class OpenCodeImportFailure(RuntimeError):
+    def __init__(self, message: str, *, session_id: str, original: Exception) -> None:
+        super().__init__(message)
+        self.session_id = session_id
+        self.original = original
+
+
 def import_chatgpt(
     config: Config,
     payload: Any,
@@ -325,18 +425,82 @@ def import_chatgpt(
 ) -> Dict[str, Any]:
     conversations = parse_export(payload, limit=limit)
     results: List[Dict[str, Any]] = []
-    for conversation in conversations:
-        converted = convert_export(
-            conversation.as_export(project),
-            config.vault,
-            overwrite=overwrite,
-            destination_dir="staging/sessions",
-        )
+    for index, conversation in enumerate(conversations):
+        try:
+            converted = convert_export(
+                conversation.as_export(project),
+                config.vault,
+                overwrite=overwrite,
+                destination_dir="staging/sessions",
+            )
+        except Exception as exc:
+            raise ChatGPTImportFailure(
+                f"写入会话“{conversation.title}”失败：{exc}",
+                imported=len(results),
+                conversation_id=conversation.id,
+                conversation_title=conversation.title,
+                conversation_index=index + 1,
+                original=exc,
+            ) from exc
         results.append(converted.as_dict())
     return {
         "imported": len(results),
         "project": project,
         "sessions": results,
+    }
+
+
+def inspect_opencode_export(payload: Any, project: str = "") -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("OpenCode 导出必须是一个 JSON 对象。")
+    markdown, metadata = render_markdown(payload)
+    info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
+    return {
+        "session_id": metadata["session_id"],
+        "title": str(info.get("title") or metadata["project"]),
+        "project": project or metadata["project"],
+        "message_count": len(payload.get("messages") or []),
+        "turns": metadata["turns"],
+        "tools": list(metadata["tools"]),
+        "rendered_bytes": len(markdown.encode("utf-8")),
+    }
+
+
+def import_opencode_export(
+    config: Config,
+    payload: Any,
+    project: str,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("OpenCode 导出必须是一个 JSON 对象。")
+    # Copy the uploaded JSON: we add local import metadata but never mutate the
+    # request payload or the external machine's original export.
+    exported = json.loads(json.dumps(payload, ensure_ascii=False))
+    info = exported.get("info")
+    if not isinstance(info, dict):
+        raise ValueError("OpenCode 导出缺少 info 对象。")
+    session_id = str(info.get("id") or "")
+    try:
+        if project:
+            info["project"] = project
+        info.setdefault("source", "opencode")
+        converted = convert_export(
+            exported,
+            config.vault,
+            overwrite=overwrite,
+            destination_dir="staging/sessions",
+        )
+    except Exception as exc:
+        raise OpenCodeImportFailure(
+            f"写入 OpenCode 会话失败：{exc}",
+            session_id=session_id,
+            original=exc,
+        ) from exc
+    return {
+        "imported": 1,
+        "project": project or converted.project,
+        "session": converted.as_dict(),
     }
 
 
@@ -361,7 +525,7 @@ def run_session_pipeline(
         )
 
     stage_started = time.monotonic()
-    sessions = list_vault_sessions(config, limit=1000, include_hidden=True)
+    sessions = list_vault_sessions(config, limit=None, include_hidden=True)
     match = next((item for item in sessions if item["id"] == session_id), None)
     if not match:
         raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
@@ -526,6 +690,79 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def _fail_chatgpt_import(self, exc: Exception, stage: str) -> None:
+        original = exc.original if isinstance(exc, ChatGPTImportFailure) else exc
+        details: Dict[str, Any] = {}
+        if isinstance(exc, ChatGPTImportFailure):
+            details = {
+                "imported_before_failure": exc.imported,
+                "failed_conversation_index": exc.conversation_index,
+                "failed_conversation_id": exc.conversation_id,
+                "failed_conversation_title": exc.conversation_title,
+            }
+
+        if isinstance(original, FileExistsError):
+            code = "SESSION_CONFLICT"
+            status = HTTPStatus.CONFLICT
+            hint = "目标会话已存在但内容不同。请检查同名会话，或在确认后使用覆盖导入。"
+        elif isinstance(original, PermissionError):
+            code = "VAULT_PERMISSION_DENIED"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请确认 Vault 目录具有写入权限，且文件未被其他程序锁定。"
+        elif isinstance(original, OSError):
+            code = "VAULT_WRITE_FAILED"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请检查 Vault 路径、剩余磁盘空间和文件占用状态。"
+        elif isinstance(original, (ValueError, TypeError)):
+            code = "INVALID_CHATGPT_EXPORT"
+            status = HTTPStatus.UNPROCESSABLE_ENTITY
+            hint = "请选择 ChatGPT 官方导出的 conversations.json；文件中至少需要一个包含文本消息的会话。"
+        else:
+            code = "CHATGPT_IMPORT_FAILED"
+            status = HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请复制完整错误详情，并结合本地服务日志进一步排查。"
+
+        details["cause"] = str(original)
+        self._send(
+            status,
+            {
+                "ok": False,
+                "error": {
+                    "type": original.__class__.__name__,
+                    "code": code,
+                    "stage": stage,
+                    "message": str(exc),
+                    "hint": hint,
+                    "details": details,
+                },
+            },
+        )
+
+    def _fail_opencode_import(self, exc: Exception, stage: str) -> None:
+        original = exc.original if isinstance(exc, OpenCodeImportFailure) else exc
+        details: Dict[str, Any] = {"cause": str(original)}
+        if isinstance(exc, OpenCodeImportFailure):
+            details["session_id"] = exc.session_id
+        if isinstance(original, FileExistsError):
+            code, status = "SESSION_CONFLICT", HTTPStatus.CONFLICT
+            hint = "该会话已存在但内容不同。请确认来源文件，或在确认后允许覆盖导入。"
+        elif isinstance(original, PermissionError):
+            code, status = "VAULT_PERMISSION_DENIED", HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请确认 Vault 目录可写，且文件没有被其他程序占用。"
+        elif isinstance(original, OSError):
+            code, status = "VAULT_WRITE_FAILED", HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请检查 Vault 路径、磁盘空间和文件占用状态。"
+        elif isinstance(original, (ValueError, TypeError)):
+            code, status = "INVALID_OPENCODE_EXPORT", HTTPStatus.UNPROCESSABLE_ENTITY
+            hint = "请选择由 OpenCode/codeagent 的 export 命令生成的完整 JSON 文件。"
+        else:
+            code, status = "OPENCODE_IMPORT_FAILED", HTTPStatus.INTERNAL_SERVER_ERROR
+            hint = "请复制完整错误详情，并结合本地服务日志继续排查。"
+        self._send(status, {"ok": False, "error": {
+            "type": original.__class__.__name__, "code": code, "stage": stage,
+            "message": str(exc), "hint": hint, "details": details,
+        }})
+
     def _json_body(self) -> Any:
         raw_length = self.headers.get("Content-Length")
         if not raw_length:
@@ -578,7 +815,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 client = OpenCodeClient(self.config.opencode_command)
                 opencode_version = client.version()
                 models = client.models()
-                sessions = list_vault_sessions(self.config, limit=1000)
+                sessions = list_vault_sessions(self.config, limit=None)
                 knowledge = list_knowledge(self.config, limit=1000)
                 qa = read_qa(self.config)
                 wiki = list_wiki_pages(self.config, limit=2000)
@@ -602,12 +839,26 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     }
                 )
             elif parsed.path == "/api/sessions":
-                self._ok(list_vault_sessions(self.config, limit))
+                if "page" in query or "page_size" in query:
+                    self._ok(
+                        paginate_vault_sessions(
+                            self.config,
+                            page=int(query.get("page", ["1"])[0]),
+                            page_size=int(query.get("page_size", ["10"])[0]),
+                            review_status=str(
+                                query.get("review_status", ["all"])[0]
+                            ),
+                            project=str(query.get("project", [""])[0]),
+                            query=str(query.get("q", [""])[0]),
+                        )
+                    )
+                else:
+                    self._ok(list_vault_sessions(self.config, limit))
             elif parsed.path == "/api/sessions/hidden":
                 hidden = [
                     item
                     for item in list_vault_sessions(
-                        self.config, limit=1000, include_hidden=True
+                        self.config, limit=None, include_hidden=True
                     )
                     if item["hidden"]
                 ]
@@ -681,21 +932,45 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("请求体必须是 JSON 对象。")
             if parsed.path == "/api/chatgpt/inspect":
-                self._ok(inspect_export(body.get("payload"), int(body.get("limit") or 20)))
+                try:
+                    self._ok(inspect_export(body.get("payload"), int(body.get("limit") or 20)))
+                except Exception as exc:
+                    self._fail_chatgpt_import(exc, "验证会话结构")
+            elif parsed.path == "/api/opencode/inspect":
+                project = str(body.get("project") or "").strip()
+                try:
+                    self._ok(inspect_opencode_export(body.get("payload"), project))
+                except Exception as exc:
+                    self._fail_opencode_import(exc, "验证 OpenCode 导出结构")
             elif parsed.path == "/api/chatgpt/import":
                 project = str(body.get("project") or "chatgpt-import").strip()
                 if not project:
                     raise ValueError("project 不能为空。")
-                self._ok(
-                    import_chatgpt(
-                        self.config,
-                        body.get("payload"),
-                        project,
-                        limit=int(body["limit"]) if body.get("limit") is not None else None,
-                        overwrite=bool(body.get("overwrite")),
-                    ),
-                    HTTPStatus.CREATED,
-                )
+                try:
+                    self._ok(
+                        import_chatgpt(
+                            self.config,
+                            body.get("payload"),
+                            project,
+                            limit=int(body["limit"]) if body.get("limit") is not None else None,
+                            overwrite=bool(body.get("overwrite")),
+                        ),
+                        HTTPStatus.CREATED,
+                    )
+                except Exception as exc:
+                    self._fail_chatgpt_import(exc, "写入会话 Vault")
+            elif parsed.path == "/api/opencode/import":
+                project = str(body.get("project") or "external-opencode").strip()
+                try:
+                    self._ok(
+                        import_opencode_export(
+                            self.config, body.get("payload"), project,
+                            overwrite=bool(body.get("overwrite")),
+                        ),
+                        HTTPStatus.CREATED,
+                    )
+                except Exception as exc:
+                    self._fail_opencode_import(exc, "写入会话 Vault")
             elif parsed.path == "/api/pipeline":
                 reindex_requested = bool(body.get("reindex", True))
                 result = run_session_pipeline(
@@ -794,7 +1069,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 known = {
                     item["id"]
                     for item in list_vault_sessions(
-                        self.config, limit=1000, include_hidden=True
+                        self.config, limit=None, include_hidden=True
                     )
                 }
                 if session_id not in known:
@@ -911,7 +1186,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 known = {
                     item["id"]: item
                     for item in list_vault_sessions(
-                        self.config, limit=1000, include_hidden=True
+                        self.config, limit=None, include_hidden=True
                     )
                 }
                 if session_id not in known:

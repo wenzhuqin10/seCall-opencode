@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from secall_opencode.converter import convert_export, validate_export
+from secall_opencode.converter import convert_export, render_markdown, validate_export
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "opencode_session.json"
@@ -29,6 +29,14 @@ class ConverterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
                 validate_export({"messages": []})
+
+    def test_external_project_override_preserves_cwd(self):
+        data = json.loads(FIXTURE.read_text(encoding="utf-8"))
+        original_directory = data["info"].get("directory")
+        data["info"]["project"] = "外部基带项目"
+        _, metadata = render_markdown(data)
+        self.assertEqual(metadata["project"], "外部基带项目")
+        self.assertEqual(data["info"].get("directory"), original_directory)
 
 
 if __name__ == "__main__":

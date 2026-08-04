@@ -7,6 +7,9 @@ $stateFile = Join-Path $env:TEMP "secall-opencode-local.json"
 $python = (Get-Command python.exe -ErrorAction Stop).Source
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
 
+# Register the browser-to-local launcher for the frontend's one-click connect button.
+& (Join-Path $PSScriptRoot "install-browser-launcher.ps1") -Quiet
+
 $apiProcess = Start-Process `
     -FilePath $python `
     -ArgumentList @("-m", "secall_opencode.cli", "serve", "--host", "127.0.0.1", "--port", "8765") `
