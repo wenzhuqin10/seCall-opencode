@@ -98,6 +98,22 @@ type WikiArchiveItem = {
   slug: string; title: string; project: string; source_session: string;
   archived_at: string;
 };
+type WikiPlanSummary = {
+  plan_id: string; status: string; reason: string; created_at: string;
+  updated_at: string; requires_review: boolean;
+  summary: { total: number; create: number; update: number; archive: number };
+};
+type WikiPlanChange = {
+  change_id: string; page_id: string; category: string; title: string;
+  action: "create" | "update" | "archive"; path: string; sources: string[];
+  base_hash: string; new_hash: string; markdown: string; diff: string;
+  conflicts: string[];
+};
+type WikiPlanDetail = WikiPlanSummary & { changes: WikiPlanChange[]; input_hash: string };
+type WikiLintReport = {
+  checked_at: string; page_count: number; finding_count: number; healthy: boolean;
+  findings: Array<{ type: string; severity: string; page_id?: string; target?: string; category?: string }>;
+};
 type GraphEvidence = {
   files?: string[]; functions?: string[]; commits?: string[];
   root_causes?: string[]; test_cases?: string[];
@@ -129,6 +145,8 @@ type PipelineResult = {
     issue_path: string; qa_path: string; qa_count: number; new_qa_count: number;
   };
   indexed: boolean; reused: boolean; stages: PipelineStage[]; elapsed_seconds: number;
+  wiki_plan_id?: string; wiki_changes?: { total: number; create: number; update: number; archive: number };
+  requires_review?: boolean;
 };
 type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
@@ -252,8 +270,11 @@ const wikiCategories = [
   ["all", "全部页面"],
   ["overview", "知识总览"],
   ["projects", "项目"],
+  ["modules", "模块"],
   ["topics", "技术主题"],
   ["decisions", "设计决策"],
+  ["runbooks", "运行手册"],
+  ["tests", "测试知识"],
   ["issues", "问题定位"],
 ] as const;
 
@@ -465,6 +486,12 @@ export default function Home() {
   const [wikiDetail, setWikiDetail] = useState<WikiDetail | null>(null);
   const [wikiArchiveItems, setWikiArchiveItems] = useState<WikiArchiveItem[]>([]);
   const [showWikiArchive, setShowWikiArchive] = useState(false);
+  const [wikiPlans, setWikiPlans] = useState<WikiPlanSummary[]>([]);
+  const [wikiPlanDetail, setWikiPlanDetail] = useState<WikiPlanDetail | null>(null);
+  const [wikiPlanSelected, setWikiPlanSelected] = useState<string[]>([]);
+  const [showWikiReview, setShowWikiReview] = useState(false);
+  const [wikiLint, setWikiLint] = useState<WikiLintReport | null>(null);
+  const [wikiWorking, setWikiWorking] = useState(false);
   const [graph, setGraph] = useState<GraphSnapshot>({ nodes: [], links: [], stats: { nodes: 0, links: 0, types: {} } });
   const [graphType, setGraphType] = useState("all");
   const [graphQuery, setGraphQuery] = useState("");
@@ -479,7 +506,7 @@ export default function Home() {
       review_status: sessionReviewFilter,
     });
     if (sessionProject) sessionParams.set("project", sessionProject);
-    const [healthResult, sessionResult, pipelineSessionsResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult] = await Promise.all([
+    const [healthResult, sessionResult, pipelineSessionsResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult, wikiPlansResult] = await Promise.all([
       apiRequest<Health>("/api/health"),
       apiRequest<SessionPageResponse>(`/api/sessions?${sessionParams}`),
       apiRequest<SessionPageResponse>("/api/sessions?page=1&page_size=1000&review_status=approved"),
@@ -488,6 +515,7 @@ export default function Home() {
       apiRequest<KnowledgeItem[]>("/api/knowledge?limit=300"),
       apiRequest<WikiResponse>("/api/wiki?limit=1000"),
       apiRequest<GraphSnapshot>("/api/graph"),
+      apiRequest<WikiPlanSummary[]>("/api/wiki/plans?status=pending"),
     ]);
     const normalizeSession = (item: Record<string, unknown>): SessionItem => ({
       id: String(item.id ?? ""),
@@ -533,6 +561,7 @@ export default function Home() {
     setWikiPages(wikiResult.pages);
     setWikiCounts(wikiResult.counts);
     setGraph(graphResult);
+    setWikiPlans(wikiPlansResult);
     setKnowledgeDetail((current) => (
       current && !knowledgeResult.some((item) => item.id === current.id) ? null : current
     ));
@@ -806,6 +835,94 @@ export default function Home() {
       notify("Wiki 回收站已清空", `已永久删除 ${result.purged} 篇归档页面`);
     } catch (error) {
       notify("清空回收站失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const openWikiPlan = async (planId?: string) => {
+    const target = planId || wikiPlans[0]?.plan_id;
+    if (!target) {
+      setShowWikiReview(true);
+      setWikiPlanDetail(null);
+      return;
+    }
+    try {
+      const detail = await apiRequest<WikiPlanDetail>(`/api/wiki/plans/${encodeURIComponent(target)}`);
+      setWikiPlanDetail(detail);
+      setWikiPlanSelected(detail.changes.map((item) => item.change_id));
+      setShowWikiReview(true);
+      setShowWikiArchive(false);
+    } catch (error) {
+      notify("无法打开 Wiki 更新计划", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
+  const rebuildWiki = async () => {
+    if (!window.confirm("将依据当前有效知识生成新版 Wiki 更新计划。历史回收站不会被恢复或清空，是否继续？")) return;
+    setWikiWorking(true);
+    try {
+      const plan = await apiRequest<WikiPlanDetail>("/api/wiki/rebuild", {
+        method: "POST", body: JSON.stringify({ regenerate: true }),
+      });
+      await refreshData();
+      await openWikiPlan(plan.plan_id);
+      notify("重建计划已生成", `共 ${plan.summary.total} 项变更，审核通过后才会写入`);
+    } catch (error) {
+      notify("生成重建计划失败", error instanceof Error ? error.message : "请检查本地服务");
+    } finally {
+      setWikiWorking(false);
+    }
+  };
+
+  const applyWikiPlan = async () => {
+    if (!wikiPlanDetail || !wikiPlanSelected.length) return;
+    setWikiWorking(true);
+    try {
+      await apiRequest(`/api/wiki/plans/${encodeURIComponent(wikiPlanDetail.plan_id)}/apply`, {
+        method: "POST",
+        body: JSON.stringify({ selected_change_ids: wikiPlanSelected }),
+      });
+      setWikiPlanDetail(null);
+      setShowWikiReview(false);
+      await refreshData();
+      notify("Wiki 更新已应用", `已原子写入 ${wikiPlanSelected.length} 项选中变更`);
+    } catch (error) {
+      notify("Wiki 更新未应用", error instanceof Error ? error.message : "页面可能在审核期间发生变化");
+    } finally {
+      setWikiWorking(false);
+    }
+  };
+
+  const rejectWikiPlan = async () => {
+    if (!wikiPlanDetail) return;
+    const reason = window.prompt("请输入拒绝原因（可选）：") ?? "";
+    setWikiWorking(true);
+    try {
+      await apiRequest(`/api/wiki/plans/${encodeURIComponent(wikiPlanDetail.plan_id)}/reject`, {
+        method: "POST", body: JSON.stringify({ reason }),
+      });
+      setWikiPlanDetail(null);
+      setShowWikiReview(false);
+      await refreshData();
+      notify("Wiki 计划已拒绝", "知识卡片和现有 Wiki 均未被修改");
+    } catch (error) {
+      notify("拒绝计划失败", error instanceof Error ? error.message : "请检查本地服务");
+    } finally {
+      setWikiWorking(false);
+    }
+  };
+
+  const runWikiLint = async () => {
+    setWikiWorking(true);
+    try {
+      const report = await apiRequest<WikiLintReport>("/api/wiki/lint", { method: "POST", body: "{}" });
+      setWikiLint(report);
+      setShowWikiReview(true);
+      setShowWikiArchive(false);
+      notify(report.healthy ? "Wiki 健康检查通过" : "Wiki 健康检查完成", `发现 ${report.finding_count} 项需要关注`);
+    } catch (error) {
+      notify("Wiki 健康检查失败", error instanceof Error ? error.message : "请检查本地服务");
+    } finally {
+      setWikiWorking(false);
     }
   };
 
@@ -1107,16 +1224,18 @@ export default function Home() {
         }),
       });
       window.clearInterval(timer);
-      setPipelineStep(5);
+      setPipelineStep(6);
       setPipelineStatus("success");
       setPipelineElapsed(result.elapsed_seconds);
       setPipelineResult(result);
       await refreshData();
       notify(
-        result.reused ? "已复用现有知识并刷新索引" : "知识已成功入库",
-        result.reused
-          ? `现有 ${result.knowledge.qa_count} 条候选 QA，未重复生成`
-          : `新增 ${result.knowledge.new_qa_count} 条候选 QA`,
+        result.requires_review ? "知识已入库，Wiki 计划待审核" : result.reused ? "已复用现有知识并刷新索引" : "知识已成功入库",
+        result.requires_review
+          ? `${result.wiki_changes?.total ?? 0} 项 Wiki 变更尚未写入，请前往 Wiki 中心审核`
+          : result.reused
+            ? `现有 ${result.knowledge.qa_count} 条候选 QA，未重复生成`
+            : `新增 ${result.knowledge.new_qa_count} 条候选 QA`,
       );
     } catch (error) {
       window.clearInterval(timer);
@@ -1427,15 +1546,15 @@ export default function Home() {
                         <div className="session-glyph">OC</div>
                         <div><strong>{pipelineSession?.title ?? "等待选择会话"}</strong><span><code>{pipelineSession?.id ?? "—"}</code> · {pipelineSession?.project ?? "—"}</span></div>
                         <div className="job-progress">
-                          <strong>{pipelineStatus === "failed" ? "失败" : pipelineStatus === "success" ? "100%" : pipelineRunning ? `${pipelineStep * 20}%` : "未运行"}</strong>
+                          <strong>{pipelineStatus === "failed" ? "失败" : pipelineStatus === "success" ? "100%" : pipelineRunning ? `${Math.round(pipelineStep / 6 * 100)}%` : "未运行"}</strong>
                           <span>{pipelineRunning ? `已耗时 ${formatElapsed(pipelineElapsed)}` : pipelineStatus === "success" ? `耗时 ${formatElapsed(pipelineElapsed)}` : pipelineStatus === "failed" ? "查看失败原因" : "可从流水线页面启动"}</span>
                         </div>
                       </div>
                       <div className="stepper">
-                        {["会话校验", "知识抽取", "知识写入", "seCall 索引", "混合索引"].map((step, index) => (
+                        {["会话校验", "知识抽取", "知识写入", "seCall 索引", "混合索引", "Wiki 计划"].map((step, index) => (
                           <div key={step} className={index < pipelineStep ? "done" : pipelineRunning && index === pipelineStep ? "current" : ""}>
                             <span>{index < pipelineStep ? "✓" : index + 1}</span><small>{step}</small>
-                            {index < 4 && <i />}
+                            {index < 5 && <i />}
                           </div>
                         ))}
                       </div>
@@ -1550,7 +1669,7 @@ export default function Home() {
                     <code>{pipelineSession?.id ?? "无会话"} · {pipelineSession?.model ?? "默认模型"}</code>
                   </p>
                 </div>
-                <div className="hero-metrics"><span><b>{pipelineStep}/5</b><small>完成步骤</small></span><span><b>{formatElapsed(pipelineElapsed)}</b><small>实际耗时</small></span><span><b>{pipelineResult?.knowledge.qa_count ?? "—"}</b><small>候选 QA</small></span></div>
+                <div className="hero-metrics"><span><b>{pipelineStep}/6</b><small>完成步骤</small></span><span><b>{formatElapsed(pipelineElapsed)}</b><small>实际耗时</small></span><span><b>{pipelineResult?.knowledge.qa_count ?? "—"}</b><small>候选 QA</small></span></div>
               </article>
               {pipelineError && <div className="pipeline-error"><strong>执行失败</strong><span>{pipelineError}</span></div>}
               <div className="pipeline-detail">
@@ -1560,6 +1679,7 @@ export default function Home() {
                   { name: "写入知识库", detail: "保存知识卡片，并关联来源会话和候选 QA", duration_seconds: 0 },
                   { name: "重建 seCall 索引", detail: "刷新会话全文索引", duration_seconds: 0 },
                   { name: "重建关键词与语义索引", detail: "同步 FTS5/BM25 与 BGE-M3 向量索引", duration_seconds: 0 },
+                  { name: "生成 Wiki 更新计划", detail: "生成跨页面 Markdown Diff，等待人工审核后原子写入", duration_seconds: 0 },
                 ]).map((stage, index) => (
                   <article key={`${stage.name}-${index}`} className={pipelineStatus === "success" || index < pipelineStep ? "complete" : pipelineRunning && index === pipelineStep ? "processing" : ""}>
                     <span>{pipelineStatus === "success" || index < pipelineStep ? "✓" : index + 1}</span>
@@ -1609,13 +1729,13 @@ export default function Home() {
           {active === "wiki" && (
             <section className="subpage wiki-page">
               <div className="subpage-heading">
-                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>{showWikiArchive ? "Wiki 回收站" : "Wiki 知识中心"}</h1><p>{showWikiArchive ? "恢复误归档的项目、主题和设计决策页面。" : "按项目、主题、决策和问题定位组织研发知识，并保留来源会话与反向链接。"}</p></div>
+                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>{showWikiArchive ? "Wiki 回收站" : showWikiReview ? "Wiki 更新审核" : "Wiki 知识中心"}</h1><p>{showWikiArchive ? "恢复误归档的项目、主题和设计决策页面。" : showWikiReview ? "核对来源证据和 Markdown Diff，确认后以一个原子事务写入。" : "按项目、模块、主题、决策、运行手册、测试和问题定位组织研发知识。"}</p></div>
                 <div className="heading-actions">
                   {showWikiArchive && wikiArchiveItems.length > 0 && <button className="danger-button" onClick={() => void clearWikiArchive()}>清空回收站</button>}
-                  {showWikiArchive
-                    ? <button className="secondary-button" onClick={() => setShowWikiArchive(false)}>← 返回 Wiki</button>
-                    : <button className="secondary-button" onClick={() => void loadWikiArchive()}>♲ Wiki 回收站</button>}
-                  {!showWikiArchive && <div className="wiki-heading-stats"><strong>{wikiPages.length}</strong><span>篇文档</span><i /><strong>{wikiCounts.projects ?? 0}</strong><span>个项目</span></div>}
+                  {(showWikiArchive || showWikiReview)
+                    ? <button className="secondary-button" onClick={() => { setShowWikiArchive(false); setShowWikiReview(false); }}>← 返回 Wiki</button>
+                    : <><button className="secondary-button" onClick={() => void runWikiLint()} disabled={wikiWorking}>健康检查</button><button className="secondary-button" onClick={() => void openWikiPlan()}>{`审核更新 ${wikiPlans.length ? `(${wikiPlans.length})` : ""}`}</button><button className="secondary-button" onClick={() => void loadWikiArchive()}>♲ Wiki 回收站</button><button className="primary-button" onClick={() => void rebuildWiki()} disabled={wikiWorking}>{wikiWorking ? "生成中…" : "↻ 重建 Wiki"}</button></>}
+                  {!showWikiArchive && !showWikiReview && <div className="wiki-heading-stats"><strong>{wikiPages.length}</strong><span>篇文档</span><i /><strong>{wikiCounts.projects ?? 0}</strong><span>个项目</span></div>}
                 </div>
               </div>
               {showWikiArchive ? (
@@ -1628,6 +1748,26 @@ export default function Home() {
                       <button className="danger-button" onClick={() => void purgeWiki(item)}>永久删除</button>
                     </article>
                   )) : <div className="empty-state">Wiki 回收站为空</div>}
+                </div>
+              ) : showWikiReview ? (
+                <div className="wiki-review-shell">
+                  <aside className="wiki-plan-list">
+                    <header><strong>待审核计划</strong><span>{wikiPlans.length}</span></header>
+                    {wikiPlans.map((plan) => <button key={plan.plan_id} className={wikiPlanDetail?.plan_id === plan.plan_id ? "active" : ""} onClick={() => void openWikiPlan(plan.plan_id)}><strong>{plan.reason}</strong><small>{plan.summary.total} 项变更 · {formatUpdated(new Date(plan.created_at).getTime())}</small><code>{plan.plan_id}</code></button>)}
+                    {!wikiPlans.length && <p>暂无待审核计划</p>}
+                    {wikiLint && <section className={`wiki-lint-summary ${wikiLint.healthy ? "healthy" : ""}`}><strong>{wikiLint.healthy ? "✓ Wiki 健康" : `发现 ${wikiLint.finding_count} 项问题`}</strong><small>{wikiLint.page_count} 个注册页面</small>{wikiLint.findings.slice(0, 8).map((item, index) => <span key={`${item.type}-${index}`}>{item.severity} · {item.type} · {item.page_id || item.category || item.target || "—"}</span>)}</section>}
+                  </aside>
+                  <article className="wiki-plan-review">
+                    {wikiPlanDetail ? <>
+                      <header><div><p className="eyebrow">REVIEW BEFORE WRITE</p><h2>{wikiPlanDetail.reason}</h2><code>{wikiPlanDetail.plan_id}</code></div><div><strong>{wikiPlanSelected.length}/{wikiPlanDetail.changes.length}</strong><span>项已选择</span></div></header>
+                      <div className="wiki-plan-toolbar"><button onClick={() => setWikiPlanSelected(wikiPlanDetail.changes.map((item) => item.change_id))}>全选</button><button onClick={() => setWikiPlanSelected([])}>取消全选</button><span>创建 {wikiPlanDetail.summary.create} · 更新 {wikiPlanDetail.summary.update} · 归档 {wikiPlanDetail.summary.archive}</span></div>
+                      <div className="wiki-change-list">{wikiPlanDetail.changes.map((change) => {
+                        const checked = wikiPlanSelected.includes(change.change_id);
+                        return <section key={change.change_id} className={checked ? "selected" : ""}><label><input type="checkbox" checked={checked} onChange={() => setWikiPlanSelected((items) => checked ? items.filter((id) => id !== change.change_id) : [...items, change.change_id])} /><span className={`wiki-change-action ${change.action}`}>{change.action === "create" ? "新增" : change.action === "update" ? "修改" : "归档"}</span><strong>{change.title}</strong><code>{change.page_id}</code></label><small>来源：{change.sources.join("、") || "聚合知识"}</small><pre>{change.diff || "无文本差异"}</pre></section>;
+                      })}</div>
+                      <footer><button className="danger-button" disabled={wikiWorking} onClick={() => void rejectWikiPlan()}>拒绝计划</button><button className="primary-button" disabled={wikiWorking || !wikiPlanSelected.length} onClick={() => void applyWikiPlan()}>{wikiWorking ? "正在提交…" : `应用 ${wikiPlanSelected.length} 项变更`}</button></footer>
+                    </> : <div className="wiki-review-empty"><span>✓</span><h2>没有待审核的 Wiki 变更</h2><p>运行知识流水线或点击“重建 Wiki”后，跨页面变更会先出现在这里。</p></div>}
+                  </article>
                 </div>
               ) : <div className="wiki-shell">
                 <aside className="wiki-browser">
