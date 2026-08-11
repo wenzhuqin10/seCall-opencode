@@ -3,6 +3,16 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $frontendRoot = Join-Path $repoRoot "frontend"
 $stateFile = Join-Path $env:TEMP "secall-opencode-local.json"
+$sourceRoot = Join-Path $repoRoot "src"
+
+# Run directly from the checked-out branch even when the adapter has not been
+# installed into the active Python environment. Child processes inherit this
+# value, while the caller's environment remains unchanged after the script exits.
+$env:PYTHONPATH = if ($env:PYTHONPATH) {
+    "$sourceRoot;$env:PYTHONPATH"
+} else {
+    $sourceRoot
+}
 
 $python = (Get-Command python.exe -ErrorAction Stop).Source
 $npm = (Get-Command npm.cmd -ErrorAction Stop).Source
