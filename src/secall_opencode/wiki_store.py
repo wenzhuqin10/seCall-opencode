@@ -79,6 +79,13 @@ def _wiki_root(config: Config) -> Path:
     return config.vault / "wiki"
 
 
+def _entity_slug(value: str) -> str:
+    value = value.strip().lower().replace("_", "-")
+    value = re.sub(r"[\\/:*?\"<>|#\[\]]+", "-", value)
+    value = re.sub(r"\s+", "-", value)
+    return re.sub(r"-+", "-", value).strip("-.")[:96] or "untitled"
+
+
 def _replace_derived_block(markdown: str, block: str) -> str:
     replacement = block.strip()
     if DERIVED_BLOCK.search(markdown):
@@ -140,7 +147,7 @@ def _knowledge_summary_block(
     return "\n".join(lines)
 
 
-def sync_wiki_knowledge_views(config: Config) -> Dict[str, Any]:
+def sync_wiki_knowledge_views(config: Config, *, allow_create: bool = False) -> Dict[str, Any]:
     """Synchronize marker-managed Wiki summaries from active knowledge cards."""
 
     cards = list_knowledge_documents(config, limit=1000)
@@ -194,7 +201,7 @@ def sync_wiki_knowledge_views(config: Config) -> Dict[str, Any]:
     from .wiki_maintenance import deterministic_reconcile, ensure_wiki_schema
 
     ensure_wiki_schema(config)
-    reconcile = deterministic_reconcile(config)
+    reconcile = deterministic_reconcile(config, allow_create=allow_create)
     snapshot = list_wiki_pages(config, limit=2000)
     return {
         "knowledge_count": len(cards),
@@ -654,9 +661,13 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             )
             existing_links.add((source, target, relation))
 
-    for page in iter_wiki_pages(config):
-        if page["category"] != "issues":
-            continue
+    issue_pages = [page for page in iter_wiki_pages(config) if page["category"] == "issues"]
+    issue_by_session = {
+        str(page["source_session"]): f"issue:{page['slug']}"
+        for page in issue_pages
+        if page["source_session"]
+    }
+    for page in issue_pages:
         issue_id = f"issue:{page['slug']}"
         project_id = f"project:{page['project']}"
         node_map[issue_id] = {
@@ -735,8 +746,21 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
                 topic_label = str(raw_topic).strip()
             if not topic_label:
                 continue
-            topic_suffix = re.sub(r"\s+", "-", topic_label.lower())
+            topic_suffix = _entity_slug(topic_label)
             add_entity("topic", topic_label, "about_topic", node_suffix=topic_suffix)
+
+        raw_claims = structured.get("claims") if isinstance(structured.get("claims"), list) else []
+        for claim in raw_claims:
+            if not isinstance(claim, dict):
+                continue
+            target_session = str(
+                claim.get("contradicts_source_session")
+                or claim.get("contradicts_session")
+                or ""
+            ).strip()
+            target_issue = issue_by_session.get(target_session)
+            if target_issue and target_issue != issue_id:
+                derived_edges.append((issue_id, target_issue, "contradicts"))
 
         source_wiki = wiki_by_source.get(page["source_session"], {})
         for test_page in source_wiki.get("tests", []):

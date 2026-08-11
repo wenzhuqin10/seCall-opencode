@@ -184,6 +184,22 @@ def get_wiki_config(config: Config) -> Dict[str, Any]:
     }
 
 
+def build_wiki_analysis_prompt(config: Config, base_prompt: Path) -> Path:
+    """Compose the extractor prompt with the active purpose and schema."""
+    ensure_wiki_schema(config)
+    root = _wiki_root(config)
+    destination = config.vault / "knowledge" / ".runtime" / "wiki-analysis-prompt.md"
+    content = (
+        base_prompt.read_text(encoding="utf-8").rstrip()
+        + "\n\n# 当前 Wiki 目标\n\n"
+        + (root / "purpose.md").read_text(encoding="utf-8")
+        + "\n\n# 当前 Wiki Schema\n\n"
+        + (root / "schema.md").read_text(encoding="utf-8")
+    )
+    atomic_write_text(destination, content.rstrip() + "\n")
+    return destination
+
+
 def update_wiki_config(config: Config, payload: Mapping[str, Any]) -> Dict[str, Any]:
     ensure_wiki_schema(config)
     root = _wiki_root(config)
@@ -297,7 +313,14 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
         for item in _records(structured.get("topics")):
             name = _record_text(item)
             if name:
-                topics[name].append({**enriched, "record": item})
+                topics[name].append({**enriched, "record": item, "record_kind": "topic"})
+        topic_names = [_record_text(item) for item in _records(structured.get("topics"))]
+        for item in _records(structured.get("claims")):
+            target_topic = str(item.get("topic") or item.get("subject") or "").strip()
+            if not target_topic and len([name for name in topic_names if name]) == 1:
+                target_topic = next(name for name in topic_names if name)
+            if target_topic and _record_text(item):
+                topics[target_topic].append({**enriched, "record": item, "record_kind": "claim"})
         for item in _records(structured.get("decisions")):
             options = item.get("options") or item.get("alternatives")
             rationale = item.get("rationale") or item.get("reason")
@@ -375,15 +398,30 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
         claims: List[str] = []
         for item in items:
             claims.extend(_claim_lines([item["record"]], str(item.get("source_session") or "")))
+        conflicts = [
+            {
+                "claim": _record_text(item["record"]),
+                "contradicts": item["record"].get("contradicts"),
+                "source_session": item.get("source_session"),
+            }
+            for item in items
+            if item["record"].get("contradicts")
+        ]
         body = "\n".join([
             f"# {topic}", "", "## 当前共识", "", *(claims or ["- 尚无可直接引用的主张。"]),
             "", "## 相关问题", "",
             *[f"- [[issues/{item['id']}|{item['title']}]]" for item in items],
             "", "## 未解决项", "", "- 新旧主张冲突时在审核计划中处理。",
+            *(
+                ["", "## 冲突主张", ""]
+                + [f"- {item['claim']} ↔ {item['contradicts']}（来源：`{item['source_session']}`）" for item in conflicts]
+                if conflicts else []
+            ),
         ])
         desired[f"topics/{_slug(topic)}"] = {
             "title": topic, "type": "topic", "project": "多项目",
             "sources": sources, "body": body,
+            "conflicts": conflicts,
         }
 
     for collection, category, page_type, heading in (
@@ -426,6 +464,22 @@ def _diff(old: str, new: str, path: str) -> str:
     ))
 
 
+def _same_page_content(old: str, new: str) -> bool:
+    if old == new:
+        return True
+    old_content = re.search(r"(?m)^content_hash:\s*(\S+)\s*$", old)
+    new_content = re.search(r"(?m)^content_hash:\s*(\S+)\s*$", new)
+    old_sources = re.search(r"(?m)^sources:\s*(.+)$", old)
+    new_sources = re.search(r"(?m)^sources:\s*(.+)$", new)
+    return bool(
+        old_content
+        and new_content
+        and old_content.group(1) == new_content.group(1)
+        and (old_sources.group(1) if old_sources else "[]")
+        == (new_sources.group(1) if new_sources else "[]")
+    )
+
+
 def create_wiki_plan(config: Config, *, reason: str = "pipeline", regenerate: bool = False) -> Dict[str, Any]:
     ensure_wiki_schema(config)
     desired = _render_desired_pages(config)
@@ -440,20 +494,7 @@ def create_wiki_plan(config: Config, *, reason: str = "pipeline", regenerate: bo
         old = path.read_text(encoding="utf-8") if path.exists() else ""
         new = str(page["markdown"])
         input_parts.append(f"{page_id}:{_hash(new)}")
-        if old:
-            old_content = re.search(r"(?m)^content_hash:\s*(\S+)\s*$", old)
-            new_content = re.search(r"(?m)^content_hash:\s*(\S+)\s*$", new)
-            old_sources = re.search(r"(?m)^sources:\s*(.+)$", old)
-            new_sources = re.search(r"(?m)^sources:\s*(.+)$", new)
-            if (
-                old_content
-                and new_content
-                and old_content.group(1) == new_content.group(1)
-                and (old_sources.group(1) if old_sources else "[]")
-                == (new_sources.group(1) if new_sources else "[]")
-            ):
-                continue
-        if old == new:
+        if _same_page_content(old, new):
             continue
         relative = str(path.relative_to(config.vault)).replace("\\", "/")
         changes.append({
@@ -468,6 +509,30 @@ def create_wiki_plan(config: Config, *, reason: str = "pipeline", regenerate: bo
             "new_hash": _hash(new),
             "markdown": new,
             "diff": _diff(old, new, relative),
+            "conflicts": list(page.get("conflicts") or []),
+        })
+    for page_id, registered in sorted((registry.get("pages") or {}).items()):
+        if page_id in desired or page_id.split("/", 1)[0] == "issues":
+            continue
+        path = config.vault / str(registered.get("path") or "")
+        if not path.is_file():
+            continue
+        old = path.read_text(encoding="utf-8")
+        if not re.search(r"(?m)^schema_version:\s*2\s*$", old):
+            continue
+        relative = str(path.relative_to(config.vault)).replace("\\", "/")
+        changes.append({
+            "change_id": uuid.uuid4().hex[:12],
+            "page_id": page_id,
+            "category": page_id.split("/", 1)[0],
+            "title": page_id.split("/", 1)[1],
+            "action": "archive",
+            "path": relative,
+            "sources": list(registered.get("sources") or []),
+            "base_hash": _hash(old),
+            "new_hash": "",
+            "markdown": "",
+            "diff": _diff(old, "", relative),
             "conflicts": [],
         })
     plan_id = f"wiki-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
@@ -608,26 +673,91 @@ def apply_wiki_plan(config: Config, plan_id: str, selected: Sequence[str] | None
 
     backup_root = Path(tempfile.mkdtemp(prefix="secall-wiki-transaction-"))
     written: List[Path] = []
+    backups: Dict[Path, Path | None] = {}
+
+    def transaction_write(path: Path, content: str) -> None:
+        if path not in backups:
+            if path.exists():
+                backup = backup_root / f"{len(backups)}.bak"
+                shutil.copy2(path, backup)
+                backups[path] = backup
+            else:
+                backups[path] = None
+            written.append(path)
+        atomic_write_text(path, content)
+
+    def transaction_delete(path: Path) -> None:
+        if path not in backups:
+            if not path.exists():
+                return
+            backup = backup_root / f"{len(backups)}.bak"
+            shutil.copy2(path, backup)
+            backups[path] = backup
+            written.append(path)
+        path.unlink(missing_ok=True)
+
     try:
-        for index, item in enumerate(changes):
+        for item in changes:
             path = config.vault / str(item["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                backup = backup_root / f"{index}.bak"
-                shutil.copy2(path, backup)
-                item["_backup"] = str(backup)
-            atomic_write_text(path, str(item.get("markdown") or ""))
-            written.append(path)
+            if item.get("action") == "archive":
+                archived_at = _now()
+                trash_id = (
+                    f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-"
+                    f"{item['category']}-{item['page_id'].split('/', 1)[1]}-{uuid.uuid4().hex[:6]}"
+                )
+                trash_dir = config.vault / ".trash" / "wiki" / trash_id
+                old_markdown = path.read_text(encoding="utf-8")
+                manifest = {
+                    "trash_id": trash_id,
+                    "wiki_id": item["page_id"],
+                    "category": item["category"],
+                    "category_label": item["category"],
+                    "slug": item["page_id"].split("/", 1)[1],
+                    "title": item["title"],
+                    "project": "",
+                    "source_session": "",
+                    "original_path": item["path"],
+                    "archived_at": archived_at,
+                    "plan_id": plan_id,
+                }
+                transaction_write(trash_dir / "document.md", old_markdown)
+                transaction_write(
+                    trash_dir / "manifest.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                )
+                transaction_delete(path)
+                item["trash_id"] = trash_id
+            else:
+                transaction_write(path, str(item.get("markdown") or ""))
         registry = _registry_from_disk(config)
+        for item in changes:
+            page_id = str(item.get("page_id") or "")
+            if item.get("action") == "archive":
+                previous = (registry.get("pages") or {}).pop(page_id, None)
+                registry.setdefault("tombstones", {})[page_id] = {
+                    "page_id": page_id,
+                    "archived_at": _now(),
+                    "previous": previous or {},
+                    "trash_id": item.get("trash_id"),
+                }
+            else:
+                (registry.get("tombstones") or {}).pop(page_id, None)
         registry, dependencies = _rebuild_registry_documents(config, registry)
-        atomic_write_text(_wiki_root(config) / "index.md", _render_index(registry))
+        transaction_write(_wiki_root(config) / "index.md", _render_index(registry))
         log_path = _wiki_root(config) / "log.md"
         old_log = log_path.read_text(encoding="utf-8") if log_path.exists() else "# Wiki 变更日志\n"
         entry = ["", f"## {_now()} · {plan_id}", "", f"- 原因：{plan.get('reason')}"]
         entry.extend(f"- {item['action']} `{item['page_id']}`" for item in changes)
-        atomic_write_text(log_path, old_log.rstrip() + "\n" + "\n".join(entry) + "\n")
-        write_json_atomic(_meta_root(config) / "page-registry.json", registry)
-        write_json_atomic(_meta_root(config) / "source-dependencies.json", dependencies)
+        transaction_write(log_path, old_log.rstrip() + "\n" + "\n".join(entry) + "\n")
+        transaction_write(
+            _meta_root(config) / "page-registry.json",
+            json.dumps(registry, ensure_ascii=False, indent=2) + "\n",
+        )
+        transaction_write(
+            _meta_root(config) / "source-dependencies.json",
+            json.dumps(dependencies, ensure_ascii=False, indent=2) + "\n",
+        )
         cache = {
             "schema_version": WIKI_SCHEMA_VERSION,
             "sources": {
@@ -636,19 +766,27 @@ def apply_wiki_plan(config: Config, plan_id: str, selected: Sequence[str] | None
             },
             "updated_at": _now(),
         }
-        write_json_atomic(_meta_root(config) / "ingest-cache.json", cache)
+        transaction_write(
+            _meta_root(config) / "ingest-cache.json",
+            json.dumps(cache, ensure_ascii=False, indent=2) + "\n",
+        )
     except Exception:
-        for item, path in zip(changes, written):
-            backup = item.get("_backup")
-            if backup and Path(backup).exists():
-                shutil.copy2(Path(backup), path)
+        for path in reversed(written):
+            backup = backups.get(path)
+            if backup and backup.exists():
+                shutil.copy2(backup, path)
             elif path.exists():
                 path.unlink()
+        for directory in sorted(
+            {path.parent for path in written if ".trash" in path.parts},
+            key=lambda item: len(item.parts),
+            reverse=True,
+        ):
+            if directory.exists() and not any(directory.iterdir()):
+                directory.rmdir()
         raise
     finally:
         shutil.rmtree(backup_root, ignore_errors=True)
-    for item in changes:
-        item.pop("_backup", None)
     plan["status"] = "applied"
     plan["updated_at"] = _now()
     plan["applied_change_ids"] = sorted(selected_set)
@@ -685,7 +823,7 @@ def clear_wiki_tombstone(config: Config, page_id: str) -> None:
     write_json_atomic(_meta_root(config) / "page-registry.json", registry)
 
 
-def deterministic_reconcile(config: Config) -> Dict[str, Any]:
+def deterministic_reconcile(config: Config, *, allow_create: bool = False) -> Dict[str, Any]:
     """Immediately remove stale derived references after source lifecycle changes."""
     ensure_wiki_schema(config)
     valid_sources = {
@@ -694,19 +832,46 @@ def deterministic_reconcile(config: Config) -> Dict[str, Any]:
     }
     registry = _registry_from_disk(config)
     removed: List[str] = []
+    updated: List[str] = []
+    desired = _render_desired_pages(config)
+    tombstones = registry.get("tombstones") or {}
     for page_id, page in list((registry.get("pages") or {}).items()):
         sources = set(str(item) for item in page.get("sources", []))
-        if sources and not (sources & valid_sources) and page_id.split("/", 1)[0] != "issues":
+        category = page_id.split("/", 1)[0]
+        if category == "issues":
+            continue
+        replacement = desired.get(page_id)
+        if replacement is not None:
+            path = config.vault / str(page.get("path") or "")
+            markdown = str(replacement["markdown"])
+            current = path.read_text(encoding="utf-8") if path.is_file() else ""
+            managed_v2 = bool(re.search(r"(?m)^schema_version:\s*2\s*$", current))
+            if managed_v2 and not _same_page_content(current, markdown):
+                atomic_write_text(path, markdown)
+                updated.append(page_id)
+        elif sources and not (sources & valid_sources):
             path = config.vault / str(page.get("path") or "")
             if path.is_file():
                 path.unlink()
             registry["pages"].pop(page_id, None)
             removed.append(page_id)
+    if allow_create:
+        active_page_ids = set((registry.get("pages") or {}).keys())
+        for page_id, replacement in desired.items():
+            if page_id in active_page_ids or page_id in tombstones:
+                continue
+            path = _page_path(config, page_id)
+            atomic_write_text(path, str(replacement["markdown"]))
+            updated.append(page_id)
     registry, dependencies = _rebuild_registry_documents(config, registry)
     atomic_write_text(_wiki_root(config) / "index.md", _render_index(registry))
     write_json_atomic(_meta_root(config) / "page-registry.json", registry)
     write_json_atomic(_meta_root(config) / "source-dependencies.json", dependencies)
-    return {"removed_pages": removed, "active_sources": len(valid_sources)}
+    return {
+        "removed_pages": removed,
+        "updated_pages": updated,
+        "active_sources": len(valid_sources),
+    }
 
 
 def lint_wiki(config: Config) -> Dict[str, Any]:

@@ -38,7 +38,9 @@ OpenCode Session
   → OpenCode/GLM 结构化 SessionKnowledge
   → Issue Card + Runbook + QA JSONL
   → 质量评分与代码实体关联
-  → seCall 重建索引
+  → Wiki 更新规划与 Markdown Diff
+  → 前端审核后原子更新多张 Wiki 页面
+  → seCall/BGE-M3 索引、变更日志、关系图与健康检查
 ```
 
 ChatGPT 导入流程：
@@ -62,6 +64,9 @@ ChatGPT conversations.json
 <vault>/knowledge/qa/candidates.jsonl
 <vault>/knowledge/events/{session-id}.json       # 确定性事件 sidecar
 <vault>/knowledge/structured/{session-id}.json  # 结构化运行知识与质量评分
+<vault>/knowledge/wiki-plans/{plan-id}.json     # 待审核/已应用 Wiki 更新计划
+<vault>/wiki/.meta/page-registry.json           # 稳定页面 ID 与内容版本
+<vault>/wiki/.meta/source-dependencies.json     # Session 到 Wiki 的来源依赖
 ```
 
 ## 安装
@@ -121,7 +126,10 @@ secall-opencode serve
 - 知识卡片详情、结构化修改、软删除和回收站恢复；
 - 知识写操作后自动同步 Wiki 卡片索引、关系图、关键词索引和向量索引；
 - 删除知识卡片时同时移出候选与已审核 QA，并兼容旧版截断 Session ID；
-- Wiki 知识中心，按总览、项目、主题、决策和问题定位分类浏览；
+- 持续演化 Wiki，按总览、项目、模块、主题、Issue、决策、运行手册和测试分类浏览；
+- 所有模型生成的跨页面变更先展示来源证据和 Markdown Diff，再由用户逐项审核并原子应用；
+- Wiki 页面注册表、来源依赖、处理缓存、知识目录和追加式变更日志均可由 Markdown 重建；
+- Wiki 健康检查可识别失效来源、孤立页、断链、重复主题、低证据覆盖和缺失聚合页；
 - 项目、主题和决策 Wiki 支持软归档、冲突安全恢复、二次确认永久删除和清空回收站；
 - Wiki 总览也可归档且不会被同步任务自动重建；问题定位页仍由知识卡片统一管理；
 - 关系图采用“核心实体 + 证据属性”两层模型：项目、知识卡片、模块、来源会话和 Wiki 页面作为节点；文件、函数、提交、根因与测试用例保留在知识卡片节点的证据面板，不再生成大量一次性叶子节点；
@@ -203,6 +211,15 @@ Wiki 与关系图接口：
 ```text
 GET  /api/wiki
 GET  /api/wiki/{category}/{slug}
+GET  /api/wiki/config
+PUT  /api/wiki/config
+POST /api/wiki/rebuild
+GET  /api/wiki/plans?status=pending
+GET  /api/wiki/plans/{plan_id}
+POST /api/wiki/plans/{plan_id}/apply
+POST /api/wiki/plans/{plan_id}/reject
+POST /api/wiki/lint
+GET  /api/wiki/lint/latest
 GET  /api/graph
 POST /api/graph/rebuild
 ```

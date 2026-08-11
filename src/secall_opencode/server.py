@@ -60,8 +60,8 @@ from .wiki_store import (
 )
 from .wiki_maintenance import (
     apply_wiki_plan,
+    build_wiki_analysis_prompt,
     create_wiki_plan,
-    ensure_wiki_schema,
     get_wiki_config,
     latest_wiki_lint,
     lint_wiki,
@@ -606,20 +606,8 @@ def run_session_pipeline(
         }
     else:
         stage_started = time.monotonic()
-        ensure_wiki_schema(config)
-        prompt_template = (Path(__file__).parent / "prompts" / "issue-card.md").read_text(
-            encoding="utf-8"
-        )
-        wiki_root = config.vault / "wiki"
-        prompt = config.vault / "knowledge" / ".runtime" / "wiki-analysis-prompt.md"
-        prompt.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            prompt,
-            prompt_template.rstrip()
-            + "\n\n# 当前 Wiki 目标\n\n"
-            + (wiki_root / "purpose.md").read_text(encoding="utf-8")
-            + "\n\n# 当前 Wiki Schema\n\n"
-            + (wiki_root / "schema.md").read_text(encoding="utf-8"),
+        prompt = build_wiki_analysis_prompt(
+            config, Path(__file__).parent / "prompts" / "issue-card.md"
         )
         generated = OpenCodeClient(config.opencode_command).run_generation(
             session_path,
@@ -822,9 +810,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         )
         return {"keyword": keyword, "semantic": semantic}
 
-    def _sync_knowledge_derivatives(self) -> Dict[str, Any]:
+    def _sync_knowledge_derivatives(self, *, allow_wiki_create: bool = False) -> Dict[str, Any]:
         qa = reconcile_qa_with_knowledge_trash(self.config)
-        wiki = sync_wiki_knowledge_views(self.config)
+        wiki = sync_wiki_knowledge_views(self.config, allow_create=allow_wiki_create)
         graph = graph_snapshot(self.config)
         search = self._refresh_search()
         return {
@@ -1218,7 +1206,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     self.config,
                     unquote(trash_id.rstrip("/")),
                 )
-                restored["derivatives"] = self._sync_knowledge_derivatives()
+                restored["derivatives"] = self._sync_knowledge_derivatives(
+                    allow_wiki_create=True
+                )
                 self._ok(restored)
             elif (
                 parsed.path.startswith("/api/wiki/trash/")

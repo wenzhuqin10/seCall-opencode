@@ -19,6 +19,7 @@ from .opencode_client import OpenCodeClient, Runner
 from .search import build_search_service
 from .server import import_chatgpt, serve
 from .wiki_store import graph_snapshot, sync_wiki_knowledge_views
+from .wiki_maintenance import build_wiki_analysis_prompt, create_wiki_plan
 
 
 def _configure_stdio() -> None:
@@ -328,7 +329,7 @@ def _pipeline_one(
         else:
             generated = client.run_generation(
                 converted.output_path,
-                _prompt_path(),
+                build_wiki_analysis_prompt(cfg, _prompt_path()),
                 cfg.vault,
                 model=args.model or cfg.model,
                 timeout=args.timeout,
@@ -361,6 +362,7 @@ def command_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     if not args.dry_run and not args.skip_generate:
         derivatives = {
             "wiki": sync_wiki_knowledge_views(cfg),
+            "wiki_plan": create_wiki_plan(cfg, reason="cli-pipeline"),
             "graph": graph_snapshot(cfg)["stats"],
         }
     if not args.skip_index and not args.dry_run:

@@ -3,10 +3,12 @@ from pathlib import Path
 import pytest
 
 from secall_opencode.config import Config
+from secall_opencode.knowledge_store import delete_knowledge_document, restore_knowledge_document
 from secall_opencode.structured_knowledge import store_structured_knowledge
 from secall_opencode.wiki_maintenance import (
     apply_wiki_plan,
     create_wiki_plan,
+    deterministic_reconcile,
     ensure_wiki_schema,
     lint_wiki,
     read_wiki_plan,
@@ -131,3 +133,48 @@ def test_reject_and_lint_do_not_modify_pages(tmp_path: Path) -> None:
     assert rejected["rejection_reason"] == "证据不足"
     assert report["finding_count"] >= 1
     assert not (tmp_path / "wiki" / "overview.md").exists()
+
+
+def test_delete_and_restore_reconcile_applied_wiki_without_model(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _knowledge(tmp_path)
+    plan = create_wiki_plan(config)
+    apply_wiki_plan(config, plan["plan_id"])
+
+    deleted = delete_knowledge_document(config, "harq")
+    after_delete = deterministic_reconcile(config)
+
+    assert "overview/overview" in after_delete["removed_pages"]
+    assert not (tmp_path / "wiki" / "overview.md").exists()
+
+    restore_knowledge_document(config, deleted["trash_id"])
+    after_restore = deterministic_reconcile(config, allow_create=True)
+
+    assert "overview/overview" in after_restore["updated_pages"]
+    assert (tmp_path / "wiki" / "overview.md").exists()
+    assert (tmp_path / "wiki" / "topics" / "harq-超时诊断.md").exists()
+
+
+def test_explicit_conflicting_claim_is_exposed_in_plan(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _knowledge(tmp_path)
+    structured = {
+        "source_session": "session-harq",
+        "project": "radio",
+        "code_entities": {"modules": ["Scheduler"]},
+        "topics": [{"name": "HARQ 超时诊断"}],
+        "claims": [{
+            "claim": "应增大 HARQ 定时器",
+            "topic": "HARQ 超时诊断",
+            "contradicts": "不应在确认反馈映射前增大定时器",
+            "source_session": "session-harq",
+            "evidence_event_ids": ["evt-0004"],
+        }],
+    }
+    store_structured_knowledge(tmp_path, structured)
+
+    plan = create_wiki_plan(config)
+    topic = next(item for item in plan["changes"] if item["page_id"] == "topics/harq-超时诊断")
+
+    assert topic["conflicts"]
+    assert "冲突主张" in topic["markdown"]

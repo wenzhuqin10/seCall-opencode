@@ -2,11 +2,90 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .config import Config
 from .opencode_client import OpenCodeClient
 from .search import HybridSearchService
+from .wiki_store import graph_snapshot, read_wiki_page
+
+
+def _graph_result_id(item: Dict[str, Any]) -> str:
+    scope = str(item.get("scope") or "")
+    identifier = str(item.get("id") or "")
+    return {
+        "session": f"session:{identifier}",
+        "knowledge": f"issue:{identifier}",
+        "wiki": f"wiki:{identifier}",
+    }.get(scope, "")
+
+
+def _expand_with_wiki_graph(
+    config: Config,
+    sources: List[Dict[str, Any]],
+    *,
+    max_extra: int = 4,
+    hops: int = 2,
+) -> List[Dict[str, Any]]:
+    """Expand retrieval with a small, evidence-only Wiki graph neighborhood."""
+    snapshot = graph_snapshot(config)
+    nodes = {str(item.get("id")): item for item in snapshot.get("nodes", [])}
+    adjacency: Dict[str, set[str]] = {}
+    for link in snapshot.get("links", []):
+        source = str(link.get("source") or "")
+        target = str(link.get("target") or "")
+        if source and target:
+            adjacency.setdefault(source, set()).add(target)
+            adjacency.setdefault(target, set()).add(source)
+    frontier = {_graph_result_id(item) for item in sources}
+    frontier.discard("")
+    visited = set(frontier)
+    candidates: List[tuple[int, str]] = []
+    for distance in range(1, hops + 1):
+        next_frontier: set[str] = set()
+        for node_id in frontier:
+            for neighbor in adjacency.get(node_id, set()):
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                next_frontier.add(neighbor)
+                node = nodes.get(neighbor) or {}
+                if node.get("type") in {"wiki_page", "issue"}:
+                    candidates.append((distance, neighbor))
+        frontier = next_frontier
+    existing = {(str(item.get("scope")), str(item.get("id"))) for item in sources}
+    expanded = list(sources)
+    for distance, node_id in candidates:
+        node = nodes.get(node_id) or {}
+        wiki_id = str(node.get("wiki_id") or "")
+        if not wiki_id and node_id.startswith("wiki:"):
+            wiki_id = node_id.removeprefix("wiki:")
+        if not wiki_id or "/" not in wiki_id:
+            continue
+        category, slug = wiki_id.split("/", 1)
+        scope = "knowledge" if category == "issues" else "wiki"
+        identifier = slug if scope == "knowledge" else wiki_id
+        if (scope, identifier) in existing:
+            continue
+        try:
+            page = read_wiki_page(config, category, slug)
+        except (FileNotFoundError, ValueError):
+            continue
+        expanded.append({
+            "id": identifier,
+            "scope": scope,
+            "title": page["title"],
+            "snippet": page["summary"] or page["markdown"][:500],
+            "project": page["project"],
+            "source_session": page["source_session"],
+            "score": round(1.0 / (distance + 2), 6),
+            "match_type": f"graph_{distance}hop",
+            "review_status": "approved",
+        })
+        existing.add((scope, identifier))
+        if len(expanded) >= len(sources) + max_extra:
+            break
+    return expanded
 
 
 def answer_with_rag(
@@ -24,7 +103,11 @@ def answer_with_rag(
     if len(question) < 2:
         raise ValueError("问题至少需要两个字符。")
     retrieval = search.search(question, scope=scope, mode=mode, limit=limit)
-    sources = retrieval["results"]
+    sources = _expand_with_wiki_graph(
+        config,
+        list(retrieval["results"]),
+        max_extra=min(4, max(1, limit // 2)),
+    )
     if not sources:
         return {
             "question": question,
