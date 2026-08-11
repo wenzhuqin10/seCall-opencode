@@ -25,12 +25,23 @@ SessionKnowledge、Issue Card 和候选 QA。
 - `parameter_changes`：参数、前值、当前值、预期范围、是否异常及证据；
 - `hypotheses`：结论、状态、原因及证据；
 - `troubleshooting_steps`：操作、命令、结果、是否有效、结论及证据；
+- `topics`：可持续维护的技术主题、适用范围、置信度及证据；
+- `claims`：可被验证的工程主张、版本/场景范围、置信度及证据；
+- `decisions`：仅记录会话明确出现的方案比较、最终选择、理由和影响范围；
+- `runbook`：可复用的前置条件、顺序步骤、失败分支和完成条件；
+- `test_knowledge`：测试目标、环境、步骤、期望、实际结果和适用版本；
+- `wiki_actions`：建议新增或更新的 Wiki 页面类型、规范名称和理由；
 - `root_cause`：结论、置信度和证据；
 - `fix`：临时规避、正式修复、文件、函数和 commit；
 - `verification`：测试用例、结果、回归情况和副作用；
 - `lessons`：诊断规则、Runbook 步骤和预防措施；
 - `code_entities`：`modules`、`files`、`functions`、`commits` 数组；
 - `candidate_qa`：候选问答。
+
+禁止仅凭一次修复结果生成设计决策。`decisions` 中的每一项必须同时包含
+`options`、`selected`、`rationale` 和 `impact`，缺少任一项时返回空数组。
+每条 topic、claim、decision、runbook 和 test_knowledge 都必须携带
+`source_session`、`evidence_event_ids`、`scope`/适用场景与 `confidence`。
 
 没有证据的数组使用 `[]`，对象字段使用空字符串，不要省略顶层字段。
 
@@ -86,6 +97,12 @@ frontmatter 必须包含：
   "parameter_changes": [],
   "hypotheses": [],
   "troubleshooting_steps": [],
+  "topics": [],
+  "claims": [],
+  "decisions": [],
+  "runbook": [],
+  "test_knowledge": [],
+  "wiki_actions": [],
   "root_cause": {
     "conclusion": "",
     "confidence": "low",

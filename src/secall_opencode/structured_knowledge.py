@@ -18,6 +18,12 @@ KNOWLEDGE_FIELDS = (
     "parameter_changes",
     "hypotheses",
     "troubleshooting_steps",
+    "topics",
+    "claims",
+    "decisions",
+    "runbook",
+    "test_knowledge",
+    "wiki_actions",
 )
 
 CODE_TOKEN = re.compile(
@@ -310,7 +316,8 @@ def _normalize_records(
     value: Any, valid_event_ids: set[str], warnings: List[str], field: str
 ) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
-    for raw in _list(value):
+    raw_values = [value] if isinstance(value, Mapping) else _list(value)
+    for raw in raw_values:
         if isinstance(raw, str):
             item: Dict[str, Any] = {"description": raw}
         elif isinstance(raw, Mapping):
@@ -343,7 +350,7 @@ def normalize_session_knowledge(
         if isinstance(item, Mapping) and item.get("event_id")
     }
     result: Dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "session_id": session_id,
         "source_session": session_id,
         "project": project,
@@ -351,6 +358,8 @@ def normalize_session_knowledge(
     }
     for field in KNOWLEDGE_FIELDS:
         result[field] = _normalize_records(value.get(field), event_ids, warnings, field)
+        for item in result[field]:
+            item.setdefault("source_session", session_id)
 
     root_cause = _dict(value.get("root_cause"))
     root_cause["evidence_event_ids"] = [
@@ -358,6 +367,7 @@ def normalize_session_knowledge(
         for event_id in _evidence_ids(root_cause.get("evidence_event_ids"))
         if event_id in event_ids
     ]
+    root_cause.setdefault("source_session", session_id)
     result["root_cause"] = root_cause
     result["fix"] = _dict(value.get("fix"))
     result["verification"] = _dict(value.get("verification"))
@@ -466,6 +476,12 @@ def derive_legacy_structure(
         "parameter_changes": [],
         "hypotheses": [],
         "troubleshooting_steps": record("定位过程"),
+        "topics": [],
+        "claims": [],
+        "decisions": [],
+        "runbook": [],
+        "test_knowledge": [],
+        "wiki_actions": [],
         "root_cause": {
             "conclusion": sections.get("根因分析", ""),
             "confidence": "low" if sections.get("根因分析") else "unknown",
@@ -523,6 +539,12 @@ def structured_search_text(value: Mapping[str, Any]) -> str:
         "parameter_changes": "参数变化",
         "hypotheses": "诊断假设",
         "troubleshooting_steps": "排查步骤",
+        "topics": "技术主题",
+        "claims": "工程主张",
+        "decisions": "设计决策",
+        "runbook": "运行手册",
+        "test_knowledge": "测试知识",
+        "wiki_actions": "Wiki 更新建议",
     }
     context = _dict(value.get("context"))
     if context:

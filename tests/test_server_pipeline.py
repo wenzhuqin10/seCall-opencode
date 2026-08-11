@@ -46,4 +46,6 @@ def test_pipeline_reuses_existing_knowledge_without_calling_model(
     assert result["reused"] is True
     assert result["knowledge"]["qa_count"] == 1
     assert result["knowledge"]["new_qa_count"] == 0
-    assert len(result["stages"]) == 4
+    assert len(result["stages"]) == 5
+    assert result["requires_review"] is True
+    assert result["wiki_plan_id"].startswith("wiki-")

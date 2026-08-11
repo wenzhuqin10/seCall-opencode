@@ -58,6 +58,18 @@ from .wiki_store import (
     restore_wiki_page,
     sync_wiki_knowledge_views,
 )
+from .wiki_maintenance import (
+    apply_wiki_plan,
+    create_wiki_plan,
+    ensure_wiki_schema,
+    get_wiki_config,
+    latest_wiki_lint,
+    lint_wiki,
+    list_wiki_plans,
+    read_wiki_plan,
+    reject_wiki_plan,
+    update_wiki_config,
+)
 
 
 MAX_BODY_BYTES = 100 * 1024 * 1024
@@ -594,7 +606,21 @@ def run_session_pipeline(
         }
     else:
         stage_started = time.monotonic()
-        prompt = Path(__file__).parent / "prompts" / "issue-card.md"
+        ensure_wiki_schema(config)
+        prompt_template = (Path(__file__).parent / "prompts" / "issue-card.md").read_text(
+            encoding="utf-8"
+        )
+        wiki_root = config.vault / "wiki"
+        prompt = config.vault / "knowledge" / ".runtime" / "wiki-analysis-prompt.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(
+            prompt,
+            prompt_template.rstrip()
+            + "\n\n# 当前 Wiki 目标\n\n"
+            + (wiki_root / "purpose.md").read_text(encoding="utf-8")
+            + "\n\n# 当前 Wiki Schema\n\n"
+            + (wiki_root / "schema.md").read_text(encoding="utf-8"),
+        )
         generated = OpenCodeClient(config.opencode_command).run_generation(
             session_path,
             prompt,
@@ -627,18 +653,28 @@ def run_session_pipeline(
         Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
         indexed = True
         record_stage("重建 seCall 索引", stage_started, "会话全文索引已刷新")
+    stage_started = time.monotonic()
+    wiki_plan = create_wiki_plan(config, reason=f"pipeline:{session_id}")
+    record_stage(
+        "生成 Wiki 更新计划",
+        stage_started,
+        f"待审核 {wiki_plan['summary']['total']} 项跨页面变更",
+    )
     return {
         "session_id": session_id,
         "knowledge": knowledge_result,
         "indexed": indexed,
         "reused": reused,
+        "wiki_plan_id": wiki_plan["plan_id"],
+        "wiki_changes": wiki_plan["summary"],
+        "requires_review": wiki_plan["requires_review"],
         "stages": stages,
         "elapsed_seconds": round(time.monotonic() - started_at, 2),
     }
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.7"
+    server_version = "seCallOpenCodeLocal/0.8"
 
     @property
     def config(self) -> Config:
@@ -879,8 +915,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         limit=limit,
                     )
                 )
+            elif parsed.path == "/api/wiki/config":
+                self._ok(get_wiki_config(self.config))
+            elif parsed.path == "/api/wiki/plans":
+                self._ok(list_wiki_plans(self.config, str(query.get("status", ["all"])[0])))
+            elif parsed.path == "/api/wiki/lint/latest":
+                self._ok(latest_wiki_lint(self.config))
             elif parsed.path == "/api/wiki/trash":
                 self._ok(list_wiki_archive(self.config))
+            elif parsed.path.startswith("/api/wiki/plans/"):
+                plan_id = unquote(parsed.path.removeprefix("/api/wiki/plans/"))
+                self._ok(read_wiki_plan(self.config, plan_id))
             elif parsed.path.startswith("/api/wiki/"):
                 wiki_id = parsed.path.removeprefix("/api/wiki/")
                 parts = [unquote(part) for part in wiki_id.split("/", 1)]
@@ -1019,6 +1064,42 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "graph": graph_snapshot(self.config)["stats"],
                 }
                 self._ok(result)
+            elif parsed.path == "/api/wiki/rebuild":
+                plan = create_wiki_plan(
+                    self.config,
+                    reason="manual-rebuild",
+                    regenerate=bool(body.get("regenerate", True)),
+                )
+                self._ok(plan, HTTPStatus.CREATED)
+            elif parsed.path == "/api/wiki/lint":
+                report = lint_wiki(self.config)
+                if bool(body.get("create_fix_plan")) and report["finding_count"]:
+                    report["fix_plan"] = create_wiki_plan(
+                        self.config, reason="lint-repair", regenerate=False
+                    )
+                self._ok(report)
+            elif (
+                parsed.path.startswith("/api/wiki/plans/")
+                and parsed.path.endswith("/apply")
+            ):
+                plan_id = unquote(
+                    parsed.path.removeprefix("/api/wiki/plans/").removesuffix("/apply")
+                ).rstrip("/")
+                selected = body.get("selected_change_ids")
+                if selected is not None and not isinstance(selected, list):
+                    raise ValueError("selected_change_ids 必须是数组。")
+                applied = apply_wiki_plan(self.config, plan_id, selected)
+                applied["search"] = self._refresh_search()
+                applied["graph"] = graph_snapshot(self.config)["stats"]
+                self._ok(applied)
+            elif (
+                parsed.path.startswith("/api/wiki/plans/")
+                and parsed.path.endswith("/reject")
+            ):
+                plan_id = unquote(
+                    parsed.path.removeprefix("/api/wiki/plans/").removesuffix("/reject")
+                ).rstrip("/")
+                self._ok(reject_wiki_plan(self.config, plan_id, str(body.get("reason") or "")))
             elif parsed.path == "/api/index":
                 result = Runner(self.config.secall_command).run(
                     "reindex", "--from-vault", timeout=600
@@ -1165,6 +1246,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             body = self._json_body()
             if not isinstance(body, dict):
                 raise ValueError("请求体必须是 JSON 对象。")
+            if parsed.path == "/api/wiki/config":
+                self._ok(update_wiki_config(self.config, body))
+                return
             if not parsed.path.startswith("/api/knowledge/"):
                 raise FileNotFoundError("接口不存在。")
             knowledge_id = unquote(parsed.path.removeprefix("/api/knowledge/"))

@@ -18,13 +18,25 @@ from .opencode_client import Runner
 from .structured_knowledge import read_structured_knowledge
 
 
-WIKI_CATEGORIES = ("overview", "projects", "topics", "decisions", "issues")
+WIKI_CATEGORIES = (
+    "overview",
+    "projects",
+    "modules",
+    "topics",
+    "decisions",
+    "runbooks",
+    "tests",
+    "issues",
+)
 CORE_GRAPH_TYPES = {"issue", "project", "module", "session", "topic", "wiki_page"}
 CATEGORY_LABELS = {
     "overview": "知识总览",
     "projects": "项目",
+    "modules": "模块",
     "topics": "技术主题",
     "decisions": "设计决策",
+    "runbooks": "运行手册",
+    "tests": "测试知识",
     "issues": "问题定位",
 }
 SAFE_SLUG = re.compile(r"^[^/\\\x00]+$")
@@ -176,12 +188,20 @@ def sync_wiki_knowledge_views(config: Config) -> Dict[str, Any]:
                 atomic_write_text(path, next_markdown)
                 updated_pages.append(f"projects/{path.stem}")
 
+    # Lifecycle changes must immediately remove stale aggregate pages and
+    # dependency records. New cross-page content is still created through a
+    # reviewable Wiki plan.
+    from .wiki_maintenance import deterministic_reconcile, ensure_wiki_schema
+
+    ensure_wiki_schema(config)
+    reconcile = deterministic_reconcile(config)
     snapshot = list_wiki_pages(config, limit=2000)
     return {
         "knowledge_count": len(cards),
         "updated_pages": updated_pages,
         "wiki_count": snapshot["count"],
         "counts": snapshot["counts"],
+        "reconcile": reconcile,
     }
 
 
@@ -382,6 +402,9 @@ def archive_wiki_page(config: Config, category: str, slug: str) -> Dict[str, Any
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
     )
     path.unlink()
+    from .wiki_maintenance import mark_wiki_tombstone
+
+    mark_wiki_tombstone(config, detail["id"], archived_at=manifest["archived_at"])
     return manifest
 
 
@@ -426,6 +449,9 @@ def restore_wiki_page(config: Config, trash_id: str) -> Dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(document_path), str(target))
     shutil.rmtree(trash_dir)
+    from .wiki_maintenance import clear_wiki_tombstone
+
+    clear_wiki_tombstone(config, f"{category}/{slug}")
     return read_wiki_page(config, category, slug)
 
 
@@ -555,6 +581,7 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
         )
         for link in links
     }
+    wiki_by_source: Dict[str, Dict[str, List[str]]] = {}
     for page in iter_wiki_pages(config, include_issues=False):
         wiki_node_id = f"wiki:{page['id']}"
         node_map[wiki_node_id] = {
@@ -567,6 +594,20 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             "wiki_id": page["id"],
         }
         derived_edges: List[tuple[str, str, str]] = []
+        page_markdown = (config.vault / page["path"]).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        sources_match = re.search(r"(?m)^sources:\s*(.+)$", page_markdown)
+        try:
+            page_sources = json.loads(sources_match.group(1)) if sources_match else []
+        except json.JSONDecodeError:
+            page_sources = []
+        if page["source_session"]:
+            page_sources = list(dict.fromkeys([*page_sources, page["source_session"]]))
+        for source_session in page_sources:
+            wiki_by_source.setdefault(str(source_session), {}).setdefault(
+                page["category"], []
+            ).append(wiki_node_id)
         if page["project"] and page["project"] != "全部项目":
             project_id = f"project:{page['project']}"
             if project_id not in node_map:
@@ -579,6 +620,26 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
         session_id = f"session:{page['source_session']}"
         if page["source_session"] and session_id in node_map:
             derived_edges.append((wiki_node_id, session_id, "derived_from"))
+        if page["category"] == "topics":
+            topic_id = f"topic:{page['slug']}"
+            node_map[topic_id] = {
+                "id": topic_id,
+                "label": page["title"],
+                "type": "topic",
+                "project": page["project"],
+                "wiki_id": page["id"],
+            }
+            derived_edges.append((topic_id, wiki_node_id, "documented_by"))
+        elif page["category"] == "modules":
+            module_id = f"module:{page['slug']}"
+            node_map[module_id] = {
+                "id": module_id,
+                "label": page["title"],
+                "type": "module",
+                "project": page["project"],
+                "wiki_id": page["id"],
+            }
+            derived_edges.append((module_id, wiki_node_id, "documented_by"))
         for source, target, relation in derived_edges:
             if (source, target, relation) in existing_links:
                 continue
@@ -660,6 +721,30 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
 
         for module in entities.get("modules", []) if isinstance(entities, dict) else []:
             add_entity("module", str(module), "affects")
+
+        for raw_topic in structured.get("topics", []) if isinstance(structured.get("topics"), list) else []:
+            if isinstance(raw_topic, dict):
+                topic_label = str(
+                    raw_topic.get("name")
+                    or raw_topic.get("title")
+                    or raw_topic.get("topic")
+                    or raw_topic.get("description")
+                    or ""
+                ).strip()
+            else:
+                topic_label = str(raw_topic).strip()
+            if not topic_label:
+                continue
+            topic_suffix = re.sub(r"\s+", "-", topic_label.lower())
+            add_entity("topic", topic_label, "about_topic", node_suffix=topic_suffix)
+
+        source_wiki = wiki_by_source.get(page["source_session"], {})
+        for test_page in source_wiki.get("tests", []):
+            derived_edges.append((issue_id, test_page, "verified_by"))
+        for decision_page in source_wiki.get("decisions", []):
+            for module in entities.get("modules", []) if isinstance(entities, dict) else []:
+                module_id = f"module:{str(module).strip()}"
+                derived_edges.append((module_id, decision_page, "implements_decision"))
 
         def evidence_values(key: str) -> List[str]:
             raw = entities.get(key, []) if isinstance(entities, dict) else []
