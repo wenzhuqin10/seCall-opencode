@@ -206,7 +206,7 @@ def test_graph_snapshot_keeps_technical_details_as_issue_evidence(
         for item in snapshot["links"]
     }
 
-    assert ("issue:harq", "module:Scheduler", "affects") in links
+    assert ("issue:harq", "module:scheduler", "affects") in links
     assert not any(
         item[1].startswith(("file:", "function:", "commit:", "root_cause:", "test_case:"))
         for item in links
@@ -330,7 +330,7 @@ def test_archive_supports_overview_and_protects_issue_pages(tmp_path: Path) -> N
         archive_wiki_page(config, "issues", "harq")
 
 
-def test_graph_removes_wiki_page_node_when_archived(tmp_path: Path) -> None:
+def test_graph_uses_topic_entity_instead_of_duplicate_wiki_page_node(tmp_path: Path) -> None:
     graph_dir = tmp_path / "graph"
     topics = tmp_path / "wiki" / "topics"
     graph_dir.mkdir(parents=True)
@@ -343,13 +343,13 @@ def test_graph_removes_wiki_page_node_when_archived(tmp_path: Path) -> None:
     config = _config(tmp_path)
 
     before = graph_snapshot(config)
-    assert before["stats"]["types"]["wiki_page"] == 1
-    assert any(item["id"] == "wiki:topics/rag" for item in before["nodes"])
+    assert before["stats"]["types"]["wiki_page"] == 0
+    assert any(item["id"] == "topic:rag" and item.get("wiki_id") == "topics/rag" for item in before["nodes"])
 
     archive_wiki_page(config, "topics", "rag")
     after = graph_snapshot(config)
     assert after["stats"]["types"]["wiki_page"] == 0
-    assert all(item["id"] != "wiki:topics/rag" for item in after["nodes"])
+    assert all(item.get("wiki_id") != "topics/rag" for item in after["nodes"])
 
 
 def test_permanently_purge_single_wiki_archive(tmp_path: Path) -> None:

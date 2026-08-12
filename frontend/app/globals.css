@@ -19,6 +19,16 @@
 .planning-workspace { display: grid; grid-template-columns: minmax(280px, .9fr) minmax(360px, 1.1fr); gap: 18px; align-items: start; }
 .planning-workspace .panel { padding: 20px; }
 .planning-wizard-stage { padding: 22px; margin-bottom: 18px; border: 1px solid #ddd7ff; box-shadow: 0 12px 34px rgba(100, 76, 220, .08); }
+.planning-generation-status { margin: 4px 0 18px; padding: 16px 18px; border: 1px solid #dcd4ff; border-radius: 14px; background: linear-gradient(135deg, #faf8ff, #f2efff); box-shadow: 0 10px 28px rgba(103, 78, 218, .1); }
+.planning-generation-status > div:first-child { display: flex; align-items: center; gap: 12px; }
+.planning-generation-status p { flex: 1; margin: 0; }
+.planning-generation-status p strong, .planning-generation-status p small { display: block; }
+.planning-generation-status p small { margin-top: 4px; color: #6f687c; line-height: 1.5; }
+.planning-generation-status time { color: #654bd0; font-size: 12px; font-variant-numeric: tabular-nums; }
+.planning-generation-status em { display: block; margin-top: 8px; color: #81798d; font-size: 11px; font-style: normal; }
+.planning-generation-bar { height: 7px; margin-top: 14px; overflow: hidden; border-radius: 999px; background: #e3def4; }
+.planning-generation-bar span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #7256ec, #9c80ff, #7256ec); background-size: 200% 100%; transition: width .3s ease; animation: planning-progress-shimmer 1.4s linear infinite; }
+@keyframes planning-progress-shimmer { to { background-position: -200% 0; } }
 .planning-topic-grid { display: grid; gap: 10px; }
 .planning-empty { padding: 30px; border-radius: 14px; background: #faf9ff; color: #6e6980; }
 .planning-empty strong { color: #272331; display: block; margin-bottom: 7px; }

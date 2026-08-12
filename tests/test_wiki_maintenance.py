@@ -178,3 +178,23 @@ def test_explicit_conflicting_claim_is_exposed_in_plan(tmp_path: Path) -> None:
 
     assert topic["conflicts"]
     assert "冲突主张" in topic["markdown"]
+
+
+def test_scalar_module_and_test_summary_do_not_create_character_pages(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    _knowledge(tmp_path)
+    store_structured_knowledge(
+        tmp_path,
+        {
+            "source_session": "session-harq",
+            "project": "radio",
+            "code_entities": {"modules": "Scheduler"},
+            "verification": {"test_cases": "Python tests passed; API health passed"},
+        },
+    )
+
+    page_ids = {item["page_id"] for item in create_wiki_plan(config)["changes"]}
+
+    assert "modules/scheduler" in page_ids
+    assert not any(page_id.startswith("tests/") for page_id in page_ids)
+    assert not any(page_id in {"modules/s", "modules/c"} for page_id in page_ids)

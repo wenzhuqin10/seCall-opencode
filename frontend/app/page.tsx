@@ -467,6 +467,8 @@ export default function Home() {
   const [planningSkipReason, setPlanningSkipReason] = useState("");
   const [showPlanningSkip, setShowPlanningSkip] = useState(false);
   const [planningBusy, setPlanningBusy] = useState(false);
+  const [planningGenerating, setPlanningGenerating] = useState(false);
+  const [planningGenerationElapsed, setPlanningGenerationElapsed] = useState(0);
   const [planningPublish, setPlanningPublish] = useState<string[]>(["knowledge", "qa", "wiki"]);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
@@ -1308,15 +1310,28 @@ export default function Home() {
   const confirmAndGeneratePlanning = async () => {
     if (!planningPlan) return;
     setPlanningBusy(true);
+    setPlanningGenerating(true);
+    setPlanningGenerationElapsed(0);
+    const generationStartedAt = Date.now();
+    const generationTimer = window.setInterval(() => {
+      setPlanningGenerationElapsed((Date.now() - generationStartedAt) / 1000);
+    }, 250);
     try {
-      const confirmed = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/confirm`, { method: "POST", body: "{}" });
+      const confirmed = planningPlan.status === "scope_confirmed"
+        ? planningPlan
+        : await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/confirm`, { method: "POST", body: "{}" });
       setPlanningPlan(confirmed);
       const generated = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/generate`, { method: "POST", body: "{}" });
       setPlanningPlan(generated);
       setPlanningDraft(await apiRequest<PlanningDraft>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/draft`));
       notify("草稿已生成", "请审核知识卡片、候选 QA 和 Wiki 更新预览后再发布。");
     } catch (error) { notify("生成草稿失败", error instanceof Error ? error.message : "请检查模型与本地服务"); }
-    finally { setPlanningBusy(false); }
+    finally {
+      window.clearInterval(generationTimer);
+      setPlanningGenerationElapsed((Date.now() - generationStartedAt) / 1000);
+      setPlanningGenerating(false);
+      setPlanningBusy(false);
+    }
   };
 
   const publishPlanning = async () => {
@@ -1815,11 +1830,17 @@ export default function Home() {
               */}
               {planningPlan && <section className="planning-wizard-stage panel">
                 <div className="panel-heading"><strong>逐项确认知识条目</strong><span>{planningPlan.status === "item_reviewing" && planningCandidate ? `主题 ${planningCandidate.progress.current}/${planningCandidate.progress.total}` : "确认前不会写入知识库"}</span></div>
+                {planningGenerating && <div className="planning-generation-status" role="status" aria-live="polite">
+                  <div><span className="spin-mark">↻</span><p><strong>正在生成统一知识草稿</strong><small>{planningGenerationElapsed < 3 ? "正在确认沉淀范围" : planningGenerationElapsed < 90 ? "模型正在组织知识卡片、QA 与 Wiki 预览" : "模型仍在处理较长会话，请保持页面开启"}</small></p><time>已用时 {planningGenerationElapsed.toFixed(1)} 秒</time></div>
+                  <div className="planning-generation-bar"><span style={{ width: `${Math.min(92, 12 + planningGenerationElapsed * 0.9)}%` }} /></div>
+                  <em>进度条表示当前处理阶段；模型返回后会自动进入“统一正确性审核”。</em>
+                </div>}
                 {planningPlan.status === "candidate_selection" && <div className="planning-topic-grid">
                   {planningPlan.candidates.map((item) => <label className="planning-candidate" key={item.id}><input type="checkbox" checked={planningPlan.selected_candidate_ids.includes(item.id)} onChange={(event) => void updatePlanningScope(item.id, event.target.checked)} /><div><strong>{item.title}</strong><small>{item.type} · {item.confidence}</small><p>{item.value}</p></div></label>)}
                   <button className="primary-button" disabled={planningBusy || !planningPlan.selected_candidate_ids.length} onClick={() => void startPlanningReview()}>开始逐项确认</button>
                 </div>}
                 {planningPlan.status === "item_reviewing" && !planningCandidate && <div className="planning-empty"><strong>所有主题已处理</strong><p>草稿仅使用逐项确认过的知识条目。</p><button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>确认范围并生成草稿</button></div>}
+                {planningPlan.status === "scope_confirmed" && !planningGenerating && !planningDraft && <div className="planning-empty"><strong>沉淀范围已确认</strong><p>如果上一次生成因模型超时或服务中断失败，可以从这里继续生成，不需要重新确认主题。</p><button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>{planningBusy ? "正在生成草稿…" : "继续生成草稿"}</button></div>}
                 {planningPlan.status === "item_reviewing" && planningCandidate && <div className="planning-entry-review"><h3>{planningCandidate.candidate.title}</h3><p>{planningCandidate.current_revision?.assistant_message || "先生成当前主题的可选知识条目。"}</p>
                   {!planningCandidate.current_revision && <button className="primary-button" disabled={planningBusy} onClick={() => void regeneratePlanningEntries()}>生成可选知识条目</button>}
                   {planningCandidate.current_revision?.entries.map((entry) => <label className="planning-entry" key={entry.id}><input type="checkbox" checked={planningEntrySelection.includes(entry.id)} onChange={(event) => setPlanningEntrySelection((current) => event.target.checked ? [...new Set([...current, entry.id])] : current.filter((id) => id !== entry.id))} /><div><strong>{entry.type}{entry.recommended && <span>模型建议</span>}</strong><p>{entry.content}</p><small>{entry.source} · {entry.confidence} · 证据 {entry.evidence_event_ids.join(", ") || "用户补充"}</small></div></label>)}

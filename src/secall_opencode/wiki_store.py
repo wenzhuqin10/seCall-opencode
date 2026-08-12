@@ -590,16 +590,34 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
     }
     wiki_by_source: Dict[str, Dict[str, List[str]]] = {}
     for page in iter_wiki_pages(config, include_issues=False):
-        wiki_node_id = f"wiki:{page['id']}"
-        node_map[wiki_node_id] = {
-            "id": wiki_node_id,
-            "label": page["title"],
-            "type": "wiki_page",
-            "category": page["category"],
-            "category_label": page["category_label"],
-            "project": page["project"],
-            "wiki_id": page["id"],
-        }
+        category = str(page["category"])
+        if category == "overview":
+            continue
+        if category == "projects":
+            wiki_node_id = f"project:{page['project']}"
+            node_map.setdefault(wiki_node_id, {
+                "id": wiki_node_id, "label": page["title"], "type": "project",
+            })
+        elif category == "modules":
+            wiki_node_id = f"module:{page['slug']}"
+            node_map.setdefault(wiki_node_id, {
+                "id": wiki_node_id, "label": page["title"], "type": "module",
+                "project": page["project"],
+            })
+        elif category == "topics":
+            wiki_node_id = f"topic:{page['slug']}"
+            node_map.setdefault(wiki_node_id, {
+                "id": wiki_node_id, "label": page["title"], "type": "topic",
+                "project": page["project"],
+            })
+        else:
+            wiki_node_id = f"wiki:{page['id']}"
+            node_map[wiki_node_id] = {
+                "id": wiki_node_id, "label": page["title"], "type": "wiki_page",
+                "category": category, "category_label": page["category_label"],
+                "project": page["project"],
+            }
+        node_map[wiki_node_id]["wiki_id"] = page["id"]
         derived_edges: List[tuple[str, str, str]] = []
         page_markdown = (config.vault / page["path"]).read_text(
             encoding="utf-8", errors="replace"
@@ -615,7 +633,7 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             wiki_by_source.setdefault(str(source_session), {}).setdefault(
                 page["category"], []
             ).append(wiki_node_id)
-        if page["project"] and page["project"] != "全部项目":
+        if category not in {"projects", "modules", "topics"} and page["project"] and page["project"] != "全部项目":
             project_id = f"project:{page['project']}"
             if project_id not in node_map:
                 node_map[project_id] = {
@@ -627,26 +645,6 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
         session_id = f"session:{page['source_session']}"
         if page["source_session"] and session_id in node_map:
             derived_edges.append((wiki_node_id, session_id, "derived_from"))
-        if page["category"] == "topics":
-            topic_id = f"topic:{page['slug']}"
-            node_map[topic_id] = {
-                "id": topic_id,
-                "label": page["title"],
-                "type": "topic",
-                "project": page["project"],
-                "wiki_id": page["id"],
-            }
-            derived_edges.append((topic_id, wiki_node_id, "documented_by"))
-        elif page["category"] == "modules":
-            module_id = f"module:{page['slug']}"
-            node_map[module_id] = {
-                "id": module_id,
-                "label": page["title"],
-                "type": "module",
-                "project": page["project"],
-                "wiki_id": page["id"],
-            }
-            derived_edges.append((module_id, wiki_node_id, "documented_by"))
         for source, target, relation in derived_edges:
             if (source, target, relation) in existing_links:
                 continue
@@ -731,7 +729,7 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             derived_edges.append((issue_id, entity_id, relation))
 
         for module in entities.get("modules", []) if isinstance(entities, dict) else []:
-            add_entity("module", str(module), "affects")
+            add_entity("module", str(module), "affects", node_suffix=_entity_slug(str(module)))
 
         for raw_topic in structured.get("topics", []) if isinstance(structured.get("topics"), list) else []:
             if isinstance(raw_topic, dict):
@@ -821,7 +819,7 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
     roots = {
         node_id
         for node_id, node in node_map.items()
-        if node.get("type") in {"issue", "wiki_page"}
+        if node.get("type") in {"issue", "wiki_page"} or node.get("wiki_id")
     }
     core_links = [
         link

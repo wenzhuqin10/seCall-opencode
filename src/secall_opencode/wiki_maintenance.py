@@ -223,6 +223,18 @@ def _records(value: Any) -> List[Dict[str, Any]]:
     return [dict(item) if isinstance(item, Mapping) else {"description": str(item)} for item in value]
 
 
+def _string_values(value: Any) -> List[str]:
+    """Normalize an entity field without iterating a string by character."""
+    raw = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    return _unique(str(item) for item in raw if not isinstance(item, Mapping))
+
+
+def _valid_page_name(value: str) -> bool:
+    """Reject character fragments and malformed model output as Wiki entities."""
+    clean = value.strip()
+    return len(clean) >= 2 and "�" not in clean and any(char.isalnum() for char in clean)
+
+
 def _record_text(item: Mapping[str, Any]) -> str:
     for key in ("name", "title", "topic", "claim", "description", "conclusion", "question"):
         value = str(item.get(key) or "").strip()
@@ -308,8 +320,10 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
         structured = read_structured_knowledge(config.vault, session_id) or {}
         enriched = {**card, "detail": detail, "structured": structured}
         projects[str(card.get("project") or "未分类")].append(enriched)
-        for module in (structured.get("code_entities") or {}).get("modules", []):
-            modules[str(module)].append(enriched)
+        raw_modules = (structured.get("code_entities") or {}).get("modules", [])
+        for module in _string_values(raw_modules):
+            if _valid_page_name(module):
+                modules[module].append(enriched)
         for item in _records(structured.get("topics")):
             name = _record_text(item)
             if name:
@@ -335,11 +349,16 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
                 runbooks[name].append({**enriched, "record": item})
         test_records = _records(structured.get("test_knowledge"))
         verification = structured.get("verification") or {}
-        for case in verification.get("test_cases", []) if isinstance(verification, Mapping) else []:
-            test_records.append({"name": str(case), "description": str(case)})
+        raw_cases = verification.get("test_cases", []) if isinstance(verification, Mapping) else []
+        if isinstance(raw_cases, list):
+            for case in raw_cases:
+                if isinstance(case, Mapping):
+                    test_records.append(dict(case))
+                elif _valid_page_name(str(case)):
+                    test_records.append({"name": str(case), "description": str(case)})
         for item in test_records:
             name = _record_text(item)
-            if name:
+            if name and _valid_page_name(name):
                 tests[name].append({**enriched, "record": item})
 
     overview_sources = _unique(str(card.get("source_session") or "") for card in cards)
