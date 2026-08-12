@@ -75,6 +75,7 @@ def store_knowledge(
     knowledge_dir: str,
     qa_file: str,
     overwrite: bool = False,
+    include_qa: bool = True,
 ) -> KnowledgeResult:
     document, candidates, structured_payload = split_generated_output(generated)
     session_id = _frontmatter_value(source_markdown, "session_id")
@@ -147,6 +148,17 @@ def store_knowledge(
     if overwrite or not issue_path.exists():
         issue_path.write_text(document, encoding="utf-8")
     qa_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Draft-first publishing may persist the Issue Card before its candidate QA
+    # has been approved.  In that case do not create a visible QA queue entry.
+    if not include_qa:
+        return KnowledgeResult(
+            issue_path=issue_path,
+            qa_path=qa_path,
+            qa_count=0,
+            structured_path=structured_file,
+            quality=dict(structured.get("quality") or {}),
+        )
 
     existing_ids = set()
     if qa_path.exists():

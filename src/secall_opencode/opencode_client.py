@@ -114,6 +114,91 @@ class OpenCodeClient:
         raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
         return extract_generation_text(raw)
 
+    def run_planning_analysis(
+        self,
+        session_file: Path,
+        prompt_file: Path,
+        workdir: Path,
+        model: Optional[str] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        """Ask the model for candidates only; it must not generate a knowledge card."""
+        args = [
+            "run", "--format", "json", "--file", str(session_file), "--file", str(prompt_file),
+            "--dir", str(workdir), "--title", f"seCall planning: {session_file.stem}",
+        ]
+        if model:
+            args.extend(["--model", model])
+        args.append("阅读会话并只返回候选知识清单。不要写入任何文件，也不要生成正式知识卡片、QA 或 Wiki。")
+        raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
+        text = extract_marked_text(raw, "<!-- SECALL_PLANNING_START -->", "<!-- SECALL_PLANNING_END -->")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"知识策划分析未返回有效 JSON：{exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("知识策划分析必须返回 JSON 对象。")
+        return value
+
+    def run_planning_dialogue(
+        self,
+        session_file: Path,
+        context_file: Path,
+        prompt_file: Path,
+        workdir: Path,
+        message: str,
+        model: Optional[str] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        args = [
+            "run", "--format", "json", "--file", str(session_file), "--file", str(context_file),
+            "--file", str(prompt_file), "--dir", str(workdir),
+            "--title", f"seCall planning dialogue: {session_file.stem}",
+        ]
+        if model:
+            args.extend(["--model", model])
+        args.append(f"用户在知识策划阶段补充：{message}\n只返回策划对话 JSON，不要生成或写入正式知识。")
+        raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
+        text = extract_marked_text(raw, "<!-- SECALL_PLANNING_START -->", "<!-- SECALL_PLANNING_END -->")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"知识策划对话未返回有效 JSON：{exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("知识策划对话必须返回 JSON 对象。")
+        return value
+
+    def run_candidate_entries(
+        self,
+        session_file: Path,
+        context_file: Path,
+        prompt_file: Path,
+        workdir: Path,
+        model: Optional[str] = None,
+        timeout: int = 900,
+    ) -> Dict[str, Any]:
+        """Ask for selectable entries for one topic, never formal knowledge output."""
+        args = [
+            "run", "--format", "json", "--file", str(session_file), "--file", str(context_file),
+            "--file", str(prompt_file), "--dir", str(workdir),
+            "--title", f"seCall entry review: {session_file.stem}",
+        ]
+        if model:
+            args.extend(["--model", model])
+        args.append(
+            "只为当前知识主题整理可供用户选择的知识条目。不得生成正式知识卡片、QA 或 Wiki，"
+            "也不得扩展到用户未选择或未确认的内容。"
+        )
+        raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
+        text = extract_marked_text(raw, "<!-- SECALL_CANDIDATE_ENTRIES_START -->", "<!-- SECALL_CANDIDATE_ENTRIES_END -->")
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"知识条目整理未返回有效 JSON：{exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError("知识条目整理必须返回 JSON 对象。")
+        return value
+
     def run_rag_answer(
         self,
         context_file: Path,

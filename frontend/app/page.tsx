@@ -2,7 +2,7 @@
 
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 
-type View = "overview" | "sessions" | "pipeline" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
+type View = "overview" | "sessions" | "pipeline" | "planning" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
 type ImportFailure = {
   file: string; size: string; stage: string; code: string; reason: string;
@@ -147,7 +147,22 @@ type PipelineResult = {
   indexed: boolean; reused: boolean; stages: PipelineStage[]; elapsed_seconds: number;
   wiki_plan_id?: string; wiki_changes?: { total: number; create: number; update: number; archive: number };
   requires_review?: boolean;
+  planning_plan_id?: string;
+  planning_status?: string;
+  candidate_count?: number;
 };
+type PlanningEntry = { id: string; type: string; content: string; source: "session_evidence" | "user_provided" | "mixed"; evidence_event_ids: string[]; confidence: string; recommended: boolean; duplicate_hint?: string; conflict_hint?: string };
+type PlanningEntryRevision = { revision: number; assistant_message: string; entries: PlanningEntry[]; supplement?: string; created_at?: string };
+type PlanningCandidate = {
+  id: string; type: string; title: string; value: string; confidence: string; evidence_event_ids: string[];
+  recommendation: string; duplicate_hint?: string; conflict_hint?: string;
+  selection_status: "unselected" | "pending" | "options_ready" | "confirmed" | "skipped";
+  entry_revisions: PlanningEntryRevision[]; selected_entry_ids: string[]; skip_reason?: string;
+};
+type PlanningMessage = { id: string; role: "user" | "assistant"; at: string; content: string };
+type PlanningPlan = { plan_id: string; session_id: string; project: string; status: string; version: number; candidates: PlanningCandidate[]; selected_candidate_ids: string[]; confirmation_order: string[]; active_candidate_id?: string; messages: PlanningMessage[]; user_facts: Array<{ id: string; source: string; content: string }>; draft?: { qa_count?: number; wiki_change_count?: number }; index_status?: string; skip_reason?: string };
+type PlanningCandidateResponse = { plan_id: string; status: string; active_candidate_id?: string; progress: { current: number; total: number }; candidate: PlanningCandidate; current_revision?: PlanningEntryRevision };
+type PlanningDraft = { plan: PlanningPlan; draft: { document: string; qa: Array<Record<string, unknown>>; wiki_preview: Array<{ id: string; title: string; category: string; action: string; reason: string; diff: string }> } };
 type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
@@ -265,6 +280,7 @@ const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
   { id: "qa", label: "QA 审核", icon: "✓" },
   { id: "diagnostics", label: "环境诊断", icon: "+" },
 ];
+navItems.splice(3, 0, { id: "planning", label: "知识策划", icon: "◌" });
 
 const wikiCategories = [
   ["all", "全部页面"],
@@ -442,6 +458,16 @@ export default function Home() {
   const [pipelineModel, setPipelineModel] = useState("");
   const [pipelineOverwrite, setPipelineOverwrite] = useState(false);
   const [pipelineReindex, setPipelineReindex] = useState(true);
+  const [planningPlan, setPlanningPlan] = useState<PlanningPlan | null>(null);
+  const [planningDraft, setPlanningDraft] = useState<PlanningDraft | null>(null);
+  const [planningCandidate, setPlanningCandidate] = useState<PlanningCandidateResponse | null>(null);
+  const [planningEntrySelection, setPlanningEntrySelection] = useState<string[]>([]);
+  const [planningSupplement, setPlanningSupplement] = useState("");
+  const [showPlanningSupplement, setShowPlanningSupplement] = useState(false);
+  const [planningSkipReason, setPlanningSkipReason] = useState("");
+  const [showPlanningSkip, setShowPlanningSkip] = useState(false);
+  const [planningBusy, setPlanningBusy] = useState(false);
+  const [planningPublish, setPlanningPublish] = useState<string[]>(["knowledge", "qa", "wiki"]);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
   const [pipelineSessionItems, setPipelineSessionItems] = useState<SessionItem[]>([]);
@@ -1194,6 +1220,127 @@ export default function Home() {
     }
   };
 
+  const openPlanning = async (planId: string) => {
+    const plan = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planId)}`);
+    setPlanningPlan(plan);
+    setPlanningDraft(null);
+    setPlanningCandidate(null);
+    if (plan.status === "reviewing") {
+      try { setPlanningDraft(await apiRequest<PlanningDraft>(`/api/knowledge-plans/${encodeURIComponent(planId)}/draft`)); } catch { /* draft may still be generating */ }
+    }
+    if (plan.status === "item_reviewing" && plan.active_candidate_id) {
+      await loadPlanningCandidate(plan.plan_id, plan.active_candidate_id);
+    }
+    setActive("planning");
+  };
+
+  const loadPlanningCandidate = async (planId: string, candidateId: string) => {
+    const response = await apiRequest<PlanningCandidateResponse>(`/api/knowledge-plans/${encodeURIComponent(planId)}/candidates/${encodeURIComponent(candidateId)}`);
+    setPlanningCandidate(response);
+    setPlanningEntrySelection(response.current_revision ? response.candidate.selected_entry_ids : []);
+    setPlanningSupplement(""); setPlanningSkipReason("");
+    setShowPlanningSupplement(false); setShowPlanningSkip(false);
+    return response;
+  };
+
+  const updatePlanningScope = async (candidateId: string, checked: boolean) => {
+    if (!planningPlan) return;
+    const selected = checked
+      ? [...new Set([...planningPlan.selected_candidate_ids, candidateId])]
+      : planningPlan.selected_candidate_ids.filter((id) => id !== candidateId);
+    const next = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/scope`, { method: "POST", body: JSON.stringify({ selected_candidate_ids: selected }) });
+    setPlanningPlan(next);
+  };
+
+  const startPlanningReview = async () => {
+    if (!planningPlan) return;
+    setPlanningBusy(true);
+    try {
+      const next = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/start-review`, { method: "POST", body: "{}" });
+      setPlanningPlan(next);
+      if (next.active_candidate_id) await loadPlanningCandidate(next.plan_id, next.active_candidate_id);
+    } catch (error) { notify("知识策划对话失败", error instanceof Error ? error.message : "请检查本地服务"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const regeneratePlanningEntries = async () => {
+    if (!planningPlan?.active_candidate_id) return;
+    setPlanningBusy(true);
+    try {
+      const response = await apiRequest<{ plan: PlanningPlan } & PlanningCandidateResponse>(
+        `/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/candidates/${encodeURIComponent(planningPlan.active_candidate_id)}/regenerate`,
+        { method: "POST", body: JSON.stringify({ supplement: planningSupplement }) },
+      );
+      setPlanningPlan(response.plan); setPlanningCandidate(response); setPlanningEntrySelection([]);
+      setPlanningSupplement(""); setShowPlanningSupplement(false);
+    } catch (error) { notify("重新整理条目失败", error instanceof Error ? error.message : "请检查本地模型服务后重试。"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const confirmPlanningCandidate = async () => {
+    if (!planningPlan?.active_candidate_id || !planningEntrySelection.length) return;
+    setPlanningBusy(true);
+    try {
+      const next = await apiRequest<PlanningPlan>(
+        `/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/candidates/${encodeURIComponent(planningPlan.active_candidate_id)}/confirm`,
+        { method: "POST", body: JSON.stringify({ selected_entry_ids: planningEntrySelection }) },
+      );
+      setPlanningPlan(next);
+      if (next.active_candidate_id) await loadPlanningCandidate(next.plan_id, next.active_candidate_id); else setPlanningCandidate(null);
+    } catch (error) { notify("确认知识条目失败", error instanceof Error ? error.message : "请至少选择一个条目。"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const skipPlanningCandidate = async () => {
+    if (!planningPlan?.active_candidate_id || !planningSkipReason.trim()) return;
+    setPlanningBusy(true);
+    try {
+      const next = await apiRequest<PlanningPlan>(
+        `/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/candidates/${encodeURIComponent(planningPlan.active_candidate_id)}/skip`,
+        { method: "POST", body: JSON.stringify({ reason: planningSkipReason }) },
+      );
+      setPlanningPlan(next);
+      if (next.active_candidate_id) await loadPlanningCandidate(next.plan_id, next.active_candidate_id); else setPlanningCandidate(null);
+    } catch (error) { notify("跳过主题失败", error instanceof Error ? error.message : "请填写跳过原因。"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const confirmAndGeneratePlanning = async () => {
+    if (!planningPlan) return;
+    setPlanningBusy(true);
+    try {
+      const confirmed = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/confirm`, { method: "POST", body: "{}" });
+      setPlanningPlan(confirmed);
+      const generated = await apiRequest<PlanningPlan>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/generate`, { method: "POST", body: "{}" });
+      setPlanningPlan(generated);
+      setPlanningDraft(await apiRequest<PlanningDraft>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/draft`));
+      notify("草稿已生成", "请审核知识卡片、候选 QA 和 Wiki 更新预览后再发布。");
+    } catch (error) { notify("生成草稿失败", error instanceof Error ? error.message : "请检查模型与本地服务"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const publishPlanning = async () => {
+    if (!planningPlan) return;
+    setPlanningBusy(true);
+    try {
+      const result = await apiRequest<{ plan: PlanningPlan; derivatives: Record<string, unknown> }>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/publish`, { method: "POST", body: JSON.stringify({ selected: planningPublish, reindex: true }) });
+      setPlanningPlan(result.plan); await refreshData();
+      notify(result.plan.index_status === "ready" ? "知识已发布并完成同步" : "知识已发布，索引待同步", result.plan.index_status === "ready" ? "已同步知识库、检索和关系图。" : "可稍后在知识库中刷新索引。" );
+    } catch (error) { notify("发布失败", error instanceof Error ? error.message : "请检查草稿与依赖关系"); }
+    finally { setPlanningBusy(false); }
+  };
+
+  const retryPlanningIndex = async () => {
+    if (!planningPlan) return;
+    setPlanningBusy(true);
+    try {
+      const result = await apiRequest<{ plan: PlanningPlan }>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/retry-index`, { method: "POST", body: "{}" });
+      setPlanningPlan(result.plan);
+      notify(result.plan.index_status === "ready" ? "索引同步完成" : "索引仍待同步", result.plan.index_status === "ready" ? "检索和向量索引已刷新。" : "请检查本地索引服务后再次重试。" );
+    } catch (error) { notify("重试索引失败", error instanceof Error ? error.message : "请检查本地服务"); }
+    finally { setPlanningBusy(false); }
+  };
+
   const startPipeline = async () => {
     if (!pipelineSession) {
       notify("暂无可运行会话", "请先在“研发会话”中通过至少一个会话的预审核");
@@ -1228,6 +1375,7 @@ export default function Home() {
       setPipelineStatus("success");
       setPipelineElapsed(result.elapsed_seconds);
       setPipelineResult(result);
+      if (result.planning_plan_id) await openPlanning(result.planning_plan_id);
       await refreshData();
       notify(
         result.requires_review ? "知识已入库，Wiki 计划待审核" : result.reused ? "已复用现有知识并刷新索引" : "知识已成功入库",
@@ -1654,6 +1802,41 @@ export default function Home() {
                 </footer>
               </article>
               {sessionPreviewLoading && <div className="preview-loading"><span>◌</span>正在读取会话内容…</div>}
+            </section>
+          )}
+
+          {active === "planning" && (
+            <section className="subpage">
+              {/*
+                <div className="panel-heading"><strong>{planningPlan.status === "candidate_selection" ? "第一阶段：选择知识主题" : planningPlan.status === "item_reviewing" ? "第二阶段：逐项确认知识条目" : "第三阶段：审核生成结果"}</strong><span>{planningPlan.status === "item_reviewing" && planningCandidate ? `第 ${planningCandidate.progress.current}/${planningCandidate.progress.total} 个主题` : "确认前不会写入知识库"}</span></div>
+                {planningPlan.status === "candidate_selection" && <div className="planning-topic-grid">{planningPlan.candidates.map((item) => <label className="planning-candidate" key={item.id}><input type="checkbox" checked={planningPlan.selected_candidate_ids.includes(item.id)} onChange={(event) => void updatePlanningScope(item.id, event.target.checked)} /><div><strong>{item.title}</strong><small>{item.type} · {item.confidence} · 证据 {item.evidence_event_ids.join(", ") || "不足"}</small><p>{item.value}</p></div></label>)}<button className="primary-button" disabled={planningBusy || !planningPlan.selected_candidate_ids.length} onClick={() => void startPlanningReview()}>{planningBusy ? "正在建立确认队列…" : "开始逐项确认"}</button></div>}
+                {planningPlan.status === "item_reviewing" && !planningCandidate && <div className="planning-empty"><strong>所有主题已处理</strong><p>你可以生成统一草稿；草稿仅使用逐项确认过的知识条目。</p><button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>{planningBusy ? "正在生成草稿…" : "确认范围并生成草稿"}</button></div>}
+                {planningPlan.status === "item_reviewing" && planningCandidate && <div className="planning-entry-review"><h3>{planningCandidate.candidate.title}</h3><p>{planningCandidate.current_revision?.assistant_message || "先让模型整理当前主题下可供选择的知识条目。"}</p>{!planningCandidate.current_revision && <button className="primary-button" disabled={planningBusy} onClick={() => void regeneratePlanningEntries()}>{planningBusy ? "正在整理…" : "生成可选知识条目"}</button>}{planningCandidate.current_revision?.entries.map((entry) => <label className="planning-entry" key={entry.id}><input type="checkbox" checked={planningEntrySelection.includes(entry.id)} onChange={(event) => setPlanningEntrySelection((current) => event.target.checked ? [...new Set([...current, entry.id])] : current.filter((id) => id !== entry.id))} /><div><strong>{entry.type}{entry.recommended && <span>模型建议</span>}</strong><p>{entry.content}</p><small>{entry.source} · {entry.confidence} · 证据 {entry.evidence_event_ids.join(", ") || "用户补充"}</small></div></label>)}{planningCandidate.current_revision && <><button className="text-button" onClick={() => setShowPlanningSupplement((value) => !value)}>这些都不合适 / 补充说明</button>{showPlanningSupplement && <div className="planning-compose"><textarea value={planningSupplement} onChange={(event) => setPlanningSupplement(event.target.value)} placeholder="说明哪些条目不准确、要保留哪些事实；补充会标记为 user_provided。" /><button className="secondary-button" disabled={planningBusy || !planningSupplement.trim()} onClick={() => void regeneratePlanningEntries()}>根据补充重新整理</button></div>}<div className="planning-actions"><button className="primary-button" disabled={planningBusy || !planningEntrySelection.length} onClick={() => void confirmPlanningCandidate()}>确认所选并进入下一项</button><button className="secondary-button" onClick={() => setShowPlanningSkip((value) => !value)}>跳过此主题</button></div>{showPlanningSkip && <div className="planning-compose"><textarea value={planningSkipReason} onChange={(event) => setPlanningSkipReason(event.target.value)} placeholder="请填写跳过此主题的原因。" /><button className="danger-button" disabled={planningBusy || !planningSkipReason.trim()} onClick={() => void skipPlanningCandidate()}>确认跳过</button></div>}</>}</div>}
+              */}
+              {planningPlan && <section className="planning-wizard-stage panel">
+                <div className="panel-heading"><strong>逐项确认知识条目</strong><span>{planningPlan.status === "item_reviewing" && planningCandidate ? `主题 ${planningCandidate.progress.current}/${planningCandidate.progress.total}` : "确认前不会写入知识库"}</span></div>
+                {planningPlan.status === "candidate_selection" && <div className="planning-topic-grid">
+                  {planningPlan.candidates.map((item) => <label className="planning-candidate" key={item.id}><input type="checkbox" checked={planningPlan.selected_candidate_ids.includes(item.id)} onChange={(event) => void updatePlanningScope(item.id, event.target.checked)} /><div><strong>{item.title}</strong><small>{item.type} · {item.confidence}</small><p>{item.value}</p></div></label>)}
+                  <button className="primary-button" disabled={planningBusy || !planningPlan.selected_candidate_ids.length} onClick={() => void startPlanningReview()}>开始逐项确认</button>
+                </div>}
+                {planningPlan.status === "item_reviewing" && !planningCandidate && <div className="planning-empty"><strong>所有主题已处理</strong><p>草稿仅使用逐项确认过的知识条目。</p><button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>确认范围并生成草稿</button></div>}
+                {planningPlan.status === "item_reviewing" && planningCandidate && <div className="planning-entry-review"><h3>{planningCandidate.candidate.title}</h3><p>{planningCandidate.current_revision?.assistant_message || "先生成当前主题的可选知识条目。"}</p>
+                  {!planningCandidate.current_revision && <button className="primary-button" disabled={planningBusy} onClick={() => void regeneratePlanningEntries()}>生成可选知识条目</button>}
+                  {planningCandidate.current_revision?.entries.map((entry) => <label className="planning-entry" key={entry.id}><input type="checkbox" checked={planningEntrySelection.includes(entry.id)} onChange={(event) => setPlanningEntrySelection((current) => event.target.checked ? [...new Set([...current, entry.id])] : current.filter((id) => id !== entry.id))} /><div><strong>{entry.type}{entry.recommended && <span>模型建议</span>}</strong><p>{entry.content}</p><small>{entry.source} · {entry.confidence} · 证据 {entry.evidence_event_ids.join(", ") || "用户补充"}</small></div></label>)}
+                  {planningCandidate.current_revision && <><button className="text-button" onClick={() => setShowPlanningSupplement((value) => !value)}>这些都不合适 / 补充说明</button>{showPlanningSupplement && <div className="planning-compose"><textarea value={planningSupplement} onChange={(event) => setPlanningSupplement(event.target.value)} placeholder="说明哪些条目不准确、要保留哪些事实。" /><button className="secondary-button" disabled={planningBusy || !planningSupplement.trim()} onClick={() => void regeneratePlanningEntries()}>根据补充重新整理</button></div>}<div className="planning-actions"><button className="primary-button" disabled={planningBusy || !planningEntrySelection.length} onClick={() => void confirmPlanningCandidate()}>确认所选并进入下一项</button><button className="secondary-button" onClick={() => setShowPlanningSkip((value) => !value)}>跳过此主题</button></div>{showPlanningSkip && <div className="planning-compose"><textarea value={planningSkipReason} onChange={(event) => setPlanningSkipReason(event.target.value)} placeholder="请填写跳过原因。" /><button className="danger-button" disabled={planningBusy || !planningSkipReason.trim()} onClick={() => void skipPlanningCandidate()}>确认跳过</button></div>}</>}
+                </div>}
+              </section>}
+              <div className="subpage-heading"><div><p className="eyebrow">INTERACTIVE KNOWLEDGE PLANNING</p><h1>知识策划</h1><p>先与模型讨论哪些经验值得沉淀；确认前，所有内容只保存在隔离草稿区。</p></div>{planningPlan && <span className={`review-pill ${planningPlan.status}`}>{planningPlan.status === "reviewing" ? "待最终审核" : planningPlan.status === "published" ? "已发布" : planningPlan.status === "skipped" ? "已跳过" : "讨论中"}</span>}</div>
+              {!planningPlan ? <div className="empty-state"><strong>尚未开始知识策划</strong><span>请在流水线中选择已通过预审核的会话，模型会先给出候选知识清单。</span></div> : <div className="planning-workspace">
+                {planningPlan.status === "published" && planningPlan.index_status !== "ready" && <div className="pipeline-error"><strong>已发布，索引待同步</strong><button className="secondary-button" disabled={planningBusy} onClick={() => void retryPlanningIndex()}>重试索引同步</button></div>}
+                {planningPlan.status !== "candidate_selection" && <article className="panel planning-candidates"><div className="panel-heading"><strong>知识主题进度</strong><span>{planningPlan.candidates.length} 项</span></div>
+                  {planningPlan.candidates.map((item) => <label className="planning-candidate" key={item.id}><input type="checkbox" checked={planningPlan.selected_candidate_ids.includes(item.id)} disabled={planningPlan.status !== "discussing"} onChange={(event) => void updatePlanningScope(item.id, event.target.checked)} /><div><strong>{item.title}</strong><small>{item.type} · {item.confidence} · 证据 {item.evidence_event_ids.join(", ") || "不足"}</small><p>{item.value}</p>{item.duplicate_hint && <em>重复提示：{item.duplicate_hint}</em>}{item.conflict_hint && <em>冲突提示：{item.conflict_hint}</em>}</div></label>)}
+                  {planningPlan.status === "item_reviewing" && !planningPlan.active_candidate_id && <button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>{planningBusy ? "正在生成草稿…" : "确认范围并生成草稿"}</button>}
+                </article>}
+                {planningDraft && <article className="panel planning-review"><div className="panel-heading"><strong>统一正确性审核</strong><span>草稿未入库</span></div><h3>知识卡片草稿</h3><MarkdownViewer markdown={planningDraft.draft.document} /><h3>候选 QA（{planningDraft.draft.qa.length}）</h3><pre>{JSON.stringify(planningDraft.draft.qa, null, 2)}</pre><h3>Wiki 更新预览</h3>{planningDraft.draft.wiki_preview.map((item) => <article className="planning-wiki-preview" key={item.id}><strong>{item.title}</strong><small>{item.category} · {item.action}</small><p>{item.reason}</p><pre>{item.diff}</pre></article>)}
+                  {planningPlan.status === "reviewing" && <div className="planning-publish"><strong>发布项</strong>{(["knowledge", "qa", "wiki"] as const).map((item) => <label key={item}><input type="checkbox" checked={planningPublish.includes(item)} onChange={(event) => setPlanningPublish((current) => event.target.checked ? [...new Set([...current, item])] : current.filter((value) => value !== item))} />{{ knowledge: "知识卡片", qa: "QA", wiki: "Wiki" }[item]}</label>)}<button className="primary-button" disabled={planningBusy || !planningPublish.includes("knowledge")} onClick={() => void publishPlanning()}>{planningBusy ? "正在发布…" : "发布已选内容"}</button><small>QA 和 Wiki 必须与知识卡片同时发布。</small></div>}
+                </article>}
+              </div>}
             </section>
           )}
 

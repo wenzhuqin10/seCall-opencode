@@ -15,6 +15,28 @@ from .chatgpt import inspect_export, parse_export
 from .config import Config
 from .converter import convert_export, render_markdown
 from .knowledge import store_knowledge
+from .knowledge_planning import (
+    append_dialogue as append_planning_dialogue,
+    confirm_candidate as confirm_planning_candidate,
+    confirm_scope as confirm_planning_scope,
+    confirmed_context as confirmed_planning_context,
+    create_plan as create_planning_plan,
+    list_plans as list_planning_plans,
+    mark_index_result as mark_planning_index_result,
+    publish_plan as publish_planning_plan,
+    read_candidate as read_planning_candidate,
+    read_draft as read_planning_draft,
+    read_plan as read_planning_plan,
+    reopen_candidate as reopen_planning_candidate,
+    reopen_plan as reopen_planning_plan,
+    save_candidate_revision as save_planning_candidate_revision,
+    save_draft as save_planning_draft,
+    skip_candidate as skip_planning_candidate,
+    skip_plan as skip_planning_plan,
+    start_review as start_planning_review,
+    update_draft as update_planning_draft,
+    update_scope as update_planning_scope,
+)
 from .knowledge_store import (
     atomic_write_text,
     delete_knowledge_document,
@@ -661,6 +683,86 @@ def run_session_pipeline(
     }
 
 
+def run_session_pipeline(
+    config: Config,
+    session_id: str,
+    model: Optional[str] = None,
+    reindex: bool = True,
+    overwrite: bool = False,
+    timeout: int = 1800,
+) -> Dict[str, Any]:
+    """Compatibility entry point that starts an isolated knowledge planning session.
+
+    The former implementation wrote directly into the formal knowledge vault.
+    The new flow deliberately stops after analysis so a user can discuss and
+    confirm the extraction scope first.
+    """
+    started_at = time.monotonic()
+    stages: List[Dict[str, Any]] = []
+    sessions = list_vault_sessions(config, limit=None, include_hidden=True)
+    match = next((item for item in sessions if item["id"] == session_id), None)
+    if not match:
+        raise FileNotFoundError(f"Vault 中不存在 Session：{session_id}")
+    if match.get("hidden"):
+        raise ValueError("该会话已被隐藏，请恢复后再开始知识策划。")
+    if match.get("review_status") != "approved" or match.get("storage_state") != "approved":
+        raise ValueError("只有通过预审核的会话可以开始知识策划。")
+    session_path = _safe_vault_path(config.vault, Path(str(match["path"])))
+    source_markdown = session_path.read_text(encoding="utf-8")
+    events = read_session_events(config.vault, session_id) or build_events_from_markdown(source_markdown)
+    stages.append({
+        "name": "读取并验证会话", "duration_seconds": round(time.monotonic() - started_at, 2),
+        "detail": f"{match.get('turns', 0)} 轮消息，预审核已通过；草稿内保留 {len(events)} 个可追溯事件。",
+    })
+
+    analysis_started = time.monotonic()
+    analysis: Dict[str, Any] = {}
+    try:
+        analysis = OpenCodeClient(config.opencode_command).run_planning_analysis(
+            session_path,
+            Path(__file__).parent / "prompts" / "knowledge-planning.md",
+            config.vault,
+            model=model or config.model,
+            timeout=min(timeout, 900),
+        )
+        detail = "模型已提出候选知识，等待用户讨论与确认范围。"
+    except Exception as exc:
+        # A temporary model failure must not make the session unusable.  The
+        # planning store creates conservative event-backed candidates instead.
+        detail = f"模型策划暂不可用，已创建保守候选：{exc}"
+    plan = create_planning_plan(
+        config,
+        session_id=session_id,
+        project=str(match.get("project") or "unknown"),
+        source_markdown=source_markdown,
+        events=events,
+        analysis=analysis,
+        source_path=session_path,
+    )
+    stages.append({
+        "name": "会话知识策划", "duration_seconds": round(time.monotonic() - analysis_started, 2),
+        "detail": detail,
+    })
+    stages.append({
+        "name": "用户确认沉淀范围", "duration_seconds": 0.0,
+        "detail": "当前仅保存策划草稿；知识卡片、QA、Wiki、关系图与检索均未改变。",
+    })
+    return {
+        "session_id": session_id,
+        "planning_plan_id": plan["plan_id"],
+        "planning_status": plan["status"],
+        "candidate_count": len(plan.get("candidates") or []),
+        "knowledge": {"issue_path": "", "qa_path": "", "qa_count": 0, "new_qa_count": 0},
+        "indexed": False,
+        "reused": False,
+        "wiki_plan_id": "",
+        "wiki_changes": {"total": 0, "create": 0, "update": 0, "archive": 0},
+        "requires_review": True,
+        "stages": stages,
+        "elapsed_seconds": round(time.monotonic() - started_at, 2),
+    }
+
+
 class LocalAPIHandler(BaseHTTPRequestHandler):
     server_version = "seCallOpenCodeLocal/0.8"
 
@@ -890,6 +992,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/sessions/"):
                 session_id = unquote(parsed.path.removeprefix("/api/sessions/"))
                 self._ok(read_vault_session(self.config, session_id))
+            elif parsed.path == "/api/knowledge-plans":
+                self._ok(list_planning_plans(self.config, str(query.get("status", ["all"])[0])))
+            elif "/candidates/" in parsed.path and parsed.path.startswith("/api/knowledge-plans/"):
+                remainder = parsed.path.removeprefix("/api/knowledge-plans/")
+                plan_id, candidate_id = remainder.split("/candidates/", 1)
+                self._ok(read_planning_candidate(self.config, unquote(plan_id).rstrip("/"), unquote(candidate_id).rstrip("/")))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/draft"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/draft")).rstrip("/")
+                self._ok(read_planning_draft(self.config, plan_id))
+            elif parsed.path.startswith("/api/knowledge-plans/"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/")).rstrip("/")
+                self._ok(read_planning_plan(self.config, plan_id))
             elif parsed.path == "/api/knowledge":
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":
@@ -1004,6 +1118,153 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as exc:
                     self._fail_opencode_import(exc, "写入会话 Vault")
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/start-review"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/start-review")).rstrip("/")
+                self._ok(start_planning_review(self.config, plan_id))
+            elif "/candidates/" in parsed.path and parsed.path.startswith("/api/knowledge-plans/"):
+                remainder = parsed.path.removeprefix("/api/knowledge-plans/")
+                plan_id, action = remainder.split("/candidates/", 1)
+                plan_id = unquote(plan_id).rstrip("/")
+                candidate_id, separator, operation = action.partition("/")
+                candidate_id = unquote(candidate_id).rstrip("/")
+                if not separator or operation not in {"regenerate", "confirm", "skip", "reopen"}:
+                    raise FileNotFoundError("知识主题操作不存在。")
+                if operation == "regenerate":
+                    plan = read_planning_plan(self.config, plan_id)
+                    candidate_view = read_planning_candidate(self.config, plan_id, candidate_id)
+                    known = {item["id"]: item for item in list_vault_sessions(self.config, limit=None, include_hidden=True)}
+                    session = known.get(str(plan.get("session_id") or ""))
+                    if not session:
+                        raise FileNotFoundError("知识策划的来源会话已不存在。")
+                    source_path = _safe_vault_path(self.config.vault, Path(str(session["path"])))
+                    supplement = str(body.get("supplement") or "").strip()
+                    context_path = self.config.vault / "knowledge" / "planning" / "drafts" / plan_id / f"{candidate_id}-context.json"
+                    context = {
+                        "plan_id": plan_id,
+                        "candidate": candidate_view["candidate"],
+                        "supplement": supplement,
+                        "events": read_session_events(self.config.vault, str(plan.get("session_id") or "")),
+                        "instruction": "只整理当前主题中的可选知识条目。",
+                    }
+                    atomic_write_text(context_path, json.dumps(context, ensure_ascii=False, indent=2) + "\n")
+                    try:
+                        analysis = OpenCodeClient(self.config.opencode_command).run_candidate_entries(
+                            source_path, context_path, Path(__file__).parent / "prompts" / "knowledge-entry-review.md",
+                            self.config.vault,
+                            model=str(body.get("model") or self.config.model or "") or None,
+                            timeout=min(int(body.get("timeout") or 900), 900),
+                        )
+                    except Exception as exc:
+                        candidate = candidate_view["candidate"]
+                        analysis = {
+                            "assistant_message": f"模型暂时无法重整条目，已保留可核查的主题摘要。详情：{exc}",
+                            "entries": [{
+                                "id": "entry-1", "type": str(candidate.get("type") or "topic"),
+                                "content": str(candidate.get("value") or candidate.get("title") or ""),
+                                "source": "session_evidence", "evidence_event_ids": list(candidate.get("evidence_event_ids") or []),
+                                "confidence": str(candidate.get("confidence") or "medium"), "recommended": False,
+                            }],
+                        }
+                    updated = save_planning_candidate_revision(self.config, plan_id, candidate_id, analysis, supplement=supplement)
+                    self._ok({"plan": updated, **read_planning_candidate(self.config, plan_id, candidate_id)})
+                elif operation == "confirm":
+                    selected = body.get("selected_entry_ids")
+                    if not isinstance(selected, list):
+                        raise ValueError("selected_entry_ids 必须是数组。")
+                    self._ok(confirm_planning_candidate(self.config, plan_id, candidate_id, [str(item) for item in selected]))
+                elif operation == "skip":
+                    self._ok(skip_planning_candidate(self.config, plan_id, candidate_id, str(body.get("reason") or "")))
+                else:
+                    self._ok(reopen_planning_candidate(self.config, plan_id, candidate_id))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/message"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/message")).rstrip("/")
+                plan = read_planning_plan(self.config, plan_id)
+                message = str(body.get("message") or "").strip()
+                known = {item["id"]: item for item in list_vault_sessions(self.config, limit=None, include_hidden=True)}
+                session = known.get(str(plan.get("session_id") or ""))
+                if not session:
+                    raise FileNotFoundError("知识策划的来源会话已不存在。")
+                source_path = _safe_vault_path(self.config.vault, Path(str(session["path"])))
+                context_path = self.config.vault / "knowledge" / "planning" / "drafts" / plan_id / "dialogue-context.json"
+                atomic_write_text(context_path, json.dumps(plan, ensure_ascii=False, indent=2) + "\n")
+                reply, facts = "", []
+                try:
+                    response = OpenCodeClient(self.config.opencode_command).run_planning_dialogue(
+                        source_path, context_path, Path(__file__).parent / "prompts" / "knowledge-planning-dialogue.md",
+                        self.config.vault, message, model=str(body.get("model") or self.config.model or "") or None,
+                        timeout=min(int(body.get("timeout") or 900), 900),
+                    )
+                    reply = str(response.get("assistant_message") or "")
+                    raw_facts = response.get("user_facts") or []
+                    facts = [str(item) for item in raw_facts if str(item).strip()] if isinstance(raw_facts, list) else []
+                except Exception as exc:
+                    reply = f"已记录你的补充。模型暂时无法继续分析：{exc}"
+                self._ok(append_planning_dialogue(self.config, plan_id, message, assistant_reply=reply, user_facts=facts))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/scope"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/scope")).rstrip("/")
+                selected = body.get("selected_candidate_ids")
+                if not isinstance(selected, list):
+                    raise ValueError("selected_candidate_ids 必须是数组。")
+                self._ok(update_planning_scope(self.config, plan_id, [str(item) for item in selected]))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/confirm"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/confirm")).rstrip("/")
+                self._ok(confirm_planning_scope(self.config, plan_id))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/skip"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/skip")).rstrip("/")
+                self._ok(skip_planning_plan(self.config, plan_id, str(body.get("reason") or "")))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/reopen"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/reopen")).rstrip("/")
+                self._ok(reopen_planning_plan(self.config, plan_id))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/generate"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/generate")).rstrip("/")
+                plan = read_planning_plan(self.config, plan_id)
+                known = {item["id"]: item for item in list_vault_sessions(self.config, limit=None, include_hidden=True)}
+                session = known.get(str(plan.get("session_id") or ""))
+                if not session:
+                    raise FileNotFoundError("知识策划的来源会话已不存在。")
+                source_path = _safe_vault_path(self.config.vault, Path(str(session["path"])))
+                draft_root = self.config.vault / "knowledge" / "planning" / "drafts" / plan_id
+                prompt_path = draft_root / "generation-prompt.md"
+                base_prompt = (Path(__file__).parent / "prompts" / "issue-card.md").read_text(encoding="utf-8")
+                scope = confirmed_planning_context(plan)
+                if not scope:
+                    raise ValueError("没有用户逐项确认的知识条目，不能生成草稿。")
+                atomic_write_text(prompt_path, base_prompt + "\n\n# 用户确认的沉淀范围\n```json\n" + json.dumps(scope, ensure_ascii=False, indent=2) + "\n```\n只生成上述范围对应的内容。\n")
+                generated = OpenCodeClient(self.config.opencode_command).run_generation(
+                    source_path, prompt_path, self.config.vault, model=str(body.get("model") or self.config.model or "") or None,
+                    timeout=int(body.get("timeout") or 1800),
+                )
+                self._ok(save_planning_draft(self.config, plan_id, generated))
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/publish"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/publish")).rstrip("/")
+                selected = body.get("selected")
+                if not isinstance(selected, list):
+                    raise ValueError("selected 必须是数组。")
+                published = publish_planning_plan(self.config, plan_id, [str(item) for item in selected], reindex=bool(body.get("reindex", True)))
+                derivatives: Dict[str, Any] = {"wiki": None, "search": None, "secall": None}
+                try:
+                    if "wiki" in selected:
+                        wiki_plan = create_wiki_plan(self.config, reason=f"planning-publish:{plan_id}")
+                        derivatives["wiki"] = apply_wiki_plan(self.config, wiki_plan["plan_id"])
+                    if bool(body.get("reindex", True)):
+                        derivatives["secall"] = Runner(self.config.secall_command).run("reindex", "--from-vault", timeout=600).stdout.strip()
+                    derivatives["search"] = self._refresh_search()
+                    published = mark_planning_index_result(self.config, plan_id, True, "派生索引已同步")
+                except Exception as exc:
+                    published = mark_planning_index_result(self.config, plan_id, False, str(exc))
+                    derivatives["error"] = str(exc)
+                self._ok({"plan": published, "derivatives": derivatives})
+            elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/retry-index"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/retry-index")).rstrip("/")
+                plan = read_planning_plan(self.config, plan_id)
+                if plan.get("status") != "published":
+                    raise ValueError("只有已发布的知识策划可以重试索引同步。")
+                try:
+                    secall = Runner(self.config.secall_command).run("reindex", "--from-vault", timeout=600).stdout.strip()
+                    search = self._refresh_search()
+                    self._ok({"plan": mark_planning_index_result(self.config, plan_id, True, "派生索引已同步"), "secall": secall, "search": search})
+                except Exception as exc:
+                    self._ok({"plan": mark_planning_index_result(self.config, plan_id, False, str(exc)), "error": str(exc)})
             elif parsed.path == "/api/pipeline":
                 reindex_requested = bool(body.get("reindex", True))
                 result = run_session_pipeline(
@@ -1014,6 +1275,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     overwrite=bool(body.get("overwrite")),
                     timeout=int(body.get("timeout") or 1800),
                 )
+                # Planning is intentionally isolated: do not refresh derived
+                # data or materialize Wiki views until final publication.
+                self._ok(result)
+                return
                 wiki_sync = sync_wiki_knowledge_views(self.config)
                 if reindex_requested:
                     search_started = time.monotonic()
@@ -1236,6 +1501,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             body = self._json_body()
             if not isinstance(body, dict):
                 raise ValueError("请求体必须是 JSON 对象。")
+            if parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/draft"):
+                plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/draft")).rstrip("/")
+                self._ok(update_planning_draft(self.config, plan_id, body))
+                return
             if parsed.path == "/api/wiki/config":
                 self._ok(update_wiki_config(self.config, body))
                 return

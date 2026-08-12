@@ -5,7 +5,7 @@ from secall_opencode.opencode_client import Runner
 from secall_opencode.server import run_session_pipeline
 
 
-def test_pipeline_reuses_existing_knowledge_without_calling_model(
+def test_pipeline_starts_isolated_planning_without_changing_formal_knowledge(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -43,9 +43,13 @@ def test_pipeline_reuses_existing_knowledge_without_calling_model(
 
     result = run_session_pipeline(config, session_id, overwrite=False)
 
-    assert result["reused"] is True
-    assert result["knowledge"]["qa_count"] == 1
+    assert result["reused"] is False
+    assert result["knowledge"]["qa_count"] == 0
     assert result["knowledge"]["new_qa_count"] == 0
-    assert len(result["stages"]) == 5
+    assert result["planning_plan_id"].startswith("plan-")
+    assert result["planning_status"] == "candidate_selection"
+    assert len(result["stages"]) == 3
     assert result["requires_review"] is True
-    assert result["wiki_plan_id"].startswith("wiki-")
+    assert result["wiki_plan_id"] == ""
+    assert issue_path.read_text(encoding="utf-8").endswith("# 已有知识\n")
+    assert qa_path.read_text(encoding="utf-8").count("qa-1") == 1
