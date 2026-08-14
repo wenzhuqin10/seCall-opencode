@@ -9,6 +9,7 @@ from secall_opencode.knowledge_planning import (
     confirm_scope,
     create_plan,
     publish_plan,
+    migrate_legacy_planning_qa,
     read_draft,
     save_draft,
     save_candidate_revision,
@@ -102,7 +103,47 @@ review_status: pending
     assert result["status"] == "published"
     assert (tmp_path / "wiki" / "issues" / "demo-session-1.md").exists()
     qa = (tmp_path / "knowledge" / "qa" / "candidates.jsonl").read_text(encoding="utf-8")
-    assert '"review_status": "approved"' in qa
+    assert '"review_status": "pending"' in qa
+    assert '"review_origin": "knowledge_planning"' in qa
+    assert '"submitted_by_plan":' in qa
+
+
+def test_migrate_legacy_planning_qa_preserves_human_review(tmp_path: Path):
+    config, plan = _create(tmp_path)
+    root = tmp_path / "knowledge" / "planning"
+    qa_path = tmp_path / "knowledge" / "qa" / "candidates.jsonl"
+    qa_path.parent.mkdir(parents=True)
+    plan.update({
+        "status": "published",
+        "published": {
+            "selected": ["knowledge", "qa"],
+            "knowledge_id": "issue-1",
+            "qa_added": 2,
+            "at": "2026-08-13T00:00:00+00:00",
+        },
+    })
+    (root / f"{plan['plan_id']}.json").write_text(
+        json.dumps(plan, ensure_ascii=False), encoding="utf-8"
+    )
+    qa_path.write_text(
+        "\n".join([
+            json.dumps({"id": "legacy", "source_session": "session-1", "knowledge_id": "issue-1", "review_status": "approved"}, ensure_ascii=False),
+            json.dumps({"id": "human", "source_session": "session-1", "knowledge_id": "issue-1", "review_status": "approved", "reviewed_at": "2026-08-13T01:00:00+00:00", "reviewed_by": "local_user"}, ensure_ascii=False),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_legacy_planning_qa(config)
+    items = [json.loads(line) for line in qa_path.read_text(encoding="utf-8").splitlines()]
+
+    assert result["plans"] == 1
+    assert result["qa_migrated"] == 1
+    assert result["backup"].startswith(".tmp/migrations/qa-before-review-queue-")
+    assert (tmp_path / result["backup"]).exists()
+    assert items[0]["review_status"] == "pending"
+    assert items[0]["migration_reason"] == "legacy_planning_bypassed_qa_review"
+    assert items[1]["review_status"] == "approved"
+    assert migrate_legacy_planning_qa(config) == {"plans": 0, "qa_migrated": 0, "backup": ""}
 
 
 def test_publish_finds_legacy_session_by_frontmatter_not_file_name(tmp_path: Path):

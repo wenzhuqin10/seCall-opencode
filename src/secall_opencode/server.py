@@ -4,6 +4,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,7 @@ from .knowledge_planning import (
     create_plan as create_planning_plan,
     list_plans as list_planning_plans,
     mark_index_result as mark_planning_index_result,
+    migrate_legacy_planning_qa,
     publish_plan as publish_planning_plan,
     read_candidate as read_planning_candidate,
     read_draft as read_planning_draft,
@@ -1453,6 +1455,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                                 " evidence_event_ids 后才能通过审核。"
                             )
                         item["review_status"] = status
+                        if status in {"approved", "rejected"}:
+                            item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
+                            item["reviewed_by"] = "local_user"
+                        else:
+                            item.pop("reviewed_at", None)
+                            item.pop("reviewed_by", None)
                         matched = True
                         break
                 if not matched:
@@ -1591,6 +1599,7 @@ def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
         raise ValueError("本地 API 默认只允许绑定回环地址。")
     migration = migrate_legacy_sessions(config)
     structured_migration = backfill_structured_knowledge(config)
+    planning_qa_migration = migrate_legacy_planning_qa(config)
     if migration.get("staged"):
         try:
             Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)
@@ -1606,6 +1615,7 @@ def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
     print(f"seCall OpenCode Local API: http://{host}:{port}")
     print(f"会话生命周期迁移：{migration}")
     print(f"结构化知识兼容迁移：{structured_migration}")
+    print(f"知识策划 QA 审核队列迁移：{planning_qa_migration}")
     print("按 Ctrl+C 停止服务。")
     try:
         server.serve_forever()

@@ -284,8 +284,92 @@ def _append_selected_qa(config: Config, plan: Mapping[str, Any], qa: Sequence[Ma
     for item in qa:
         record = dict(item); record.setdefault("id", f"qa-{uuid.uuid4().hex[:12]}")
         if str(record["id"]) in known: continue
-        record.update({"source_session": plan["session_id"], "project": plan["project"], "knowledge_id": knowledge_id, "review_status": "approved"}); existing.append(record); known.add(str(record["id"])); added += 1
+        record.update({
+            "source_session": plan["session_id"],
+            "project": plan["project"],
+            "knowledge_id": knowledge_id,
+            "review_status": "pending",
+            "review_origin": "knowledge_planning",
+            "submitted_by_plan": plan["plan_id"],
+            "submitted_at": _now(),
+        }); existing.append(record); known.add(str(record["id"])); added += 1
     atomic_write_text(path, "\n".join(json.dumps(item, ensure_ascii=False) for item in existing) + ("\n" if existing else "")); return added
+
+
+def migrate_legacy_planning_qa(config: Config) -> Dict[str, Any]:
+    """Move legacy planner-approved QA into the dedicated review queue once.
+
+    Older planning releases marked generated QA as ``approved`` immediately.
+    Only QA tied to a published planning record without the v2 queue marker and
+    without human-review audit fields are migrated, so manually reviewed QA are
+    left unchanged.
+    """
+    qa_path = config.vault / config.qa_file
+    if not qa_path.exists() or not _root(config).exists():
+        return {"plans": 0, "qa_migrated": 0, "backup": ""}
+    original_qa = qa_path.read_text(encoding="utf-8", errors="replace")
+    qa_items: List[Dict[str, Any]] = []
+    for line in original_qa.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict):
+            qa_items.append(item)
+    migrated = 0
+    migrated_plans = 0
+    for plan_path in sorted(_root(config).glob("plan-*.json")):
+        try:
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(plan, dict) or plan.get("status") != "published":
+            continue
+        published = dict(plan.get("published") or {})
+        if "qa" not in set(str(value) for value in published.get("selected") or []):
+            continue
+        if int(published.get("qa_review_queue_version") or 1) >= 2:
+            continue
+        knowledge_id = str(published.get("knowledge_id") or "")
+        session_id = str(plan.get("session_id") or "")
+        plan_migrated = 0
+        for item in qa_items:
+            if (
+                str(item.get("knowledge_id") or "") == knowledge_id
+                and str(item.get("source_session") or "") == session_id
+                and item.get("review_status") == "approved"
+                and not item.get("reviewed_at")
+                and not item.get("reviewed_by")
+            ):
+                item.update({
+                    "review_status": "pending",
+                    "review_origin": "knowledge_planning",
+                    "submitted_by_plan": plan.get("plan_id"),
+                    "submitted_at": published.get("at") or _now(),
+                    "migration_reason": "legacy_planning_bypassed_qa_review",
+                })
+                plan_migrated += 1
+        published.update({
+            "qa_review_queue_version": 2,
+            "qa_review_queue_migrated_at": _now(),
+            "qa_review_queue_migrated_count": plan_migrated,
+        })
+        plan["published"] = published
+        _write(config, plan)
+        migrated += plan_migrated
+        migrated_plans += 1
+    backup_path = ""
+    if migrated:
+        backup = config.vault / ".tmp" / "migrations" / (
+            f"qa-before-review-queue-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+        )
+        atomic_write_text(backup, original_qa)
+        backup_path = backup.relative_to(config.vault).as_posix()
+        atomic_write_text(
+            qa_path,
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in qa_items) + "\n",
+        )
+    return {"plans": migrated_plans, "qa_migrated": migrated, "backup": backup_path}
 
 
 def _resolve_source_session(config: Config, plan: Mapping[str, Any]) -> Path | None:
@@ -332,7 +416,7 @@ def publish_plan(config: Config, plan_id: str, selected: Sequence[str], *, reind
     if not generated.exists(): raise FileNotFoundError("知识草稿原文丢失，无法发布。")
     result = store_knowledge(generated.read_text(encoding="utf-8"), source_file.read_text(encoding="utf-8"), config.vault, config.knowledge_dir, config.qa_file, include_qa=False)
     added = _append_selected_qa(config, plan, draft.get("qa") or [], result.issue_path.stem) if "qa" in requested else 0
-    plan.update({"source_path": _source_relative_path(config, source_file), "status": "published", "published": {"selected": sorted(requested), "knowledge_id": result.issue_path.stem, "qa_added": added, "at": _now()}, "index_status": "pending" if reindex else "not_requested"})
+    plan.update({"source_path": _source_relative_path(config, source_file), "status": "published", "published": {"selected": sorted(requested), "knowledge_id": result.issue_path.stem, "qa_added": added, "at": _now(), "qa_review_queue_version": 2}, "index_status": "pending" if reindex else "not_requested"})
     return _write(config, plan) | {"published": plan["published"]}
 
 
