@@ -235,6 +235,81 @@ def _valid_page_name(value: str) -> bool:
     return len(clean) >= 2 and "�" not in clean and any(char.isalnum() for char in clean)
 
 
+def _stable_module_name(value: str) -> str:
+    """Accept explicit business module names, not paths or source files."""
+
+    clean = str(value or "").strip()
+    if not _valid_page_name(clean):
+        return ""
+    if any(separator in clean for separator in ("/", "\\")):
+        return ""
+    if re.search(r"\.(?:c|cc|cpp|h|hpp|py|js|ts|tsx|java|rs|go)$", clean, re.IGNORECASE):
+        return ""
+    if len(clean) > 64 or re.fullmatch(r"[A-Za-z]", clean):
+        return ""
+    return clean
+
+
+def _explicit_wiki_request(enriched: Mapping[str, Any], category: str, name: str) -> bool:
+    """Check the structured extractor's explicit page request, if present."""
+
+    structured = enriched.get("structured") or {}
+    if category == "modules":
+        # A stable module emitted in code_entities is an explicit business
+        # boundary.  Paths and leaf directories were filtered by
+        # _stable_module_name before reaching this function.
+        raw_modules = (structured.get("code_entities") or {}).get("modules", [])
+        if name.casefold() in {_stable_module_name(value).casefold() for value in _string_values(raw_modules)}:
+            return True
+    if category == "topics":
+        # A topic with both a description and event evidence is already a
+        # confirmed structured claim, even when older sidecars predate
+        # wiki_actions.
+        for topic in _records(structured.get("topics")):
+            if _record_text(topic).casefold() == name.casefold() and (
+                topic.get("description") and topic.get("evidence_event_ids")
+            ):
+                return True
+    for raw in _records(structured.get("wiki_actions")):
+        action = str(raw.get("action") or raw.get("operation") or "").casefold()
+        if action and action in {"ignore", "skip", "archive", "delete"}:
+            continue
+        raw_category = str(raw.get("category") or raw.get("page_type") or raw.get("type") or "").casefold()
+        raw_name = _record_text(raw) or str(raw.get("target") or raw.get("page") or "").strip()
+        normalized_category = {"project": "projects", "module": "modules", "topic": "topics"}.get(raw_category, raw_category)
+        if normalized_category == category and raw_name.casefold() == name.casefold():
+            return True
+    return False
+
+
+def _distinct_card_ids(items: Sequence[Mapping[str, Any]]) -> set[str]:
+    return {
+        str(item.get("id") or item.get("detail", {}).get("id") or item.get("source_session") or "")
+        for item in items
+        if str(item.get("id") or item.get("detail", {}).get("id") or item.get("source_session") or "")
+    }
+
+
+def _has_runbook_evidence(item: Mapping[str, Any]) -> bool:
+    record = item.get("record") or {}
+    steps = record.get("steps") or record.get("procedure")
+    if not isinstance(steps, (list, tuple)) or not steps:
+        return False
+    has_scope = any(record.get(key) for key in ("preconditions", "conditions", "scope", "applicable_when"))
+    has_verification = any(record.get(key) for key in ("verification", "completion", "expected", "result", "outcome"))
+    grounded = bool(record.get("evidence_event_ids"))
+    return (has_scope and has_verification) or grounded
+
+
+def _has_test_evidence(item: Mapping[str, Any]) -> bool:
+    record = item.get("record") or {}
+    has_input = any(record.get(key) for key in ("input", "inputs", "environment", "test_input", "description"))
+    has_process = any(record.get(key) for key in ("steps", "procedure", "process", "command"))
+    has_result = any(record.get(key) for key in ("result", "results", "actual", "outcome", "expected"))
+    grounded = bool(record.get("evidence_event_ids"))
+    return (has_input and has_process and has_result) or (grounded and has_input)
+
+
 def _record_text(item: Mapping[str, Any]) -> str:
     for key in ("name", "title", "topic", "claim", "description", "conclusion", "question"):
         value = str(item.get(key) or "").strip()
@@ -322,8 +397,9 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
         projects[str(card.get("project") or "未分类")].append(enriched)
         raw_modules = (structured.get("code_entities") or {}).get("modules", [])
         for module in _string_values(raw_modules):
-            if _valid_page_name(module):
-                modules[module].append(enriched)
+            stable_module = _stable_module_name(module)
+            if stable_module:
+                modules[stable_module].append(enriched)
         for item in _records(structured.get("topics")):
             name = _record_text(item)
             if name:
@@ -345,7 +421,7 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
         for item in _records(structured.get("runbook")):
             steps = item.get("steps") or item.get("procedure")
             name = _record_text(item) or str(detail.get("title") or "")
-            if name and steps:
+            if name and steps and _has_runbook_evidence({**enriched, "record": item}):
                 runbooks[name].append({**enriched, "record": item})
         test_records = _records(structured.get("test_knowledge"))
         verification = structured.get("verification") or {}
@@ -358,8 +434,24 @@ def _desired_pages(config: Config) -> Dict[str, Dict[str, Any]]:
                     test_records.append({"name": str(case), "description": str(case)})
         for item in test_records:
             name = _record_text(item)
-            if name and _valid_page_name(name):
+            if name and _valid_page_name(name) and _has_test_evidence({**enriched, "record": item}):
                 tests[name].append({**enriched, "record": item})
+
+    # Aggregates are intentionally conservative.  A single card is the
+    # canonical source, not enough evidence for a new module/topic page unless
+    # the extractor recorded an explicit Wiki action.
+    modules = {
+        name: items
+        for name, items in modules.items()
+        if len(_distinct_card_ids(items)) >= 2
+        or any(_explicit_wiki_request(item, "modules", name) for item in items)
+    }
+    topics = {
+        name: items
+        for name, items in topics.items()
+        if len(items) >= 2
+        or any(_explicit_wiki_request(item, "topics", name) for item in items)
+    }
 
     overview_sources = _unique(str(card.get("source_session") or "") for card in cards)
     overview_lines = [

@@ -17,6 +17,9 @@
 }
 
 .planning-workspace { display: grid; grid-template-columns: minmax(280px, .9fr) minmax(360px, 1.1fr); gap: 18px; align-items: start; }
+.planning-draft-workspace { display: block; }
+.planning-draft-workspace .planning-candidates { display: none; }
+.planning-draft-workspace .planning-review { grid-column: 1 / -1; }
 .planning-workspace .panel { padding: 20px; }
 .planning-wizard-stage { padding: 22px; margin-bottom: 18px; border: 1px solid #ddd7ff; box-shadow: 0 12px 34px rgba(100, 76, 220, .08); }
 .planning-generation-status { margin: 4px 0 18px; padding: 16px 18px; border: 1px solid #dcd4ff; border-radius: 14px; background: linear-gradient(135deg, #faf8ff, #f2efff); box-shadow: 0 10px 28px rgba(103, 78, 218, .1); }
@@ -67,6 +70,7 @@
 .planning-wiki-preview small { margin-left: 8px; color: var(--muted); }
 .planning-publish { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 20px; border-top: 1px solid var(--line); padding-top: 16px; }
 .planning-publish small { width: 100%; color: var(--muted); }
+.muted-copy { color: var(--muted); line-height: 1.6; }
 @media (max-width: 980px) { .planning-workspace { grid-template-columns: 1fr; } .planning-candidates, .planning-review { grid-row: auto; grid-column: auto; } }
 
 * { box-sizing: border-box; }
@@ -285,6 +289,19 @@ code, kbd { font-family: var(--font-geist-mono), "SFMono-Regular", Consolas, mon
 .ghost-button span { color: var(--purple); }
 
 .subpage { animation: enter .3s ease; }
+.knowledge-center-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 18px; padding: 5px; border: 1px solid #e3dff0; border-radius: 13px; background: #fbfaff; }
+.knowledge-center-tabs button { min-height: 32px; padding: 0 12px; border: 0; border-radius: 9px; color: #797282; background: transparent; font-size: 9px; font-weight: 650; }
+.knowledge-center-tabs button:hover { color: #5f49c8; background: #f0ecff; }
+.knowledge-center-tabs button.active { color: #fff; background: var(--purple); box-shadow: 0 5px 12px #765be833; }
+.knowledge-center-summary { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin: 0 0 18px; padding: 12px 16px; border: 1px solid #e7e2f5; border-radius: 12px; background: #fff; color: #7b7488; font-size: 10px; }
+.knowledge-center-summary strong { color: #5d46c2; }
+.knowledge-linked-qa { margin: 16px 0 18px; padding: 12px 14px; border: 1px solid #e7e2f5; border-radius: 12px; background: #fbfaff; }
+.linked-qa-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.linked-qa-heading h3 { margin: 0; font-size: 12px; }
+.linked-qa-heading span { color: #817a90; font-size: 10px; }
+.knowledge-linked-qa article { display: flex; gap: 10px; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid #ece8f4; }
+.knowledge-linked-qa article strong { flex: 1; color: #4c4655; font-size: 10px; line-height: 1.5; }
+.knowledge-linked-qa article .review-pill { position: static; white-space: nowrap; }
 @keyframes enter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
 .subpage-heading { min-height: 102px; display: flex; align-items: flex-start; justify-content: space-between; }
 .import-actions { display: flex; align-items: center; gap: 8px; }
@@ -550,6 +567,8 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .markdown-viewer h3 { margin: 23px 0 9px; font-size: 12px; }
 .markdown-viewer p, .markdown-list, .markdown-viewer blockquote { color: #59545f; font-size: 10px; line-height: 1.9; }
 .markdown-viewer p { margin: 8px 0; white-space: pre-wrap; }
+.markdown-wikilink { padding: 0 4px; border: 0; border-bottom: 1px solid #a78cf0; color: #6549c6; background: transparent; font: inherit; cursor: pointer; }
+.markdown-wikilink:hover { color: #4b31a5; background: #f0ecff; }
 .markdown-list { display: flex; gap: 9px; margin: 4px 0; }
 .markdown-list i { width: 5px; height: 5px; flex: 0 0 auto; margin-top: 7px; border-radius: 50%; background: var(--purple); }
 .markdown-viewer blockquote { margin: 15px 0; padding: 11px 15px; border-left: 3px solid #8a72e8; border-radius: 0 8px 8px 0; background: #f8f5ff; }

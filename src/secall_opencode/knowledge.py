@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -68,6 +69,67 @@ def split_document_and_qa(text: str) -> Tuple[str, List[Dict[str, Any]]]:
     return document, qa
 
 
+_CANONICAL_SECTIONS = (
+    "适用场景",
+    "问题或任务",
+    "确认结论",
+    "解决方法",
+    "验证结果",
+    "证据与来源",
+)
+
+
+def _canonical_section(heading: str) -> str:
+    normalized = re.sub(r"[\s：:()（）/\\_-]+", "", heading).casefold()
+    if any(token in normalized for token in ("适用场景", "场景", "context", "environment")):
+        return "适用场景"
+    if any(token in normalized for token in ("问题", "现象", "任务", "problem", "symptom")):
+        return "问题或任务"
+    if any(token in normalized for token in ("根因", "结论", "诊断", "分析", "conclusion", "rootcause")):
+        return "确认结论"
+    if any(token in normalized for token in ("修复", "解决", "定位", "排查", "步骤", "方案", "fix", "solution", "runbook")):
+        return "解决方法"
+    if any(token in normalized for token in ("验证", "测试", "回归", "verification", "test")):
+        return "验证结果"
+    return "证据与来源"
+
+
+def _canonicalize_document(document: str) -> str:
+    """Keep new cards compact while preserving all legacy section content."""
+
+    text = document.strip()
+    frontmatter = ""
+    body = text
+    if text.startswith("---"):
+        match = re.match(r"(?s)^---\s*\n(.*?)\n---\s*\n?(.*)$", text)
+        if match:
+            frontmatter = match.group(1).strip()
+            body = match.group(2).strip()
+    title_match = re.search(r"(?m)^#\s+(.+?)\s*$", body)
+    if not title_match:
+        return document.rstrip() + "\n"
+    title = title_match.group(1).strip()
+    after_title = body[title_match.end():]
+    matches = list(re.finditer(r"(?m)^##\s+(.+?)\s*$", after_title))
+    buckets: Dict[str, List[str]] = {heading: [] for heading in _CANONICAL_SECTIONS}
+    intro = after_title[: matches[0].start()].strip() if matches else after_title.strip()
+    if intro:
+        buckets["问题或任务"].append(intro)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(after_title)
+        content = after_title[match.end():end].strip()
+        if content:
+            buckets[_canonical_section(match.group(1))].append(content)
+    if not any(buckets.values()):
+        return document.rstrip() + "\n"
+    if "schema_version:" not in frontmatter:
+        frontmatter = (frontmatter + "\n" if frontmatter else "") + "schema_version: 2"
+    lines = ["---", frontmatter, "---", "", f"# {title}", ""]
+    for heading in _CANONICAL_SECTIONS:
+        lines.extend([f"## {heading}", "", "\n\n".join(buckets[heading]).strip(), ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def store_knowledge(
     generated: str,
     source_markdown: str,
@@ -78,6 +140,7 @@ def store_knowledge(
     include_qa: bool = True,
 ) -> KnowledgeResult:
     document, candidates, structured_payload = split_generated_output(generated)
+    document = _canonicalize_document(document)
     session_id = _frontmatter_value(source_markdown, "session_id")
     project = _frontmatter_value(source_markdown, "project") or "unknown"
     if not session_id:
@@ -118,11 +181,15 @@ def store_knowledge(
     slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff-]+", "-", project).strip("-").lower()
     issue_path = vault / knowledge_dir / f"{slug}-{session_id[:12]}.md"
     knowledge_id = issue_path.stem
+    candidates = candidates[:3]
+    knowledge_version = hashlib.sha256(document.encode("utf-8")).hexdigest()
     for item in candidates:
         item.setdefault("source_session", session_id)
         item.setdefault("knowledge_id", knowledge_id)
         item.setdefault("project", project)
         item.setdefault("review_status", "pending")
+        item.setdefault("review_origin", "knowledge_pipeline")
+        item.setdefault("knowledge_version", knowledge_version)
         item.setdefault("evidence_event_ids", [])
         item.setdefault("related_files", [])
         item.setdefault("related_functions", [])
@@ -136,17 +203,35 @@ def store_knowledge(
         ]
 
     qa_path = vault / qa_file
+    previous_document = ""
+    had_existing_document = issue_path.exists()
+    if had_existing_document:
+        previous_document = issue_path.read_text(encoding="utf-8")
     if issue_path.exists() and not overwrite:
-        existing = issue_path.read_text(encoding="utf-8")
+        existing = previous_document
         if existing != document:
             raise FileExistsError(
                 f"Issue Card 已存在且内容不同：{issue_path}；使用 --overwrite 覆盖。"
             )
 
     structured_file = store_structured_knowledge(vault, structured)
+    from .config import Config
+    from .knowledge_store import atomic_write_text, mark_qa_stale_for_knowledge
+
     issue_path.parent.mkdir(parents=True, exist_ok=True)
     if overwrite or not issue_path.exists():
-        issue_path.write_text(document, encoding="utf-8")
+        atomic_write_text(issue_path, document)
+    # QA is derived from the card body.  Keep this invariant for every
+    # publishing path (CLI, pipeline and API), not only the editor endpoint.
+    # The import is local to avoid coupling the knowledge writer to the
+    # higher-level store module during package import.
+    if had_existing_document and previous_document != document:
+        mark_qa_stale_for_knowledge(
+            Config(vault=vault, knowledge_dir=knowledge_dir, qa_file=qa_file),
+            knowledge_id,
+            knowledge_version,
+            source_session=session_id,
+        )
     qa_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Draft-first publishing may persist the Issue Card before its candidate QA
@@ -176,9 +261,8 @@ def store_knowledge(
         if str(item["id"]) not in existing_ids:
             new_lines.append(json.dumps(item, ensure_ascii=False))
     if new_lines:
-        with qa_path.open("a", encoding="utf-8", newline="\n") as handle:
-            for line in new_lines:
-                handle.write(line + "\n")
+        existing_text = qa_path.read_text(encoding="utf-8") if qa_path.exists() else ""
+        atomic_write_text(qa_path, existing_text + "\n".join(new_lines) + "\n")
     return KnowledgeResult(
         issue_path,
         qa_path,

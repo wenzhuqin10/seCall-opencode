@@ -28,7 +28,7 @@ WIKI_CATEGORIES = (
     "tests",
     "issues",
 )
-CORE_GRAPH_TYPES = {"issue", "project", "module", "session", "topic", "wiki_page"}
+CORE_GRAPH_TYPES = {"issue", "project", "module", "session", "topic"}
 CATEGORY_LABELS = {
     "overview": "知识总览",
     "projects": "项目",
@@ -84,6 +84,26 @@ def _entity_slug(value: str) -> str:
     value = re.sub(r"[\\/:*?\"<>|#\[\]]+", "-", value)
     value = re.sub(r"\s+", "-", value)
     return re.sub(r"-+", "-", value).strip("-.")[:96] or "untitled"
+
+
+def _graph_module_name(value: str) -> str:
+    """Return a stable business/module label, or an empty value for file paths.
+
+    Code evidence may contain thousands of file paths and leaf directories.  They
+    are useful on a knowledge card but must not become first-class graph nodes.
+    Keep only explicit, human-sized module names here; the Wiki maintenance
+    planner applies the same rule when creating aggregate pages.
+    """
+    label = str(value or "").strip()
+    if not label or len(label) > 64:
+        return ""
+    if any(token in label for token in ("/", "\\", ".c", ".h", ".cpp", ".py", ".rs")):
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9]", label):
+        return ""
+    if label.lower() in {"src", "include", "lib", "bin", "build", "test", "tests", "docs"}:
+        return ""
+    return label
 
 
 def _replace_derived_block(markdown: str, block: str) -> str:
@@ -306,10 +326,12 @@ def list_wiki_pages(
     category: str = "all",
     query: str = "",
     limit: int = 500,
+    *,
+    include_issues: bool = True,
 ) -> Dict[str, Any]:
     if category != "all":
         _validate_category(category)
-    pages = list(iter_wiki_pages(config))
+    pages = list(iter_wiki_pages(config, include_issues=include_issues))
     if category != "all":
         pages = [item for item in pages if item["category"] == category]
     normalized = query.strip().lower()
@@ -502,30 +524,14 @@ def purge_all_wiki_archive(config: Config) -> Dict[str, Any]:
 
 def graph_snapshot(config: Config) -> Dict[str, Any]:
     path = config.vault / "graph" / "graph.json"
-    if not path.exists():
-        return {
-            "directed": True,
-            "multigraph": False,
-            "nodes": [],
-            "links": [],
-            "stats": {
-                "nodes": 0,
-                "links": 0,
-                "types": {
-                    node_type: 0
-                    for node_type in (
-                        "issue", "project", "module", "session", "topic", "wiki_page"
-                    )
-                },
-                "evidence": {
-                    key: 0
-                    for key in (
-                        "files", "functions", "commits", "root_causes", "test_cases"
-                    )
-                },
-            },
-        }
-    value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    # The graph is a rebuildable derivative.  Treat a missing graph file as an
+    # empty seed and derive the current core nodes from the active Wiki/card
+    # files below; this keeps local deployments useful even when the external
+    # seCall CLI is not installed.
+    if path.exists():
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    else:
+        value = {"directed": True, "multigraph": False, "nodes": [], "links": []}
     if not isinstance(value, dict):
         raise ValueError("知识图谱快照格式无效。")
     nodes = value.get("nodes") if isinstance(value.get("nodes"), list) else []
@@ -550,7 +556,12 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
     node_map = {
         str(node.get("id")): dict(node)
         for node in nodes
-        if isinstance(node, dict) and node.get("id")
+        if isinstance(node, dict)
+        and node.get("id")
+        and not (
+            str(node.get("type") or "") == "module"
+            and not _graph_module_name(str(node.get("label") or node.get("id") or ""))
+        )
     }
     for node_id, node in node_map.items():
         node["label"] = _localize_display_text(str(node.get("label") or node_id))
@@ -599,9 +610,12 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
                 "id": wiki_node_id, "label": page["title"], "type": "project",
             })
         elif category == "modules":
+            module_label = _graph_module_name(str(page["title"] or page["slug"] or ""))
+            if not module_label:
+                continue
             wiki_node_id = f"module:{page['slug']}"
             node_map.setdefault(wiki_node_id, {
-                "id": wiki_node_id, "label": page["title"], "type": "module",
+                "id": wiki_node_id, "label": module_label, "type": "module",
                 "project": page["project"],
             })
         elif category == "topics":
@@ -611,12 +625,10 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
                 "project": page["project"],
             })
         else:
-            wiki_node_id = f"wiki:{page['id']}"
-            node_map[wiki_node_id] = {
-                "id": wiki_node_id, "label": page["title"], "type": "wiki_page",
-                "category": category, "category_label": page["category_label"],
-                "project": page["project"],
-            }
+            # Decision/Runbook/Test pages are navigation views, not graph
+            # entities.  Their evidence remains on the knowledge card and
+            # the relationship graph stays at the core abstraction level.
+            continue
         node_map[wiki_node_id]["wiki_id"] = page["id"]
         derived_edges: List[tuple[str, str, str]] = []
         page_markdown = (config.vault / page["path"]).read_text(
@@ -660,6 +672,18 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             existing_links.add((source, target, relation))
 
     issue_pages = [page for page in iter_wiki_pages(config) if page["category"] == "issues"]
+    active_issue_ids = {f"issue:{page['slug']}" for page in issue_pages}
+
+    # Do not carry deleted canonical cards forward from a stale graph export.
+    # Aggregate pages are allowed to exist without a card for backwards
+    # compatibility (for example, a manually authored topic), so only issue
+    # nodes are filtered here; reachability below removes their orphaned
+    # project/session/module links.
+    node_map = {
+        node_id: node
+        for node_id, node in node_map.items()
+        if node.get("type") != "issue" or node_id in active_issue_ids
+    }
     issue_by_session = {
         str(page["source_session"]): f"issue:{page['slug']}"
         for page in issue_pages
@@ -729,7 +753,9 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             derived_edges.append((issue_id, entity_id, relation))
 
         for module in entities.get("modules", []) if isinstance(entities, dict) else []:
-            add_entity("module", str(module), "affects", node_suffix=_entity_slug(str(module)))
+            module_name = _graph_module_name(str(module))
+            if module_name:
+                add_entity("module", module_name, "affects", node_suffix=_entity_slug(module_name))
 
         for raw_topic in structured.get("topics", []) if isinstance(structured.get("topics"), list) else []:
             if isinstance(raw_topic, dict):
@@ -765,8 +791,10 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             derived_edges.append((issue_id, test_page, "verified_by"))
         for decision_page in source_wiki.get("decisions", []):
             for module in entities.get("modules", []) if isinstance(entities, dict) else []:
-                module_id = f"module:{str(module).strip()}"
-                derived_edges.append((module_id, decision_page, "implements_decision"))
+                module_name = _graph_module_name(str(module))
+                if module_name:
+                    module_id = f"module:{_entity_slug(module_name)}"
+                    derived_edges.append((module_id, decision_page, "implements_decision"))
 
         def evidence_values(key: str) -> List[str]:
             raw = entities.get(key, []) if isinstance(entities, dict) else []
@@ -816,11 +844,38 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
             )
             existing_links.add((source, target, relation))
 
+    # If no active cards or aggregate pages remain, a previous graph export is
+    # entirely stale.  Return an empty core graph instead of resurrecting old
+    # nodes through the legacy fallback roots.
+    active_aggregate_pages = list(iter_wiki_pages(config, include_issues=False))
+    if not active_issue_ids and not active_aggregate_pages:
+        node_map = {}
+        links = []
+
     roots = {
         node_id
         for node_id, node in node_map.items()
-        if node.get("type") in {"issue", "wiki_page"} or node.get("wiki_id")
+        if node.get("type") == "issue"
     }
+    # A standalone aggregate page may be present during a first import before
+    # the registry has been rebuilt.  Keep that page visible for compatibility,
+    # but do not resurrect a registered/stale aggregate after its source cards
+    # have been deleted.
+    if not roots:
+        registry_path = _wiki_root(config) / ".meta" / "page-registry.json"
+        registered_ids: set[str] = set()
+        if registry_path.is_file():
+            try:
+                registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                registered_ids = set((registry.get("pages") or {}).keys())
+            except (OSError, json.JSONDecodeError, AttributeError):
+                registered_ids = set()
+        roots = {
+            node_id
+            for node_id, node in node_map.items()
+            if node.get("type") in {"project", "module", "topic"}
+            and str(node.get("wiki_id") or "") not in registered_ids
+        }
     core_links = [
         link
         for link in links
@@ -882,12 +937,45 @@ def graph_snapshot(config: Config) -> Dict[str, Any]:
     }
 
 
+def rebuild_graph_snapshot(config: Config) -> Dict[str, Any]:
+    """Rebuild and persist the lightweight core graph from current sources.
+
+    The persisted JSON is deliberately only a cache.  Knowledge cards and
+    Wiki Markdown remain the source of truth, so this operation is safe to
+    repeat after publish, delete, restore, or Wiki cleanup.
+    """
+
+    snapshot = graph_snapshot(config)
+    path = config.vault / "graph" / "graph.json"
+    payload = {
+        "directed": snapshot["directed"],
+        "multigraph": snapshot["multigraph"],
+        "nodes": snapshot["nodes"],
+        "links": snapshot["links"],
+    }
+    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return snapshot
+
+
 def rebuild_graph(config: Config) -> Dict[str, Any]:
     runner = Runner(config.secall_command)
-    build = runner.run("graph", "build", "--force", timeout=600)
-    export = runner.run("graph", "export", timeout=120)
+    try:
+        build = runner.run("graph", "build", "--force", timeout=600)
+        export = runner.run("graph", "export", timeout=120)
+        build_output = build.stdout.strip()
+        export_output = export.stdout.strip()
+        source = "secall"
+    except Exception as exc:
+        # Local/OpenCode-only installations may intentionally omit the
+        # external CLI.  The canonical card/Wiki cache is sufficient for a
+        # deterministic graph, so keep the endpoint useful in that mode.
+        build_output = ""
+        export_output = f"fallback: {exc}"
+        source = "local-derived"
+    snapshot = rebuild_graph_snapshot(config)
     return {
-        "build_output": build.stdout.strip(),
-        "export_output": export.stdout.strip(),
-        "graph": graph_snapshot(config),
+        "build_output": build_output,
+        "export_output": export_output,
+        "source": source,
+        "graph": snapshot,
     }

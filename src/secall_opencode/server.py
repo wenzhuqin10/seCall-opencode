@@ -41,9 +41,11 @@ from .knowledge_planning import (
 )
 from .knowledge_store import (
     atomic_write_text,
+    backfill_qa_metadata,
     delete_knowledge_document,
     list_knowledge_documents,
     list_knowledge_trash,
+    mark_qa_stale_for_knowledge,
     purge_all_knowledge_derivatives,
     read_knowledge_document,
     reconcile_qa_with_knowledge_trash,
@@ -78,6 +80,7 @@ from .wiki_store import (
     purge_all_wiki_archive,
     purge_wiki_archive,
     read_wiki_page,
+    rebuild_graph_snapshot,
     rebuild_graph,
     restore_wiki_page,
     sync_wiki_knowledge_views,
@@ -426,6 +429,132 @@ def write_qa(config: Config, items: List[Dict[str, Any]]) -> None:
     atomic_write_text(path, payload)
 
 
+def knowledge_center_summary(config: Config) -> Dict[str, Any]:
+    """Return the canonical/derived split used by the unified Knowledge Center."""
+
+    cards = list_knowledge_documents(config, limit=10000)
+    qa = read_qa(config)
+    wiki = list_wiki_pages(config, limit=5000, include_issues=False)
+    graph = graph_snapshot(config)
+    counts = {"pending": 0, "approved": 0, "rejected": 0, "stale": 0}
+    for item in qa:
+        status = str(item.get("review_status") or "pending")
+        counts[status] = counts.get(status, 0) + 1
+    return {
+        "knowledge_count": len(cards),
+        "derived_page_count": len(wiki.get("pages") or []),
+        "wiki_counts": dict(wiki.get("counts") or {}),
+        "qa_approved": counts.get("approved", 0),
+        "qa_pending": counts.get("pending", 0),
+        "qa_rejected": counts.get("rejected", 0),
+        "qa_stale": counts.get("stale", 0),
+        "graph_nodes": int((graph.get("stats") or {}).get("nodes", 0)),
+        "graph_links": int((graph.get("stats") or {}).get("links", 0)),
+    }
+
+
+def regenerate_knowledge_qa(config: Config, knowledge_id: str) -> Dict[str, Any]:
+    """Create up to three grounded QA candidates from the current card.
+
+    The generator is deliberately deterministic.  It keeps the local API
+    usable without an LLM and makes the QA boundary explicit: facts come only
+    from the editable knowledge card and its recorded Session evidence.
+    """
+
+    detail = read_knowledge_document(config, knowledge_id)
+    current_version = str(detail.get("version") or "")
+    stale_result = mark_qa_stale_for_knowledge(
+        config,
+        knowledge_id,
+        current_version,
+        source_session=str(detail.get("source_session") or ""),
+    )
+    section_map = {
+        str(section.get("heading") or "").strip(): str(section.get("content") or "").strip()
+        for section in detail.get("sections") or []
+        if isinstance(section, dict)
+    }
+    title = str(detail.get("title") or detail.get("heading") or knowledge_id)
+    evidence_ids = [
+        str(event.get("event_id") or "")
+        for event in detail.get("events") or []
+        if isinstance(event, dict) and str(event.get("event_id") or "")
+    ][:8]
+    candidates = [
+        (
+            "core_conclusion",
+            f"{title} 的确认结论是什么？",
+            section_map.get("确认结论", ""),
+        ),
+        (
+            "solution",
+            f"{title} 应如何处理？",
+            section_map.get("解决方法", ""),
+        ),
+        (
+            "verification",
+            f"{title} 的适用场景和验证方法是什么？",
+            "\n\n".join(
+                value
+                for value in (
+                    section_map.get("适用场景", ""),
+                    section_map.get("验证结果", ""),
+                )
+                if value
+            ),
+        ),
+    ]
+    path = config.vault / config.qa_file
+    items = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                items.append(value)
+    # Stale records are retained for audit, but never duplicated as active QA.
+    now = datetime.now(timezone.utc).isoformat()
+    added: List[Dict[str, Any]] = []
+    for index, (qa_type, question, answer) in enumerate(candidates, start=1):
+        answer = answer.strip()
+        if not answer:
+            continue
+        base_id = f"qa-{knowledge_id}-{current_version[:12]}-{index}"
+        revision = 1 + sum(
+            1 for value in items
+            if str(value.get("id") or "").startswith(base_id)
+        )
+        item = {
+            "id": f"{base_id}-r{revision}",
+            "question": question,
+            "answer": answer,
+            "qa_type": qa_type,
+            "project": str(detail.get("project") or "unknown"),
+            "source_session": str(detail.get("source_session") or ""),
+            "knowledge_id": knowledge_id,
+            "knowledge_version": current_version,
+            "review_origin": "knowledge_planning",
+            "review_status": "pending",
+            "evidence_event_ids": evidence_ids,
+            "confidence": str(detail.get("confidence") or "unknown"),
+            "created_at": now,
+        }
+        items.append(item)
+        added.append(item)
+    write_qa(config, items)
+    return {
+        "knowledge_id": knowledge_id,
+        "knowledge_version": current_version,
+        "qa": added,
+        "count": len(added),
+        "added": len(added),
+        "stale": int(stale_result.get("changed", 0)),
+        "review_status": "pending" if added else "empty",
+    }
+
+
 class ChatGPTImportFailure(RuntimeError):
     def __init__(
         self,
@@ -766,7 +895,7 @@ def run_session_pipeline(
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
-    server_version = "seCallOpenCodeLocal/0.8"
+    server_version = "seCallOpenCodeLocal/0.10"
 
     @property
     def config(self) -> Config:
@@ -915,11 +1044,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return {"keyword": keyword, "semantic": semantic}
 
     def _sync_knowledge_derivatives(self, *, allow_wiki_create: bool = False) -> Dict[str, Any]:
+        qa_metadata = backfill_qa_metadata(self.config)
         qa = reconcile_qa_with_knowledge_trash(self.config)
         wiki = sync_wiki_knowledge_views(self.config, allow_create=allow_wiki_create)
-        graph = graph_snapshot(self.config)
+        graph = rebuild_graph_snapshot(self.config)
         search = self._refresh_search()
         return {
+            "qa_metadata": qa_metadata,
             "qa": qa,
             "wiki": wiki,
             "graph": graph["stats"],
@@ -946,7 +1077,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 sessions = list_vault_sessions(self.config, limit=None)
                 knowledge = list_knowledge(self.config, limit=1000)
                 qa = read_qa(self.config)
-                wiki = list_wiki_pages(self.config, limit=2000)
+                wiki = list_wiki_pages(self.config, limit=2000, include_issues=False)
                 graph = graph_snapshot(self.config)
                 self._ok(
                     {
@@ -960,6 +1091,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         "knowledge": len(knowledge),
                         "qa": len(qa),
                         "pending_qa": sum(item.get("review_status") == "pending" for item in qa),
+                        "approved_qa": sum(item.get("review_status") == "approved" for item in qa),
+                        "stale_qa": sum(item.get("review_status") == "stale" for item in qa),
                         "wiki": wiki["count"],
                         "graph": graph["stats"],
                         "sync": self.server.sync_worker.status(),  # type: ignore[attr-defined]
@@ -1006,17 +1139,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif parsed.path.startswith("/api/knowledge-plans/"):
                 plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/")).rstrip("/")
                 self._ok(read_planning_plan(self.config, plan_id))
+            elif parsed.path == "/api/knowledge-center/summary":
+                self._ok(knowledge_center_summary(self.config))
             elif parsed.path == "/api/knowledge":
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":
                 self._ok(list_knowledge_trash(self.config))
             elif parsed.path == "/api/wiki":
+                include_issues = str(query.get("include_issues", ["1"])[0]).lower() not in {"0", "false", "no"}
                 self._ok(
                     list_wiki_pages(
                         self.config,
                         category=str(query.get("category", ["all"])[0]),
                         query=str(query.get("q", [""])[0]),
                         limit=limit,
+                        include_issues=include_issues,
                     )
                 )
             elif parsed.path == "/api/wiki/config":
@@ -1120,6 +1257,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as exc:
                     self._fail_opencode_import(exc, "写入会话 Vault")
+            elif parsed.path.startswith("/api/knowledge/") and parsed.path.endswith("/qa/regenerate"):
+                knowledge_id = unquote(
+                    parsed.path.removeprefix("/api/knowledge/").removesuffix("/qa/regenerate")
+                ).rstrip("/")
+                result = regenerate_knowledge_qa(self.config, knowledge_id)
+                result["search"] = self._refresh_search()
+                self._ok(result, HTTPStatus.CREATED)
             elif parsed.path.startswith("/api/knowledge-plans/") and parsed.path.endswith("/start-review"):
                 plan_id = unquote(parsed.path.removeprefix("/api/knowledge-plans/").removesuffix("/start-review")).rstrip("/")
                 self._ok(start_planning_review(self.config, plan_id))
@@ -1345,7 +1489,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     raise ValueError("selected_change_ids 必须是数组。")
                 applied = apply_wiki_plan(self.config, plan_id, selected)
                 applied["search"] = self._refresh_search()
-                applied["graph"] = graph_snapshot(self.config)["stats"]
+                applied["graph"] = rebuild_graph_snapshot(self.config)["stats"]
                 self._ok(applied)
             elif (
                 parsed.path.startswith("/api/wiki/plans/")
@@ -1375,7 +1519,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 result = purge_all_knowledge_derivatives(self.config)
                 result["search"] = self._refresh_search()
                 result["wiki"] = list_wiki_pages(self.config, limit=2000)
-                result["graph"] = graph_snapshot(self.config)["stats"]
+                result["graph"] = rebuild_graph_snapshot(self.config)["stats"]
                 self._ok(result)
             elif parsed.path == "/api/sync/now":
                 self._ok(self.server.sync_worker.scan(force=True))  # type: ignore[attr-defined]
@@ -1440,7 +1584,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/qa/review":
                 qa_id = str(body.get("id") or "")
                 status = str(body.get("status") or "")
-                if status not in {"approved", "rejected", "pending"}:
+                if status not in {"approved", "rejected", "pending", "stale"}:
                     raise ValueError("status 必须是 approved、rejected 或 pending。")
                 items = read_qa(self.config)
                 matched = False
@@ -1449,15 +1593,32 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                         if status == "approved" and not (
                             item.get("evidence")
                             or item.get("evidence_event_ids")
+                            or item.get("knowledge_id")
                         ):
                             raise ValueError(
                                 "该 QA 缺少来源证据，补充 evidence 或"
                                 " evidence_event_ids 后才能通过审核。"
                             )
+                        if status == "approved" and item.get("knowledge_id"):
+                            current = read_knowledge_document(
+                                self.config, str(item.get("knowledge_id"))
+                            )
+                            expected_version = str(item.get("knowledge_version") or "")
+                            current_version = str(current.get("version") or "")
+                            if expected_version and expected_version != current_version:
+                                item["review_status"] = "stale"
+                                item["stale_reason"] = "knowledge_version_mismatch"
+                                item["current_knowledge_version"] = current_version
+                                write_qa(self.config, items)
+                                raise RuntimeError("QA knowledge version is stale; regenerate it before approval")
                         item["review_status"] = status
-                        if status in {"approved", "rejected"}:
+                        if status in {"approved", "rejected", "stale"}:
                             item["reviewed_at"] = datetime.now(timezone.utc).isoformat()
                             item["reviewed_by"] = "local_user"
+                            if status == "stale":
+                                item["stale_reason"] = str(
+                                    body.get("reason") or item.get("stale_reason") or "manual"
+                                )
                         else:
                             item.pop("reviewed_at", None)
                             item.pop("reviewed_by", None)
@@ -1600,6 +1761,7 @@ def serve(config: Config, host: str = "127.0.0.1", port: int = 8765) -> None:
     migration = migrate_legacy_sessions(config)
     structured_migration = backfill_structured_knowledge(config)
     planning_qa_migration = migrate_legacy_planning_qa(config)
+    qa_metadata_migration = backfill_qa_metadata(config)
     if migration.get("staged"):
         try:
             Runner(config.secall_command).run("reindex", "--from-vault", timeout=600)

@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 type View = "overview" | "sessions" | "pipeline" | "planning" | "knowledge" | "wiki" | "graph" | "rag" | "qa" | "diagnostics";
 type Toast = { title: string; detail: string } | null;
@@ -36,7 +36,8 @@ type SessionPageResponse = {
 };
 type QaItem = {
   id: string; question: string; answer: string; source: string;
-  confidence: number; type: string; state: string;
+  confidence: number; type: string; state: "pending" | "approved" | "rejected" | "stale"; knowledge_id?: string;
+  knowledge_version?: string; review_origin?: string; stale_reason?: string;
 };
 type KnowledgeItem = {
   id: string; title: string; project: string; summary: string;
@@ -167,6 +168,7 @@ type Health = {
   ready: boolean; api_version: string; vault: string; opencode_version: string;
   models: string[]; configured_model?: string; sessions: number;
   knowledge: number; qa: number; pending_qa: number;
+  approved_qa?: number; stale_qa?: number;
   wiki?: number; graph?: { nodes: number; links: number; types: Record<string, number> };
   sync?: {
     running: boolean; syncing: boolean; last_checked: string; last_synced: string;
@@ -176,6 +178,18 @@ type Health = {
     available: boolean; backend: string; model_dir: string;
     indexed_documents: number; indexed_chunks: number; reason?: string;
   };
+};
+
+type KnowledgeCenterSummary = {
+  knowledge_count: number;
+  derived_page_count: number;
+  wiki_counts: Record<string, number>;
+  qa_approved: number;
+  qa_pending: number;
+  qa_rejected: number;
+  qa_stale: number;
+  graph_nodes: number;
+  graph_links: number;
 };
 
 const demoSessions: SessionItem[] = [
@@ -273,14 +287,13 @@ const navItems: { id: View; label: string; icon: string; badge?: string }[] = [
   { id: "overview", label: "总览", icon: "⌂" },
   { id: "sessions", label: "会话", icon: "◫" },
   { id: "pipeline", label: "流水线", icon: "⌘", badge: "1" },
-  { id: "knowledge", label: "知识库", icon: "◇" },
-  { id: "wiki", label: "Wiki 中心", icon: "▤" },
-  { id: "graph", label: "知识关系图", icon: "◎" },
+  { id: "knowledge", label: "知识中心", icon: "◇" },
   { id: "rag", label: "RAG 问答", icon: "✦" },
   { id: "qa", label: "QA 审核", icon: "✓" },
   { id: "diagnostics", label: "环境诊断", icon: "+" },
 ];
 navItems.splice(3, 0, { id: "planning", label: "知识策划", icon: "◌" });
+navItems.splice(4, 0, navItems.splice(6, 1)[0]);
 
 const wikiCategories = [
   ["all", "全部页面"],
@@ -291,10 +304,72 @@ const wikiCategories = [
   ["decisions", "设计决策"],
   ["runbooks", "运行手册"],
   ["tests", "测试知识"],
-  ["issues", "问题定位"],
 ] as const;
 
-function MarkdownViewer({ markdown }: { markdown: string }) {
+const knowledgeCenterTabs: Array<["overview" | "cards" | "projects" | "modules" | "topics" | "decisions" | "runbooks" | "tests" | "graph" | "trash", string]> = [
+  ["overview", "总览"],
+  ["cards", "知识卡片"],
+  ["projects", "项目"],
+  ["modules", "模块"],
+  ["topics", "技术主题"],
+  ["decisions", "决策"],
+  ["runbooks", "Runbook"],
+  ["tests", "测试"],
+  ["graph", "关系图"],
+  ["trash", "回收站"],
+];
+
+function KnowledgeCenterTabs({
+  active,
+  onChange,
+}: {
+  active: (typeof knowledgeCenterTabs)[number][0];
+  onChange: (value: (typeof knowledgeCenterTabs)[number][0]) => void;
+}) {
+  return (
+    <div className="knowledge-center-tabs" role="tablist" aria-label="知识中心视图">
+      {knowledgeCenterTabs.map(([id, label]) => (
+        <button key={id} className={active === id ? "active" : ""} onClick={() => onChange(id)} role="tab" aria-selected={active === id}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function WikiInlineText({
+  value,
+  onWikiLink,
+}: {
+  value: string;
+  onWikiLink?: (id: string) => void;
+}) {
+  if (!onWikiLink || !value.includes("[[")) return <>{value}</>;
+  const parts: ReactNode[] = [];
+  const pattern = /\[\[([^|\]]+)(?:\|([^\]]+))?\]\]/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(value))) {
+    if (match.index > cursor) parts.push(value.slice(cursor, match.index));
+    const target = match[1].trim();
+    const label = (match[2] || match[1]).trim();
+    parts.push(
+      <button
+        type="button"
+        className="markdown-wikilink"
+        key={`${target}-${match.index}`}
+        onClick={() => onWikiLink(target)}
+      >
+        {label}
+      </button>,
+    );
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < value.length) parts.push(value.slice(cursor));
+  return <>{parts}</>;
+}
+
+function MarkdownViewer({ markdown, onWikiLink }: { markdown: string; onWikiLink?: (id: string) => void }) {
   const body = markdown.replace(/^---[\s\S]*?\n---\s*/, "");
   const blocks: Array<{ kind: string; value: string }> = [];
   let code: string[] | null = null;
@@ -327,7 +402,7 @@ function MarkdownViewer({ markdown }: { markdown: string }) {
     if (block.kind === "code") return <pre key={index}><code>{block.value}</code></pre>;
     if (block.kind === "li") return <div className="markdown-list" key={index}><i />{block.value}</div>;
     if (block.kind === "quote") return <blockquote key={index}>{block.value}</blockquote>;
-    return <p key={index}>{block.value}</p>;
+    return <p key={index}><WikiInlineText value={block.value} onWikiLink={onWikiLink} /></p>;
   })}</div>;
 }
 
@@ -424,6 +499,7 @@ function ReviewPill({ status }: { status?: string }) {
     pending: "待预审核",
     approved: "已通过",
     rejected: "已拒绝",
+    stale: "已失效",
   };
   return <span className={`review-pill ${value}`}><i />{labels[value] ?? value}</span>;
 }
@@ -469,7 +545,6 @@ export default function Home() {
   const [planningBusy, setPlanningBusy] = useState(false);
   const [planningGenerating, setPlanningGenerating] = useState(false);
   const [planningGenerationElapsed, setPlanningGenerationElapsed] = useState(0);
-  const [planningPublish, setPlanningPublish] = useState<string[]>(["knowledge", "qa", "wiki"]);
   const [qaItems, setQaItems] = useState(qaSeed);
   const [sessionItems, setSessionItems] = useState<SessionItem[]>(demoSessions);
   const [pipelineSessionItems, setPipelineSessionItems] = useState<SessionItem[]>([]);
@@ -497,6 +572,7 @@ export default function Home() {
   const externalOpenCodeFileInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [knowledgeDetail, setKnowledgeDetail] = useState<KnowledgeDetail | null>(null);
+  const [knowledgeCenterTab, setKnowledgeCenterTab] = useState<"overview" | "cards" | "projects" | "modules" | "topics" | "decisions" | "runbooks" | "tests" | "graph" | "trash">("overview");
   const [knowledgeTab, setKnowledgeTab] = useState<"overview" | "timeline" | "diagnosis" | "code" | "evidence">("overview");
   const [editingKnowledge, setEditingKnowledge] = useState(false);
   const [savingKnowledge, setSavingKnowledge] = useState(false);
@@ -520,6 +596,7 @@ export default function Home() {
   const [showWikiReview, setShowWikiReview] = useState(false);
   const [wikiLint, setWikiLint] = useState<WikiLintReport | null>(null);
   const [wikiWorking, setWikiWorking] = useState(false);
+  const [knowledgeCenterSummary, setKnowledgeCenterSummary] = useState<KnowledgeCenterSummary | null>(null);
   const [graph, setGraph] = useState<GraphSnapshot>({ nodes: [], links: [], stats: { nodes: 0, links: 0, types: {} } });
   const [graphType, setGraphType] = useState("all");
   const [graphQuery, setGraphQuery] = useState("");
@@ -534,16 +611,17 @@ export default function Home() {
       review_status: sessionReviewFilter,
     });
     if (sessionProject) sessionParams.set("project", sessionProject);
-    const [healthResult, sessionResult, pipelineSessionsResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult, wikiPlansResult] = await Promise.all([
+    const [healthResult, sessionResult, pipelineSessionsResult, hiddenSessionResult, qaResult, knowledgeResult, wikiResult, graphResult, wikiPlansResult, summaryResult] = await Promise.all([
       apiRequest<Health>("/api/health"),
       apiRequest<SessionPageResponse>(`/api/sessions?${sessionParams}`),
       apiRequest<SessionPageResponse>("/api/sessions?page=1&page_size=1000&review_status=approved"),
       apiRequest<Array<Record<string, unknown>>>("/api/sessions/hidden?limit=1000"),
       apiRequest<Array<Record<string, unknown>>>("/api/qa?limit=300"),
       apiRequest<KnowledgeItem[]>("/api/knowledge?limit=300"),
-      apiRequest<WikiResponse>("/api/wiki?limit=1000"),
+      apiRequest<WikiResponse>("/api/wiki?limit=1000&include_issues=0"),
       apiRequest<GraphSnapshot>("/api/graph"),
       apiRequest<WikiPlanSummary[]>("/api/wiki/plans?status=pending"),
+      apiRequest<KnowledgeCenterSummary>("/api/knowledge-center/summary"),
     ]);
     const normalizeSession = (item: Record<string, unknown>): SessionItem => ({
       id: String(item.id ?? ""),
@@ -573,7 +651,11 @@ export default function Home() {
         ? Math.round(Number(item.confidence) * (Number(item.confidence) <= 1 ? 100 : 1))
         : ({ high: 95, medium: 78, low: 52 }[String(item.confidence)] ?? 70),
       type: String(item.qa_type ?? "知识问答"),
-      state: String(item.review_status ?? "pending"),
+      state: String(item.review_status ?? "pending") as QaItem["state"],
+      knowledge_id: item.knowledge_id ? String(item.knowledge_id) : undefined,
+      knowledge_version: item.knowledge_version ? String(item.knowledge_version) : undefined,
+      review_origin: item.review_origin ? String(item.review_origin) : undefined,
+      stale_reason: item.stale_reason ? String(item.stale_reason) : undefined,
     }));
     setHealth(healthResult);
     setSessionItems(normalizedSessions);
@@ -590,6 +672,7 @@ export default function Home() {
     setWikiCounts(wikiResult.counts);
     setGraph(graphResult);
     setWikiPlans(wikiPlansResult);
+    setKnowledgeCenterSummary(summaryResult);
     setKnowledgeDetail((current) => (
       current && !knowledgeResult.some((item) => item.id === current.id) ? null : current
     ));
@@ -625,6 +708,12 @@ export default function Home() {
   }, [apiConnected]);
 
   useEffect(() => {
+    if (!showTrash && knowledgeCenterTab === "trash") {
+      setKnowledgeCenterTab("cards");
+    }
+  }, [knowledgeCenterTab, showTrash]);
+
+  useEffect(() => {
     const timer = window.setInterval(() => setClock(new Date()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
@@ -632,6 +721,40 @@ export default function Home() {
   const notify = (title: string, detail: string) => {
     setToast({ title, detail });
     window.setTimeout(() => setToast(null), 3200);
+  };
+
+  const selectKnowledgeCenterTab = (value: (typeof knowledgeCenterTabs)[number][0]) => {
+    setKnowledgeCenterTab(value);
+    setShowTrash(value === "trash");
+    setShowWikiArchive(false);
+    setShowWikiReview(false);
+    setWikiDetail(null);
+    if (value === "trash") {
+      void loadTrash();
+    } else if (value !== "cards" && value !== "graph") {
+      setWikiCategory(value === "overview" ? "overview" : value);
+    }
+  };
+
+  // Keep deep links/bookmarks from the former three-entry navigation working.
+  // They now land in the corresponding Knowledge Center subview.
+  const activateView = (value: View) => {
+    if (value === "wiki") {
+      setKnowledgeCenterTab("overview");
+      setActive("knowledge");
+      return;
+    }
+    if (value === "graph") {
+      setKnowledgeCenterTab("graph");
+      setActive("knowledge");
+      return;
+    }
+    if (value === "knowledge") {
+      setKnowledgeCenterTab("cards");
+      setActive("knowledge");
+      return;
+    }
+    setActive(value);
   };
 
   const connectLocalService = async () => {
@@ -753,6 +876,15 @@ export default function Home() {
     )),
     [wikiPages, wikiCategory, wikiQuery],
   );
+  const linkedKnowledgeQa = useMemo(
+    () => knowledgeDetail
+      ? qaItems.filter((item) => (
+        item.knowledge_id === knowledgeDetail.id
+        || (!item.knowledge_id && item.source === knowledgeDetail.source_session)
+      ))
+      : [],
+    [knowledgeDetail, qaItems],
+  );
   const graphPositionsMap = useMemo(() => graphPositions(graph.nodes), [graph.nodes]);
   const graphTypeOptions = useMemo(
     () => ["all", ...Object.keys(graph.stats.types).filter((type) => (graph.stats.types[type] ?? 0) > 0)],
@@ -770,10 +902,17 @@ export default function Home() {
 
   const openWiki = async (id: string) => {
     const [category, slug] = id.split("/", 2);
+    if (category === "issues") {
+      setKnowledgeCenterTab("cards");
+      await openKnowledge(slug);
+      return;
+    }
     try {
       const detail = await apiRequest<WikiDetail>(`/api/wiki/${encodeURIComponent(category)}/${encodeURIComponent(slug)}`);
       setWikiDetail(detail);
-      setActive("wiki");
+      setKnowledgeCenterTab((category as typeof knowledgeCenterTab) || "overview");
+      setWikiCategory(category);
+      setActive("knowledge");
       setSearchOpen(false);
     } catch (error) {
       notify("无法打开 Wiki 页面", error instanceof Error ? error.message : "请检查本地服务");
@@ -1055,6 +1194,8 @@ export default function Home() {
     try {
       const detail = await apiRequest<KnowledgeDetail>(`/api/knowledge/${encodeURIComponent(id)}`);
       setKnowledgeDetail(detail);
+      setKnowledgeCenterTab("cards");
+      setActive("knowledge");
       setKnowledgeTab("overview");
       setEditingKnowledge(false);
       setSearchOpen(false);
@@ -1082,6 +1223,20 @@ export default function Home() {
     }
   };
 
+  const regenerateKnowledgeQa = async () => {
+    if (!knowledgeDetail || !apiConnected) return;
+    try {
+      const result = await apiRequest<{ added: number; stale: number }>(
+        `/api/knowledge/${encodeURIComponent(knowledgeDetail.id)}/qa/regenerate`,
+        { method: "POST", body: "{}" },
+      );
+      await refreshData();
+      notify("候选 QA 已重新生成", `已生成 ${result.added} 条待审核问答，旧版本 ${result.stale} 条已标记失效。`);
+    } catch (error) {
+      notify("QA 生成失败", error instanceof Error ? error.message : "请检查本地服务");
+    }
+  };
+
   const deleteKnowledge = async () => {
     if (!knowledgeDetail) return;
     if (!window.confirm(`将“${knowledgeDetail.title}”和关联 QA 移入回收站？`)) return;
@@ -1099,6 +1254,7 @@ export default function Home() {
     try {
       const items = await apiRequest<TrashItem[]>("/api/knowledge/trash");
       setTrashItems(items);
+      setKnowledgeCenterTab("trash");
       setShowTrash(true);
     } catch (error) {
       notify("无法打开回收站", error instanceof Error ? error.message : "请检查本地服务");
@@ -1338,7 +1494,12 @@ export default function Home() {
     if (!planningPlan) return;
     setPlanningBusy(true);
     try {
-      const result = await apiRequest<{ plan: PlanningPlan; derivatives: Record<string, unknown> }>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/publish`, { method: "POST", body: JSON.stringify({ selected: planningPublish, reindex: true }) });
+      const result = await apiRequest<{ plan: PlanningPlan; derivatives: Record<string, unknown> }>(`/api/knowledge-plans/${encodeURIComponent(planningPlan.plan_id)}/publish`, {
+        method: "POST",
+        // Publish the canonical card and queue its derived views. QA remains
+        // a separate review gate and does not block the card itself.
+        body: JSON.stringify({ selected: ["knowledge", "qa", "wiki"], reindex: true }),
+      });
       setPlanningPlan(result.plan); await refreshData();
       notify(result.plan.index_status === "ready" ? "知识已发布并完成同步" : "知识已发布，索引待同步", result.plan.index_status === "ready" ? "已同步知识库、检索和关系图。" : "可稍后在知识库中刷新索引。" );
     } catch (error) { notify("发布失败", error instanceof Error ? error.message : "请检查草稿与依赖关系"); }
@@ -1591,7 +1752,7 @@ export default function Home() {
                 ? String(qaItems.filter((item) => item.state === "pending").length)
                 : item.badge;
             return (
-              <button key={item.id} className={active === item.id ? "active" : ""} onClick={() => setActive(item.id)}>
+              <button key={item.id} className={active === item.id || (item.id === "knowledge" && active === "knowledge") ? "active" : ""} onClick={() => activateView(item.id)}>
                 <span className="nav-icon">{item.icon}</span>{item.label}
                 {badge && <em>{badge}</em>}
               </button>
@@ -1847,17 +2008,17 @@ export default function Home() {
                   {planningCandidate.current_revision && <><button className="text-button" onClick={() => setShowPlanningSupplement((value) => !value)}>这些都不合适 / 补充说明</button>{showPlanningSupplement && <div className="planning-compose"><textarea value={planningSupplement} onChange={(event) => setPlanningSupplement(event.target.value)} placeholder="说明哪些条目不准确、要保留哪些事实。" /><button className="secondary-button" disabled={planningBusy || !planningSupplement.trim()} onClick={() => void regeneratePlanningEntries()}>根据补充重新整理</button></div>}<div className="planning-actions"><button className="primary-button" disabled={planningBusy || !planningEntrySelection.length} onClick={() => void confirmPlanningCandidate()}>确认所选并进入下一项</button><button className="secondary-button" onClick={() => setShowPlanningSkip((value) => !value)}>跳过此主题</button></div>{showPlanningSkip && <div className="planning-compose"><textarea value={planningSkipReason} onChange={(event) => setPlanningSkipReason(event.target.value)} placeholder="请填写跳过原因。" /><button className="danger-button" disabled={planningBusy || !planningSkipReason.trim()} onClick={() => void skipPlanningCandidate()}>确认跳过</button></div>}</>}
                 </div>}
               </section>}
-              <div className="subpage-heading"><div><p className="eyebrow">INTERACTIVE KNOWLEDGE PLANNING</p><h1>知识策划</h1><p>先与模型讨论哪些经验值得沉淀；确认前，所有内容只保存在隔离草稿区。</p></div>{planningPlan && <span className={`review-pill ${planningPlan.status}`}>{planningPlan.status === "reviewing" ? "待最终审核" : planningPlan.status === "published" ? "已发布" : planningPlan.status === "skipped" ? "已跳过" : "讨论中"}</span>}</div>
-              {!planningPlan ? <div className="empty-state"><strong>尚未开始知识策划</strong><span>请在流水线中选择已通过预审核的会话，模型会先给出候选知识清单。</span></div> : <div className="planning-workspace">
+              {!planningPlan && <div className="subpage-heading"><div><p className="eyebrow">INTERACTIVE KNOWLEDGE PLANNING</p><h1>知识策划</h1><p>先与模型讨论哪些经验值得沉淀；确认前，所有内容只保存在隔离草稿区。</p></div></div>}
+              {!planningPlan ? <div className="empty-state"><strong>尚未开始知识策划</strong><span>请在流水线中选择已通过预审核的会话，模型会先给出候选知识清单。</span></div> : planningDraft ? <div className="planning-workspace planning-draft-workspace">
                 {planningPlan.status === "published" && planningPlan.index_status !== "ready" && <div className="pipeline-error"><strong>已发布，索引待同步</strong><button className="secondary-button" disabled={planningBusy} onClick={() => void retryPlanningIndex()}>重试索引同步</button></div>}
                 {planningPlan.status !== "candidate_selection" && <article className="panel planning-candidates"><div className="panel-heading"><strong>知识主题进度</strong><span>{planningPlan.candidates.length} 项</span></div>
                   {planningPlan.candidates.map((item) => <label className="planning-candidate" key={item.id}><input type="checkbox" checked={planningPlan.selected_candidate_ids.includes(item.id)} disabled={planningPlan.status !== "discussing"} onChange={(event) => void updatePlanningScope(item.id, event.target.checked)} /><div><strong>{item.title}</strong><small>{item.type} · {item.confidence} · 证据 {item.evidence_event_ids.join(", ") || "不足"}</small><p>{item.value}</p>{item.duplicate_hint && <em>重复提示：{item.duplicate_hint}</em>}{item.conflict_hint && <em>冲突提示：{item.conflict_hint}</em>}</div></label>)}
                   {planningPlan.status === "item_reviewing" && !planningPlan.active_candidate_id && <button className="primary-button" disabled={planningBusy} onClick={() => void confirmAndGeneratePlanning()}>{planningBusy ? "正在生成草稿…" : "确认范围并生成草稿"}</button>}
                 </article>}
-                {planningDraft && <article className="panel planning-review"><div className="panel-heading"><strong>统一正确性审核</strong><span>草稿未入库</span></div><h3>知识卡片草稿</h3><MarkdownViewer markdown={planningDraft.draft.document} /><h3>候选 QA（{planningDraft.draft.qa.length}）</h3><pre>{JSON.stringify(planningDraft.draft.qa, null, 2)}</pre><h3>Wiki 更新预览</h3>{planningDraft.draft.wiki_preview.map((item) => <article className="planning-wiki-preview" key={item.id}><strong>{item.title}</strong><small>{item.category} · {item.action}</small><p>{item.reason}</p><pre>{item.diff}</pre></article>)}
-                  {planningPlan.status === "reviewing" && <div className="planning-publish"><strong>发布项</strong>{(["knowledge", "qa", "wiki"] as const).map((item) => <label key={item}><input type="checkbox" checked={planningPublish.includes(item)} onChange={(event) => setPlanningPublish((current) => event.target.checked ? [...new Set([...current, item])] : current.filter((value) => value !== item))} />{{ knowledge: "知识卡片", qa: "提交 QA 审核", wiki: "Wiki" }[item]}</label>)}<button className="primary-button" disabled={planningBusy || !planningPublish.includes("knowledge")} onClick={() => void publishPlanning()}>{planningBusy ? "正在发布…" : "发布已选内容"}</button><small>候选 QA 将进入待审核队列，审核通过后才进入正式检索与 RAG；QA 和 Wiki 必须依赖知识卡片。</small></div>}
+                {planningDraft && <article className="panel planning-review"><div className="panel-heading"><strong>统一正确性审核</strong><span>草稿未入库</span></div><h3>知识卡片草稿</h3><MarkdownViewer markdown={planningDraft.draft.document} /><h3>将生成 {planningDraft.draft.qa.length} 条候选 QA</h3><p className="muted-copy">发布知识卡片后，候选 QA 会进入独立的 QA 审核队列；未通过审核的 QA 不会进入搜索或 RAG。Wiki 视图会从正式知识卡片派生。</p><h3>Wiki 更新预览</h3>{planningDraft.draft.wiki_preview.map((item) => <article className="planning-wiki-preview" key={item.id}><strong>{item.title}</strong><small>{item.category} · {item.action}</small><p>{item.reason}</p><pre>{item.diff}</pre></article>)}
+                  {planningPlan.status === "reviewing" && <div className="planning-publish"><strong>发布正式知识</strong><button className="primary-button" disabled={planningBusy} onClick={() => void publishPlanning()}>{planningBusy ? "正在发布…" : "发布知识卡片并提交 QA"}</button><small>知识卡片立即进入知识中心；候选 QA 仅进入待审核队列，QA 审核通过后才进入正式检索与 RAG。</small></div>}
                 </article>}
-              </div>}
+              </div> : null}
             </section>
           )}
 
@@ -1895,10 +2056,11 @@ export default function Home() {
             </section>
           )}
 
-          {active === "knowledge" && (
+          {active === "knowledge" && (knowledgeCenterTab === "cards" || knowledgeCenterTab === "trash") && (
             <section className="subpage">
+              <KnowledgeCenterTabs active={knowledgeCenterTab} onChange={selectKnowledgeCenterTab} />
               <div className="subpage-heading">
-                <div><p className="eyebrow">KNOWLEDGE VAULT</p><h1>{showTrash ? "知识回收站" : "知识库"}</h1><p>{showTrash ? "恢复误删的知识卡片及其关联 QA。" : "可查看、修改、删除和检索的本地工程知识。"}</p></div>
+                 <div><p className="eyebrow">KNOWLEDGE CENTER / CARDS</p><h1>{showTrash ? "知识回收站" : "知识卡片"}</h1><p>{showTrash ? "恢复误删的知识卡片及其关联 QA。" : "正式、可编辑的工程事实来源。Wiki 与 QA 均由此派生。"}</p></div>
                 <div className="heading-actions">
                   {showTrash ? <button className="secondary-button" onClick={() => setShowTrash(false)}>← 返回知识库</button> : <button className="secondary-button" onClick={() => void loadTrash()}>♲ 回收站</button>}
                   {!showTrash && <button className="secondary-button" onClick={() => void syncKnowledgeDerivatives()}>⟳ 同步派生数据</button>}
@@ -1930,10 +2092,12 @@ export default function Home() {
             </section>
           )}
 
-          {active === "wiki" && (
+          {active === "knowledge" && knowledgeCenterTab !== "cards" && knowledgeCenterTab !== "trash" && knowledgeCenterTab !== "graph" && (
             <section className="subpage wiki-page">
+              <KnowledgeCenterTabs active={knowledgeCenterTab} onChange={selectKnowledgeCenterTab} />
+              {knowledgeCenterSummary && <div className="knowledge-center-summary"><strong>正式知识 {knowledgeCenterSummary.knowledge_count}</strong><span>派生专题 {knowledgeCenterSummary.derived_page_count}</span><span>QA 待审 {knowledgeCenterSummary.qa_pending}</span><span>QA 已通过 {knowledgeCenterSummary.qa_approved}</span></div>}
               <div className="subpage-heading">
-                <div><p className="eyebrow">CONNECTED KNOWLEDGE WIKI</p><h1>{showWikiArchive ? "Wiki 回收站" : showWikiReview ? "Wiki 更新审核" : "Wiki 知识中心"}</h1><p>{showWikiArchive ? "恢复误归档的项目、主题和设计决策页面。" : showWikiReview ? "核对来源证据和 Markdown Diff，确认后以一个原子事务写入。" : "按项目、模块、主题、决策、运行手册、测试和问题定位组织研发知识。"}</p></div>
+                 <div><p className="eyebrow">KNOWLEDGE CENTER / DERIVED VIEWS</p><h1>{showWikiArchive ? "知识中心回收站" : showWikiReview ? "Wiki 更新审核" : "知识中心"}</h1><p>{showWikiArchive ? "恢复误归档的派生专题页面。" : showWikiReview ? "核对来源证据和 Markdown Diff，确认后以一个原子事务写入。" : "按项目、模块、主题、决策、运行手册和测试组织由知识卡片派生的视图。"}</p></div>
                 <div className="heading-actions">
                   {showWikiArchive && wikiArchiveItems.length > 0 && <button className="danger-button" onClick={() => void clearWikiArchive()}>清空回收站</button>}
                   {(showWikiArchive || showWikiReview)
@@ -1979,7 +2143,7 @@ export default function Home() {
                   <nav>
                     {wikiCategories.map(([id, label]) => (
                       <button key={id} className={wikiCategory === id ? "active" : ""} onClick={() => setWikiCategory(id)}>
-                        <span>{id === "all" ? "⌘" : id === "projects" ? "▦" : id === "topics" ? "◇" : id === "decisions" ? "✓" : id === "issues" ? "!" : "◎"}</span>
+                        <span>{id === "all" ? "⌘" : id === "projects" ? "▦" : id === "topics" ? "◇" : id === "decisions" ? "✓" : "◎"}</span>
                         {label}<em>{id === "all" ? wikiPages.length : wikiCounts[id] ?? 0}</em>
                       </button>
                     ))}
@@ -2005,7 +2169,7 @@ export default function Home() {
                           <button className="danger-button" onClick={() => void archiveWiki()}>归档此页面</button>
                         </div>
                       )}
-                      <div className="wiki-reader-body"><MarkdownViewer markdown={wikiDetail.markdown} /></div>
+                      <div className="wiki-reader-body"><MarkdownViewer markdown={wikiDetail.markdown} onWikiLink={(id) => void openWiki(id)} /></div>
                       {(wikiDetail.backlinks.length > 0 || wikiDetail.references.length > 0) && (
                         <footer>
                           <h3>关联知识</h3>
@@ -2024,8 +2188,9 @@ export default function Home() {
             </section>
           )}
 
-          {active === "graph" && (
+          {active === "knowledge" && knowledgeCenterTab === "graph" && (
             <section className="subpage graph-page">
+              <KnowledgeCenterTabs active={knowledgeCenterTab} onChange={selectKnowledgeCenterTab} />
               <div className="subpage-heading">
                 <div><p className="eyebrow">KNOWLEDGE RELATIONSHIP MAP</p><h1>知识关系图</h1><p>聚焦项目、知识卡片、模块和来源会话之间可复用的工程知识关系。</p></div>
                 <button className="primary-button" disabled={graphLoading} onClick={() => void rebuildKnowledgeGraph()}>{graphLoading ? "正在构建…" : "↻ 重建关系图"}</button>
@@ -2152,7 +2317,7 @@ export default function Home() {
                     <h3>{qa.question}</h3><p>{qa.answer}</p>
                     <div className="evidence"><span>证据</span><p>答案可在来源 Session 的定位过程与工具输出中直接验证。</p></div>
                     <div className="qa-actions">
-                      {qa.state === "pending" ? <><button className="reject" onClick={() => reviewQa(qa.id, "rejected")}>退回</button><button className="approve" onClick={() => reviewQa(qa.id, "approved")}>✓ 通过并入库</button></> : <strong>{qa.state === "approved" ? "✓ 已通过审核" : "× 已退回"}</strong>}
+                      {qa.state === "pending" ? <><button className="reject" onClick={() => reviewQa(qa.id, "rejected")}>退回</button><button className="approve" onClick={() => reviewQa(qa.id, "approved")}>✓ 通过并入库</button></> : <strong>{qa.state === "approved" ? "✓ 已通过审核" : qa.state === "stale" ? "↻ 卡片已更新，待重新生成" : "× 已退回"}</strong>}
                     </div>
                   </article>
                 ))}
@@ -2292,6 +2457,15 @@ export default function Home() {
                   <span>{knowledgeDetail.review_status === "approved" ? "已通过" : "待审核"}</span>
                   {knowledgeDetail.quality?.overall !== undefined && <span>质量 {Math.round(knowledgeDetail.quality.overall * 100)}%</span>}
                 </div>
+                <section className="knowledge-linked-qa">
+                  <div className="linked-qa-heading"><h3>关联 QA</h3><span>{linkedKnowledgeQa.length} 条</span></div>
+                  {linkedKnowledgeQa.length ? linkedKnowledgeQa.map((item) => (
+                    <article key={item.id}>
+                      <strong>{item.question}</strong>
+                      <small className={`review-pill ${item.state}`}>{item.state === "approved" ? "已通过" : item.state === "stale" ? "已失效" : item.state === "rejected" ? "已拒绝" : "待审核"}</small>
+                    </article>
+                  )) : <p className="structured-empty">尚未生成候选 QA，可在审核卡片后生成最多三条。</p>}
+                </section>
                 <nav className="knowledge-tabs" aria-label="知识详情分区">
                   {([
                     ["overview", "文档概览"],
@@ -2337,6 +2511,7 @@ export default function Home() {
             <footer>
               <button className="danger-button" onClick={() => void deleteKnowledge()}>删除</button>
               <span />
+              {!editingKnowledge && <button onClick={() => void regenerateKnowledgeQa()} disabled={!apiConnected}>重新生成 QA</button>}
               {!editingKnowledge && <button onClick={() => {
                 const source = [...sessionItems, ...hiddenSessionItems].find((item) => item.id === knowledgeDetail.source_session);
                 if (source) { setKnowledgeDetail(null); void openSessionPreview(source); }

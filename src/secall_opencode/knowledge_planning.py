@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
 from .config import Config
 from .knowledge import split_generated_output, store_knowledge
+from .knowledge_store import read_knowledge_document
 from .knowledge_store import atomic_write_text, parse_frontmatter
 
 PLAN_VERSION = 2
@@ -247,7 +248,12 @@ def confirmed_context(plan: Mapping[str, Any]) -> List[Dict[str, Any]]:
 def save_draft(config: Config, plan_id: str, generated: str) -> Dict[str, Any]:
     plan = read_plan(config, plan_id)
     if plan.get("status") not in {"scope_confirmed", "generating", "reviewing"}: raise ValueError("请先完成逐项确认。")
-    document, qa, structured = split_generated_output(generated); root = _draft_root(config, plan_id); atomic_write_text(root / "generated.md", generated.strip() + "\n")
+    document, qa, structured = split_generated_output(generated)
+    # Keep the default review queue deliberately small.  QA is a derived
+    # presentation of the canonical card; extra questions can be generated
+    # later from the current card after an explicit user request.
+    qa = qa[:3]
+    root = _draft_root(config, plan_id); atomic_write_text(root / "generated.md", generated.strip() + "\n")
     draft = {"document": document, "qa": qa, "structured": structured or {}, "confirmed_context": _confirmed_context(plan), "wiki_preview": _wiki_preview(plan), "generated_at": _now(), "content_hash": _hash(generated)}
     atomic_write_text(root / "draft.json", json.dumps(draft, ensure_ascii=False, indent=2) + "\n")
     plan.update({"draft": {"path": str(root / "draft.json"), "content_hash": draft["content_hash"], "qa_count": len(qa), "wiki_change_count": len(draft["wiki_preview"])}, "status": "reviewing"})
@@ -281,7 +287,14 @@ def _append_selected_qa(config: Config, plan: Mapping[str, Any], qa: Sequence[Ma
             except json.JSONDecodeError: continue
             if isinstance(item, dict): existing.append(item)
     known = {str(item.get("id")) for item in existing}; added = 0
-    for item in qa:
+    knowledge_version = ""
+    try:
+        knowledge_version = str(read_knowledge_document(config, knowledge_id).get("version") or "")
+    except FileNotFoundError:
+        # The caller has just written the card, so this is only a defensive
+        # fallback for a partially recovered legacy Vault.
+        knowledge_version = ""
+    for item in list(qa)[:3]:
         record = dict(item); record.setdefault("id", f"qa-{uuid.uuid4().hex[:12]}")
         if str(record["id"]) in known: continue
         record.update({
@@ -290,6 +303,8 @@ def _append_selected_qa(config: Config, plan: Mapping[str, Any], qa: Sequence[Ma
             "knowledge_id": knowledge_id,
             "review_status": "pending",
             "review_origin": "knowledge_planning",
+            "knowledge_version": knowledge_version,
+            "evidence_event_ids": list(record.get("evidence_event_ids") or []),
             "submitted_by_plan": plan["plan_id"],
             "submitted_at": _now(),
         }); existing.append(record); known.add(str(record["id"])); added += 1
@@ -415,7 +430,16 @@ def publish_plan(config: Config, plan_id: str, selected: Sequence[str], *, reind
     generated = _draft_root(config, plan_id) / "generated.md"
     if not generated.exists(): raise FileNotFoundError("知识草稿原文丢失，无法发布。")
     result = store_knowledge(generated.read_text(encoding="utf-8"), source_file.read_text(encoding="utf-8"), config.vault, config.knowledge_dir, config.qa_file, include_qa=False)
-    added = _append_selected_qa(config, plan, draft.get("qa") or [], result.issue_path.stem) if "qa" in requested else 0
+    # A published card is the canonical anchor.  Candidate QA is always
+    # queued for review with that card; the old ``selected`` flag is retained
+    # only for API compatibility and no longer lets the planner bypass the
+    # QA review boundary.
+    added = _append_selected_qa(
+        config,
+        plan,
+        draft.get("qa") or [],
+        result.issue_path.stem,
+    )
     plan.update({"source_path": _source_relative_path(config, source_file), "status": "published", "published": {"selected": sorted(requested), "knowledge_id": result.issue_path.stem, "qa_added": added, "at": _now(), "qa_review_queue_version": 2}, "index_status": "pending" if reindex else "not_requested"})
     return _write(config, plan) | {"published": plan["published"]}
 

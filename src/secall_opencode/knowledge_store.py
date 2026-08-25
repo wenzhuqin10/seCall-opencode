@@ -269,7 +269,15 @@ def update_knowledge_document(
             read_session_events(config.vault, existing["source_session"]),
         )
         store_structured_knowledge(config.vault, structured)
-    return read_knowledge_document(config, knowledge_id)
+    updated = read_knowledge_document(config, knowledge_id)
+    if markdown != existing["markdown"]:
+        mark_qa_stale_for_knowledge(
+            config,
+            knowledge_id,
+            updated["version"],
+            source_session=updated["source_session"],
+        )
+    return updated
 
 
 def _read_qa_records(path: Path) -> List[Dict[str, Any]]:
@@ -291,6 +299,90 @@ def _write_qa_records(path: Path, items: Iterable[Dict[str, Any]]) -> None:
     atomic_write_text(path, payload)
 
 
+def mark_qa_stale_for_knowledge(
+    config: Config,
+    knowledge_id: str,
+    current_version: str,
+    *,
+    source_session: str = "",
+) -> Dict[str, int]:
+    """Invalidate QA derived from a changed knowledge card.
+
+    QA is a derived representation of a card.  It must not remain searchable
+    after the card body changes until a reviewer confirms the new wording.
+    """
+
+    path = config.vault / config.qa_file
+    items = _read_qa_records(path)
+    changed = 0
+    for item in items:
+        item_knowledge_id = str(item.get("knowledge_id") or "")
+        # A populated knowledge_id is authoritative.  Only legacy records
+        # without that field may fall back to the source session; otherwise
+        # two historical cards created from one session would invalidate each
+        # other's QA when one card changes.
+        linked = item_knowledge_id == knowledge_id if item_knowledge_id else False
+        if not item_knowledge_id and source_session:
+            linked = str(item.get("source_session") or "") == source_session
+        if not linked or str(item.get("review_status") or "pending") == "stale":
+            continue
+        status = str(item.get("review_status") or "pending")
+        if status not in {"pending", "approved"}:
+            continue
+        item["previous_review_status"] = status
+        item["review_status"] = "stale"
+        item["stale_reason"] = "knowledge_updated"
+        item["current_knowledge_version"] = current_version
+        changed += 1
+    if changed:
+        _write_qa_records(path, items)
+    return {"changed": changed, "total": len(items)}
+
+
+def backfill_qa_metadata(config: Config) -> Dict[str, int]:
+    """Link legacy QA records to cards and versions without changing answers."""
+
+    path = config.vault / config.qa_file
+    items = _read_qa_records(path)
+    if not items:
+        return {"updated": 0, "stale": 0, "total": 0}
+    cards = list_knowledge_documents(config, limit=10000)
+    by_id = {str(item.get("id")): item for item in cards}
+    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for item in cards:
+        source = str(item.get("source_session") or "")
+        if source:
+            by_session.setdefault(source, []).append(item)
+    updated = 0
+    stale = 0
+    for item in items:
+        knowledge_id = str(item.get("knowledge_id") or "")
+        card = by_id.get(knowledge_id)
+        if card is None:
+            matches = by_session.get(str(item.get("source_session") or ""), [])
+            card = matches[0] if len(matches) == 1 else None
+            if card is not None:
+                item["knowledge_id"] = str(card.get("id") or "")
+        if card is None:
+            if item.get("review_status") in {"pending", "approved"}:
+                item["previous_review_status"] = item.get("review_status")
+                item["review_status"] = "stale"
+                item["stale_reason"] = "knowledge_missing"
+                stale += 1
+                updated += 1
+            continue
+        detail = read_knowledge_document(config, str(card["id"]))
+        version = str(detail.get("version") or "")
+        if item.get("knowledge_version") != version:
+            item["knowledge_version"] = version
+            updated += 1
+        item.setdefault("review_origin", "legacy")
+        item.setdefault("source_session", detail.get("source_session", ""))
+    if updated:
+        _write_qa_records(path, items)
+    return {"updated": updated, "stale": stale, "total": len(items)}
+
+
 def _session_aliases(value: str) -> set[str]:
     normalized = str(value or "").strip().lower()
     if not normalized:
@@ -308,8 +400,9 @@ def _qa_matches_knowledge(
     knowledge_id: str,
     source_session: str,
 ) -> bool:
-    if str(item.get("knowledge_id") or "") == knowledge_id:
-        return True
+    item_knowledge_id = str(item.get("knowledge_id") or "")
+    if item_knowledge_id:
+        return item_knowledge_id == knowledge_id
     qa_source = str(item.get("source_session") or item.get("source") or "")
     return bool(_session_aliases(qa_source) & _session_aliases(source_session))
 

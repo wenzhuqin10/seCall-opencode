@@ -42,6 +42,7 @@ class SearchResult:
     score: float
     match_type: str
     review_status: str
+    knowledge_id: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -58,6 +59,7 @@ class SearchDocument:
     review_status: str
     diagnosis: str = ""
     code_context: str = ""
+    knowledge_id: str = ""
 
     @property
     def content_hash(self) -> str:
@@ -200,6 +202,7 @@ def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
             review_status=item["review_status"],
             diagnosis=diagnosis,
             code_context=code_context,
+            knowledge_id=str(item["id"]),
         )
 
     qa_path = config.vault / config.qa_file
@@ -220,6 +223,7 @@ def _knowledge_and_qa_documents(config: Config) -> Iterator[SearchDocument]:
             project=str(item.get("project") or "unknown"),
             source_session=str(item.get("source_session") or ""),
             review_status="approved",
+            knowledge_id=str(item.get("knowledge_id") or ""),
         )
 
 
@@ -289,7 +293,8 @@ class KeywordSearchBackend:
                 project TEXT NOT NULL,
                 source_session TEXT NOT NULL,
                 review_status TEXT NOT NULL,
-                content_hash TEXT NOT NULL
+                content_hash TEXT NOT NULL,
+                knowledge_id TEXT NOT NULL DEFAULT ''
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts_v2 USING fts5(
                 id UNINDEXED,
@@ -302,6 +307,14 @@ class KeywordSearchBackend:
             );
             """
         )
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+        }
+        if "knowledge_id" not in columns:
+            connection.execute(
+                "ALTER TABLE documents ADD COLUMN knowledge_id TEXT NOT NULL DEFAULT ''"
+            )
         return connection
 
     def rebuild(self) -> Dict[str, Any]:
@@ -314,8 +327,8 @@ class KeywordSearchBackend:
                 connection.execute(
                     """
                     INSERT INTO documents
-                    (id, scope, title, body, project, source_session, review_status, content_hash)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (id, scope, title, body, project, source_session, review_status, content_hash, knowledge_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         item.id,
@@ -326,6 +339,7 @@ class KeywordSearchBackend:
                         item.source_session,
                         item.review_status,
                         item.content_hash,
+                        item.knowledge_id,
                     ),
                 )
                 connection.execute(
@@ -387,6 +401,7 @@ class KeywordSearchBackend:
                 score=round(1.0 / (index + 1), 6),
                 match_type="keyword",
                 review_status=str(row["review_status"]),
+                knowledge_id=str(row["knowledge_id"] or ""),
             )
             for index, row in enumerate(rows)
         ]
@@ -453,7 +468,18 @@ class KeywordSearchBackend:
         if scope in {"all", "knowledge", "wiki", "qa"}:
             result.extend(self._knowledge_search(query, scope, limit))
         result.sort(key=lambda item: item.score, reverse=True)
-        return result[:limit]
+        # A QA and its source card can both match the same query.  The card is
+        # the canonical fact source, so return one result per knowledge_id and
+        # prefer it over the derived QA representation.
+        deduped: Dict[str, SearchResult] = {}
+        for item in result:
+            key = item.knowledge_id or f"{item.scope}:{item.id}"
+            previous = deduped.get(key)
+            if previous is None or (
+                item.scope == "knowledge" and previous.scope != "knowledge"
+            ):
+                deduped[key] = item
+        return list(deduped.values())[:limit]
 
 
 def _chunk_text(text: str, size: int, overlap: int) -> List[str]:
@@ -550,6 +576,7 @@ class OnnxSemanticBackend:
                 source_session TEXT NOT NULL,
                 review_status TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
+                knowledge_id TEXT NOT NULL DEFAULT '',
                 chunk_index INTEGER NOT NULL,
                 chunk_text TEXT NOT NULL,
                 vector BLOB NOT NULL,
@@ -560,6 +587,14 @@ class OnnxSemanticBackend:
             ON semantic_documents(scope);
             """
         )
+        columns = {
+            str(row[1])
+            for row in connection.execute("PRAGMA table_info(semantic_documents)").fetchall()
+        }
+        if "knowledge_id" not in columns:
+            connection.execute(
+                "ALTER TABLE semantic_documents ADD COLUMN knowledge_id TEXT NOT NULL DEFAULT ''"
+            )
         return connection
 
     def _counts(self) -> tuple[int, int]:
@@ -673,8 +708,8 @@ class OnnxSemanticBackend:
                     """
                     INSERT INTO semantic_documents
                     (id, scope, title, project, source_session, review_status,
-                     content_hash, chunk_index, chunk_text, vector, dimensions)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     content_hash, knowledge_id, chunk_index, chunk_text, vector, dimensions)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         document.id,
@@ -684,6 +719,7 @@ class OnnxSemanticBackend:
                         document.source_session,
                         document.review_status,
                         document.content_hash,
+                        document.knowledge_id,
                         chunk_index,
                         chunk,
                         vector.astype("<f4").tobytes(),
@@ -746,6 +782,7 @@ class OnnxSemanticBackend:
                 score=round(score, 6),
                 match_type="semantic",
                 review_status=str(row["review_status"]),
+                knowledge_id=str(row["knowledge_id"] or ""),
             )
             for score, row in ranked
         ]
@@ -878,8 +915,12 @@ def _rrf_merge(
     scores: Dict[tuple[str, str], float] = {}
     for collection in (keyword, semantic):
         for rank, item in enumerate(collection, 1):
-            key = (item.scope, item.id)
-            values[key] = item
+            key = (item.knowledge_id or f"{item.scope}:{item.id}", "canonical")
+            previous = values.get(key)
+            if previous is None or (
+                item.scope == "knowledge" and previous.scope != "knowledge"
+            ):
+                values[key] = item
             scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
     return [
         SearchResult(
