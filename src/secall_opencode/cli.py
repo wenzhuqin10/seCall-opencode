@@ -333,6 +333,7 @@ def _pipeline_one(
                 cfg.vault,
                 model=args.model or cfg.model,
                 timeout=args.timeout,
+                developer_intent=args.intent or "",
             )
             item["generation"] = store_knowledge(
                 generated,
@@ -347,6 +348,8 @@ def _pipeline_one(
 
 def command_pipeline(args: argparse.Namespace) -> Dict[str, Any]:
     cfg = _config(args)
+    if args.intent and len(args.intent.strip()) > 1200:
+        raise ValueError("本次希望沉淀的经验不能超过 1200 个字符。")
     client = OpenCodeClient(cfg.opencode_command)
     if args.all:
         sessions = client.list_sessions(args.limit)
@@ -534,6 +537,10 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--all", action="store_true", help="处理最近 Session。")
     pipeline.add_argument("--limit", type=int, default=20)
     pipeline.add_argument("--model")
+    pipeline.add_argument(
+        "--intent",
+        help="本次希望沉淀的经验；仅用于引导候选知识优先级，不作为会话事实或证据。",
+    )
     pipeline.add_argument("--timeout", type=int, default=1800)
     pipeline.add_argument(
         "--sanitize",

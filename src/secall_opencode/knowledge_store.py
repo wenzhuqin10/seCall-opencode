@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import tempfile
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
@@ -144,6 +146,52 @@ def list_knowledge_documents(config: Config, limit: int = 200) -> List[Dict[str,
             }
         )
     return result
+
+
+def export_knowledge_markdown(config: Config, knowledge_id: str) -> Tuple[str, bytes]:
+    """Return one formal knowledge card exactly as stored in the Vault."""
+
+    path = _find_knowledge_path(config, knowledge_id)
+    return f"{path.stem}.md", path.read_bytes()
+
+
+def export_knowledge_bundle(
+    config: Config, knowledge_ids: Iterable[str] | None = None
+) -> Tuple[str, bytes]:
+    """Create an in-memory Markdown-only archive of formal knowledge cards."""
+
+    requested = [str(item) for item in (knowledge_ids or []) if str(item).strip()]
+    if requested:
+        seen: set[str] = set()
+        paths = []
+        for knowledge_id in requested:
+            if knowledge_id in seen:
+                continue
+            seen.add(knowledge_id)
+            paths.append(_find_knowledge_path(config, knowledge_id))
+    else:
+        root = _knowledge_root(config)
+        paths = sorted(root.glob("*.md"), key=lambda item: item.name) if root.exists() else []
+    if not paths:
+        raise ValueError("当前没有可导出的正式知识卡片。")
+
+    index_lines = [
+        "# 知识中心 Markdown 导出",
+        "",
+        f"共导出 {len(paths)} 张正式知识卡片。",
+        "",
+        "## 文件目录",
+        "",
+    ]
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path in paths:
+            markdown = path.read_bytes()
+            document = read_knowledge_document(config, path.stem)
+            index_lines.append(f"- [{document['title']}]({path.name})")
+            bundle.writestr(path.name, markdown)
+        bundle.writestr("README.md", "\n".join(index_lines) + "\n")
+    return "knowledge-center-markdown.zip", archive.getvalue()
 
 
 def _yaml_value(value: str) -> str:

@@ -398,6 +398,7 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .knowledge-card:focus-visible { outline: 3px solid #7158e833; border-color: var(--purple); }
 .knowledge-card:hover { transform: translateY(-3px); box-shadow: 0 13px 30px rgba(37,31,61,.08); border-color: #d9d2f2; }
 .knowledge-top { display: flex; align-items: center; }
+.knowledge-select { width: 15px; height: 15px; margin: 0 8px 0 0; accent-color: var(--purple); cursor: pointer; }
 .knowledge-top > span { width: 31px; height: 31px; display: grid; place-items: center; background: var(--lilac); color: var(--purple); border-radius: 9px; }
 .knowledge-top em { color: #6e6487; background: #f2eff8; border-radius: 10px; padding: 4px 7px; font-size: 7px; margin-left: 8px; font-style: normal; }
 .knowledge-top button { margin-left: auto; border: 0; background: transparent; color: #aaa6af; }
@@ -654,6 +655,14 @@ button.table-row:hover, .table-row.selected { background: #faf9fd; }
 .modal > p:not(.eyebrow) { color: #837f89; font-size: 10px; margin: 7px 0 21px; }
 .modal label { display: grid; gap: 7px; color: #57535f; font-size: 9px; font-weight: 650; margin-bottom: 13px; }
 .modal select { height: 40px; width: 100%; }
+.pipeline-intent-input { margin-top: 2px; }
+.pipeline-intent-input textarea { width: 100%; min-height: 76px; resize: vertical; border: 1px solid #dfdbe4; border-radius: 9px; padding: 10px; color: var(--ink); background: #fbfafc; font: inherit; font-size: 9px; line-height: 1.55; outline: none; }
+.pipeline-intent-input textarea:focus { border-color: #8c78e9; box-shadow: 0 0 0 3px #7158e812; background: white; }
+.pipeline-intent-input small { color: #8a8492; font-size: 8px; font-weight: 500; line-height: 1.5; }
+.planning-intent { margin: 0 0 13px; padding: 12px 14px; border: 1px solid #dfd6fb; border-radius: 11px; color: #504572; background: #f8f6ff; }
+.planning-intent strong { display: block; color: #624dc8; font-size: 9px; }
+.planning-intent p { margin: 6px 0 4px; color: #40385a; font-size: 10px; line-height: 1.55; white-space: pre-wrap; }
+.planning-intent small { color: #827896; font-size: 8px; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .switch-row { display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #efedf1; padding: 12px 1px; }
 .switch-row strong, .switch-row small { display: block; }

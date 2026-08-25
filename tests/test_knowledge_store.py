@@ -6,6 +6,8 @@ import pytest
 from secall_opencode.config import Config
 from secall_opencode.knowledge_store import (
     delete_knowledge_document,
+    export_knowledge_bundle,
+    export_knowledge_markdown,
     list_knowledge_trash,
     purge_all_knowledge_derivatives,
     read_knowledge_document,
@@ -195,3 +197,34 @@ def test_purge_all_knowledge_derivatives_preserves_source_sessions(
     assert not (tmp_path / "knowledge" / "qa" / "candidates.jsonl").exists()
     assert not (tmp_path / ".trash" / "knowledge").exists()
     assert not (tmp_path / ".trash" / "wiki").exists()
+
+
+def test_export_returns_only_formal_markdown_cards(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    root = tmp_path / "wiki" / "issues"
+    (root / "second-card.md").write_text(
+        DOCUMENT.replace("����ʧ���Ų�", "�ڶ���֪ʶ��"), encoding="utf-8"
+    )
+    # These related artifacts must never be part of a knowledge-card export.
+    draft = tmp_path / "knowledge" / "planning" / "drafts" / "plan-a"
+    draft.mkdir(parents=True)
+    (draft / "draft.md").write_text("# draft", encoding="utf-8")
+    (tmp_path / "wiki" / "overview.md").write_text("# wiki", encoding="utf-8")
+
+    filename, markdown = export_knowledge_markdown(config, "download-session-001")
+    zip_name, archive = export_knowledge_bundle(config, ["download-session-001", "second-card"])
+
+    assert filename == "download-session-001.md"
+    assert markdown == (root / filename).read_bytes()
+    assert zip_name == "knowledge-center-markdown.zip"
+    import zipfile
+    import io
+
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        assert set(bundle.namelist()) == {"download-session-001.md", "second-card.md", "README.md"}
+        assert "draft.md" not in bundle.namelist()
+        assert "overview.md" not in bundle.namelist()
+
+    delete_knowledge_document(config, "second-card")
+    with pytest.raises(FileNotFoundError):
+        export_knowledge_bundle(config, ["download-session-001", "second-card"])

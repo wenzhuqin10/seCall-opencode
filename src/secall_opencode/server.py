@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from . import __version__
 from .chatgpt import inspect_export, parse_export
@@ -43,6 +43,8 @@ from .knowledge_store import (
     atomic_write_text,
     backfill_qa_metadata,
     delete_knowledge_document,
+    export_knowledge_bundle,
+    export_knowledge_markdown,
     list_knowledge_documents,
     list_knowledge_trash,
     mark_qa_stale_for_knowledge,
@@ -676,7 +678,11 @@ def run_session_pipeline(
     reindex: bool = True,
     overwrite: bool = False,
     timeout: int = 1800,
+    knowledge_intent: str = "",
 ) -> Dict[str, Any]:
+    knowledge_intent = knowledge_intent.strip()
+    if len(knowledge_intent) > 1200:
+        raise ValueError("本次希望沉淀的经验不能超过 1200 个字符。")
     started_at = time.monotonic()
     stages: List[Dict[str, Any]] = []
 
@@ -821,6 +827,7 @@ def run_session_pipeline(
     reindex: bool = True,
     overwrite: bool = False,
     timeout: int = 1800,
+    knowledge_intent: str = "",
 ) -> Dict[str, Any]:
     """Compatibility entry point that starts an isolated knowledge planning session.
 
@@ -828,6 +835,9 @@ def run_session_pipeline(
     The new flow deliberately stops after analysis so a user can discuss and
     confirm the extraction scope first.
     """
+    knowledge_intent = knowledge_intent.strip()
+    if len(knowledge_intent) > 1200:
+        raise ValueError("Developer knowledge intent must not exceed 1200 characters.")
     started_at = time.monotonic()
     stages: List[Dict[str, Any]] = []
     sessions = list_vault_sessions(config, limit=None, include_hidden=True)
@@ -855,6 +865,7 @@ def run_session_pipeline(
             config.vault,
             model=model or config.model,
             timeout=min(timeout, 900),
+            developer_intent=knowledge_intent,
         )
         detail = "模型已提出候选知识，等待用户讨论与确认范围。"
     except Exception as exc:
@@ -869,6 +880,7 @@ def run_session_pipeline(
         events=events,
         analysis=analysis,
         source_path=session_path,
+        developer_intent=knowledge_intent,
     )
     stages.append({
         "name": "会话知识策划", "duration_seconds": round(time.monotonic() - analysis_started, 2),
@@ -931,6 +943,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_download(
+        self, content: bytes, *, content_type: str, filename: str
+    ) -> None:
+        """Send an in-memory local export without wrapping it as API JSON."""
+
+        fallback = "knowledge-export.zip" if filename.endswith(".zip") else "knowledge-card.md"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Content-Disposition", f'attachment; filename="{fallback}"; filename*=UTF-8\'\'{quote(filename)}')
+        self.send_header("Cache-Control", "no-store")
+        self._cors()
+        self.end_headers()
+        self.wfile.write(content)
 
     def _ok(self, result: Any, status: int = HTTPStatus.OK) -> None:
         self._send(status, {"ok": True, "result": result})
@@ -1145,6 +1172,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._ok(list_knowledge(self.config, limit))
             elif parsed.path == "/api/knowledge/trash":
                 self._ok(list_knowledge_trash(self.config))
+            elif (
+                parsed.path.startswith("/api/knowledge/")
+                and parsed.path.endswith("/export")
+            ):
+                knowledge_id = unquote(
+                    parsed.path.removeprefix("/api/knowledge/").removesuffix("/export")
+                ).rstrip("/")
+                filename, markdown = export_knowledge_markdown(
+                    self.config, knowledge_id
+                )
+                self._send_download(
+                    markdown,
+                    content_type="text/markdown; charset=utf-8",
+                    filename=filename,
+                )
             elif parsed.path == "/api/wiki":
                 include_issues = str(query.get("include_issues", ["1"])[0]).lower() not in {"0", "false", "no"}
                 self._ok(
@@ -1257,6 +1299,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     )
                 except Exception as exc:
                     self._fail_opencode_import(exc, "写入会话 Vault")
+            elif parsed.path == "/api/knowledge/export":
+                ids = body.get("ids", [])
+                if not isinstance(ids, list):
+                    raise ValueError("ids must be a knowledge-card ID array.")
+                filename, bundle = export_knowledge_bundle(
+                    self.config, [str(item) for item in ids]
+                )
+                self._send_download(
+                    bundle,
+                    content_type="application/zip",
+                    filename=filename,
+                )
             elif parsed.path.startswith("/api/knowledge/") and parsed.path.endswith("/qa/regenerate"):
                 knowledge_id = unquote(
                     parsed.path.removeprefix("/api/knowledge/").removesuffix("/qa/regenerate")
@@ -1420,6 +1474,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     reindex=reindex_requested,
                     overwrite=bool(body.get("overwrite")),
                     timeout=int(body.get("timeout") or 1800),
+                    knowledge_intent=str(body.get("knowledge_intent") or ""),
                 )
                 # Planning is intentionally isolated: do not refresh derived
                 # data or materialize Wiki views until final publication.

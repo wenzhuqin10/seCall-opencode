@@ -91,6 +91,7 @@ class OpenCodeClient:
         workdir: Path,
         model: Optional[str] = None,
         timeout: int = 1800,
+        developer_intent: str = "",
     ) -> str:
         args = [
             "run",
@@ -111,6 +112,13 @@ class OpenCodeClient:
             "依据附件中的中文规则分析 Session。只输出结构化 SessionKnowledge、"
             "最终 Issue Card 与 QA 标记块，不要修改任何文件。"
         )
+        if developer_intent.strip():
+            args.append(
+                "开发者本次希望沉淀的经验是：\n"
+                f"{developer_intent.strip()}\n\n"
+                "这只是知识组织与筛选的优先方向，不是会话证据、用户补充事实或确认结论。"
+                "正式输出只能使用会话证据或明确标记的用户补充。"
+            )
         raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
         return extract_generation_text(raw)
 
@@ -121,6 +129,7 @@ class OpenCodeClient:
         workdir: Path,
         model: Optional[str] = None,
         timeout: int = 900,
+        developer_intent: str = "",
     ) -> Dict[str, Any]:
         """Ask the model for candidates only; it must not generate a knowledge card."""
         args = [
@@ -130,6 +139,13 @@ class OpenCodeClient:
         if model:
             args.extend(["--model", model])
         args.append("阅读会话并只返回候选知识清单。不要写入任何文件，也不要生成正式知识卡片、QA 或 Wiki。")
+        if developer_intent.strip():
+            args.append(
+                "开发者本次希望沉淀的经验是：\n"
+                f"{developer_intent.strip()}\n\n"
+                "这只是候选知识的优先方向，不是会话证据、用户补充事实或确认结论。"
+                "请优先提出相关候选，同时仍可保留其他有明确工程价值的候选。"
+            )
         raw = self.runner.run(*args, cwd=workdir, timeout=timeout).stdout
         text = extract_marked_text(raw, "<!-- SECALL_PLANNING_START -->", "<!-- SECALL_PLANNING_END -->")
         try:

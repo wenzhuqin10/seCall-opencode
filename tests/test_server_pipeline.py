@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from secall_opencode.config import Config
-from secall_opencode.opencode_client import Runner
+from secall_opencode.knowledge_planning import read_plan
+from secall_opencode.opencode_client import OpenCodeClient, Runner
 from secall_opencode.server import run_session_pipeline
 
 
@@ -53,3 +54,43 @@ def test_pipeline_starts_isolated_planning_without_changing_formal_knowledge(
     assert result["wiki_plan_id"] == ""
     assert issue_path.read_text(encoding="utf-8").endswith("# 已有知识\n")
     assert qa_path.read_text(encoding="utf-8").count("qa-1") == 1
+
+
+def test_pipeline_persists_developer_intent_without_turning_it_into_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    session_id = "session-approved-intent"
+    session_dir = tmp_path / "raw" / ".sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / f"{session_id}.md").write_text(
+        "---\n"
+        f"session_id: {session_id}\n"
+        "project: demo\n"
+        "turns: 2\n"
+        "---\n"
+        "# Session\n\n用户：检查超时。\n",
+        encoding="utf-8",
+    )
+    captured: dict[str, str] = {}
+
+    def fake_analysis(self, *args, **kwargs):
+        captured["intent"] = kwargs["developer_intent"]
+        return {
+            "candidates": [{
+                "id": "candidate-1", "title": "超时定位", "type": "issue",
+                "value": "检查超时的定位路径", "evidence_event_ids": [],
+            }],
+        }
+
+    monkeypatch.setattr(OpenCodeClient, "run_planning_analysis", fake_analysis)
+    config = Config(vault=tmp_path)
+    intent = "重点沉淀超时定位路径与验证方法"
+
+    result = run_session_pipeline(config, session_id, knowledge_intent=intent)
+    plan = read_plan(config, result["planning_plan_id"])
+
+    assert captured["intent"] == intent
+    assert plan["developer_intent"] == intent
+    assert all(intent not in event["content"] for event in plan["events"])
+    assert not (tmp_path / "wiki" / "issues").exists()

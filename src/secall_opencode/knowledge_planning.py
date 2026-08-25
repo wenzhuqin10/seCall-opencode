@@ -13,7 +13,7 @@ from .knowledge import split_generated_output, store_knowledge
 from .knowledge_store import read_knowledge_document
 from .knowledge_store import atomic_write_text, parse_frontmatter
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
 
 def _now() -> str: return datetime.now(timezone.utc).isoformat()
@@ -35,6 +35,7 @@ def _migrate(plan: Mapping[str, Any]) -> Dict[str, Any]:
     value = dict(plan)
     if int(value.get("schema_version") or 1) >= PLAN_VERSION:
         return value
+    value.setdefault("developer_intent", "")
     selected = {str(item) for item in value.get("selected_candidate_ids") or []}
     candidates = []
     for source in value.get("candidates") or []:
@@ -95,7 +96,7 @@ def _source_relative_path(config: Config, source_path: Path | None) -> str:
         return ""
 
 
-def create_plan(config: Config, *, session_id: str, project: str, source_markdown: str, events: Sequence[Mapping[str, Any]], analysis: Mapping[str, Any] | None = None, source_path: Path | None = None) -> Dict[str, Any]:
+def create_plan(config: Config, *, session_id: str, project: str, source_markdown: str, events: Sequence[Mapping[str, Any]], analysis: Mapping[str, Any] | None = None, source_path: Path | None = None, developer_intent: str = "") -> Dict[str, Any]:
     analysis = analysis or {}
     allowed = {str(item.get("event_id")) for item in events if item.get("event_id")}
     raw_candidates = analysis.get("candidates") if isinstance(analysis.get("candidates"), list) else []
@@ -103,7 +104,7 @@ def create_plan(config: Config, *, session_id: str, project: str, source_markdow
     if not candidates and allowed:
         candidates = [_candidate({"title": "待确认的会话经验", "value": "会话包含可追溯事件，请确认是否需要沉淀。", "evidence_event_ids": list(allowed)[:3]}, session_id, allowed, 0)]
     now = _now()
-    return _write(config, {"schema_version": PLAN_VERSION, "plan_id": f"plan-{uuid.uuid4().hex[:12]}", "session_id": session_id, "project": project or "unknown", "source_path": _source_relative_path(config, source_path), "status": "candidate_selection", "created_at": now, "updated_at": now, "version": 0, "session_hash": _hash(source_markdown), "events": _events(events), "candidates": candidates, "selected_candidate_ids": [], "confirmation_order": [], "active_candidate_id": "", "messages": [{"id": "message-1", "role": "assistant", "at": now, "content": str(analysis.get("assistant_message") or "请选择需要逐项确认的知识主题。")}], "user_facts": [], "draft": {}, "index_status": "not_requested"})
+    return _write(config, {"schema_version": PLAN_VERSION, "plan_id": f"plan-{uuid.uuid4().hex[:12]}", "session_id": session_id, "project": project or "unknown", "source_path": _source_relative_path(config, source_path), "developer_intent": developer_intent.strip(), "status": "candidate_selection", "created_at": now, "updated_at": now, "version": 0, "session_hash": _hash(source_markdown), "events": _events(events), "candidates": candidates, "selected_candidate_ids": [], "confirmation_order": [], "active_candidate_id": "", "messages": [{"id": "message-1", "role": "assistant", "at": now, "content": str(analysis.get("assistant_message") or "请选择需要逐项确认的知识主题。")}], "user_facts": [], "draft": {}, "index_status": "not_requested"})
 
 
 def _find(plan: Mapping[str, Any], candidate_id: str) -> Dict[str, Any]:

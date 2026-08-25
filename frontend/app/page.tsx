@@ -161,7 +161,7 @@ type PlanningCandidate = {
   entry_revisions: PlanningEntryRevision[]; selected_entry_ids: string[]; skip_reason?: string;
 };
 type PlanningMessage = { id: string; role: "user" | "assistant"; at: string; content: string };
-type PlanningPlan = { plan_id: string; session_id: string; project: string; status: string; version: number; candidates: PlanningCandidate[]; selected_candidate_ids: string[]; confirmation_order: string[]; active_candidate_id?: string; messages: PlanningMessage[]; user_facts: Array<{ id: string; source: string; content: string }>; draft?: { qa_count?: number; wiki_change_count?: number }; index_status?: string; skip_reason?: string };
+type PlanningPlan = { plan_id: string; session_id: string; project: string; status: string; version: number; candidates: PlanningCandidate[]; selected_candidate_ids: string[]; confirmation_order: string[]; active_candidate_id?: string; messages: PlanningMessage[]; user_facts: Array<{ id: string; source: string; content: string }>; draft?: { qa_count?: number; wiki_change_count?: number }; index_status?: string; skip_reason?: string; developer_intent?: string };
 type PlanningCandidateResponse = { plan_id: string; status: string; active_candidate_id?: string; progress: { current: number; total: number }; candidate: PlanningCandidate; current_revision?: PlanningEntryRevision };
 type PlanningDraft = { plan: PlanningPlan; draft: { document: string; qa: Array<Record<string, unknown>>; wiki_preview: Array<{ id: string; title: string; category: string; action: string; reason: string; diff: string }> } };
 type Health = {
@@ -251,6 +251,26 @@ async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(String(error.message ?? `请求失败（${response.status}）`), response.status, error);
   }
   return payload.result as T;
+}
+
+function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function downloadFilename(disposition: string | null, fallback: string): string {
+  const encoded = disposition?.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (encoded) {
+    try { return decodeURIComponent(encoded); } catch { return fallback; }
+  }
+  const plain = disposition?.match(/filename="?([^";]+)"?/i)?.[1];
+  return plain || fallback;
 }
 
 function formatFileSize(bytes: number): string {
@@ -532,6 +552,7 @@ export default function Home() {
   const [pipelineResult, setPipelineResult] = useState<PipelineResult | null>(null);
   const [pipelineError, setPipelineError] = useState("");
   const [pipelineModel, setPipelineModel] = useState("");
+  const [pipelineKnowledgeIntent, setPipelineKnowledgeIntent] = useState("");
   const [pipelineOverwrite, setPipelineOverwrite] = useState(false);
   const [pipelineReindex, setPipelineReindex] = useState(true);
   const [planningPlan, setPlanningPlan] = useState<PlanningPlan | null>(null);
@@ -560,6 +581,8 @@ export default function Home() {
   const [sessionPreviewLoading, setSessionPreviewLoading] = useState(false);
   const [syncingSessions, setSyncingSessions] = useState(false);
   const [knowledgeItems, setKnowledgeItems] = useState<KnowledgeItem[]>([]);
+  const [knowledgeExportSelection, setKnowledgeExportSelection] = useState<string[]>([]);
+  const [knowledgeExporting, setKnowledgeExporting] = useState<"" | "selected" | "all">("");
   const [health, setHealth] = useState<Health | null>(null);
   const [apiConnected, setApiConnected] = useState(false);
   const [connectingService, setConnectingService] = useState(false);
@@ -668,6 +691,7 @@ export default function Home() {
     if (sessionResult.page !== sessionPage) setSessionPage(sessionResult.page);
     setQaItems(normalizedQa);
     setKnowledgeItems(knowledgeResult);
+    setKnowledgeExportSelection((current) => current.filter((id) => knowledgeResult.some((item) => item.id === id)));
     setWikiPages(wikiResult.pages);
     setWikiCounts(wikiResult.counts);
     setGraph(graphResult);
@@ -1204,6 +1228,48 @@ export default function Home() {
     }
   };
 
+  const downloadKnowledgeExport = async (ids: string[] | null, mode: "selected" | "all") => {
+    if (mode === "selected" && !ids?.length) {
+      notify("尚未选择知识卡片", "请先勾选至少一张正式知识卡片后再导出。");
+      return;
+    }
+    setKnowledgeExporting(mode);
+    try {
+      const single = ids?.length === 1;
+      const path = single
+        ? `/api/knowledge/${encodeURIComponent(ids[0])}/export`
+        : "/api/knowledge/export";
+      const response = await fetch(path, single ? undefined : {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: ids ?? [] }),
+      });
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        const detail = typeof payload?.error?.message === "string"
+          ? payload.error.message
+          : `导出失败（HTTP ${response.status}）`;
+        throw new Error(detail);
+      }
+      const filename = downloadFilename(
+        response.headers.get("Content-Disposition"),
+        single ? "knowledge-card.md" : "knowledge-center-markdown.zip",
+      );
+      downloadBlob(await response.blob(), filename);
+      notify("下载已开始", single ? "已导出该知识卡片的 Markdown 原文。" : `已打包 ${ids?.length || knowledgeItems.length} 张正式知识卡片。`);
+    } catch (error) {
+      notify("导出失败", error instanceof Error ? error.message : "请检查本地服务状态后重试。");
+    } finally {
+      setKnowledgeExporting("");
+    }
+  };
+
+  const toggleKnowledgeExportSelection = (id: string, selected: boolean) => {
+    setKnowledgeExportSelection((current) => selected
+      ? [...new Set([...current, id])]
+      : current.filter((value) => value !== id));
+  };
+
   const saveKnowledge = async () => {
     if (!knowledgeDetail) return;
     setSavingKnowledge(true);
@@ -1544,6 +1610,7 @@ export default function Home() {
           model: pipelineModel || undefined,
           reindex: pipelineReindex,
           overwrite: pipelineOverwrite,
+          knowledge_intent: pipelineKnowledgeIntent.trim() || undefined,
         }),
       });
       window.clearInterval(timer);
@@ -1990,6 +2057,7 @@ export default function Home() {
                 {planningPlan.status === "item_reviewing" && planningCandidate && <div className="planning-entry-review"><h3>{planningCandidate.candidate.title}</h3><p>{planningCandidate.current_revision?.assistant_message || "先让模型整理当前主题下可供选择的知识条目。"}</p>{!planningCandidate.current_revision && <button className="primary-button" disabled={planningBusy} onClick={() => void regeneratePlanningEntries()}>{planningBusy ? "正在整理…" : "生成可选知识条目"}</button>}{planningCandidate.current_revision?.entries.map((entry) => <label className="planning-entry" key={entry.id}><input type="checkbox" checked={planningEntrySelection.includes(entry.id)} onChange={(event) => setPlanningEntrySelection((current) => event.target.checked ? [...new Set([...current, entry.id])] : current.filter((id) => id !== entry.id))} /><div><strong>{entry.type}{entry.recommended && <span>模型建议</span>}</strong><p>{entry.content}</p><small>{entry.source} · {entry.confidence} · 证据 {entry.evidence_event_ids.join(", ") || "用户补充"}</small></div></label>)}{planningCandidate.current_revision && <><button className="text-button" onClick={() => setShowPlanningSupplement((value) => !value)}>这些都不合适 / 补充说明</button>{showPlanningSupplement && <div className="planning-compose"><textarea value={planningSupplement} onChange={(event) => setPlanningSupplement(event.target.value)} placeholder="说明哪些条目不准确、要保留哪些事实；补充会标记为 user_provided。" /><button className="secondary-button" disabled={planningBusy || !planningSupplement.trim()} onClick={() => void regeneratePlanningEntries()}>根据补充重新整理</button></div>}<div className="planning-actions"><button className="primary-button" disabled={planningBusy || !planningEntrySelection.length} onClick={() => void confirmPlanningCandidate()}>确认所选并进入下一项</button><button className="secondary-button" onClick={() => setShowPlanningSkip((value) => !value)}>跳过此主题</button></div>{showPlanningSkip && <div className="planning-compose"><textarea value={planningSkipReason} onChange={(event) => setPlanningSkipReason(event.target.value)} placeholder="请填写跳过此主题的原因。" /><button className="danger-button" disabled={planningBusy || !planningSkipReason.trim()} onClick={() => void skipPlanningCandidate()}>确认跳过</button></div>}</>}</div>}
               */}
               {planningPlan && <section className="planning-wizard-stage panel">
+                {planningPlan.developer_intent?.trim() && <div className="planning-intent"><strong>本次沉淀目标</strong><p>{planningPlan.developer_intent}</p><small>仅用于候选主题的优先方向，不是会话事实或证据。</small></div>}
                 <div className="panel-heading"><strong>逐项确认知识条目</strong><span>{planningPlan.status === "item_reviewing" && planningCandidate ? `主题 ${planningCandidate.progress.current}/${planningCandidate.progress.total}` : "确认前不会写入知识库"}</span></div>
                 {planningGenerating && <div className="planning-generation-status" role="status" aria-live="polite">
                   <div><span className="spin-mark">↻</span><p><strong>正在生成统一知识草稿</strong><small>{planningGenerationElapsed < 3 ? "正在确认沉淀范围" : planningGenerationElapsed < 90 ? "模型正在组织知识卡片、QA 与 Wiki 预览" : "模型仍在处理较长会话，请保持页面开启"}</small></p><time>已用时 {planningGenerationElapsed.toFixed(1)} 秒</time></div>
@@ -2062,6 +2130,8 @@ export default function Home() {
               <div className="subpage-heading">
                  <div><p className="eyebrow">KNOWLEDGE CENTER / CARDS</p><h1>{showTrash ? "知识回收站" : "知识卡片"}</h1><p>{showTrash ? "恢复误删的知识卡片及其关联 QA。" : "正式、可编辑的工程事实来源。Wiki 与 QA 均由此派生。"}</p></div>
                 <div className="heading-actions">
+                  {!showTrash && <button className="secondary-button" disabled={!knowledgeExportSelection.length || Boolean(knowledgeExporting)} onClick={() => void downloadKnowledgeExport(knowledgeExportSelection, "selected")}>{knowledgeExporting === "selected" ? `正在打包 ${knowledgeExportSelection.length} 张…` : `导出所选 Markdown${knowledgeExportSelection.length ? ` (${knowledgeExportSelection.length})` : ""}`}</button>}
+                  {!showTrash && <button className="secondary-button" disabled={!knowledgeItems.length || Boolean(knowledgeExporting)} onClick={() => void downloadKnowledgeExport([], "all")}>{knowledgeExporting === "all" ? `正在打包 ${knowledgeItems.length} 张…` : "导出全部 Markdown"}</button>}
                   {showTrash ? <button className="secondary-button" onClick={() => setShowTrash(false)}>← 返回知识库</button> : <button className="secondary-button" onClick={() => void loadTrash()}>♲ 回收站</button>}
                   {!showTrash && <button className="secondary-button" onClick={() => void syncKnowledgeDerivatives()}>⟳ 同步派生数据</button>}
                   {!showTrash && <button className="secondary-button" onClick={() => void refreshIndex()}>↻ 刷新索引</button>}
@@ -2082,7 +2152,7 @@ export default function Home() {
                   const score = ({ high: 96, medium: 82, low: 58 } as Record<string, number>)[item.confidence] ?? 75;
                   return (
                   <article className="knowledge-card" key={item.id} tabIndex={0} onClick={() => void openKnowledge(item.id)} onKeyDown={(event) => { if (event.key === "Enter") void openKnowledge(item.id); }}>
-                    <div className="knowledge-top"><span>◇</span><em>{item.project}</em><button aria-label={`查看 ${item.title}`}>查看</button></div><h3>{item.title}</h3><p>{item.summary || "该知识卡片已写入本地 Vault。"}</p>
+                    <div className="knowledge-top"><input className="knowledge-select" type="checkbox" aria-label={`选择 ${item.title}`} checked={knowledgeExportSelection.includes(item.id)} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} onChange={(event) => toggleKnowledgeExportSelection(item.id, event.target.checked)} /><span>◇</span><em>{item.project}</em><button aria-label={`查看 ${item.title}`}>查看</button></div><h3>{item.title}</h3><p>{item.summary || "该知识卡片已写入本地 Vault。"}</p>
                     <div className="knowledge-meta"><span><i style={{ width: `${score}%` }} /></span><b>{score}% 置信度</b><small>{item.source_session}</small></div>
                   </article>
                   );
@@ -2359,6 +2429,10 @@ export default function Home() {
               {!approvedSessions.length && <small className="form-help">请先关闭窗口，在“研发会话”页面完成预审核。</small>}
             </label>
             <div className="form-grid"><label>生成模型<select value={pipelineModel} onChange={(event) => setPipelineModel(event.target.value)}><option value="">OpenCode 默认模型</option>{health?.models?.map((model) => <option value={model} key={model}>{model}</option>)}</select></label><label>知识语言<select><option>简体中文</option><option>English</option></select></label></div>
+            <label className="pipeline-intent-input">本次希望沉淀的经验（可选）
+              <textarea value={pipelineKnowledgeIntent} maxLength={1200} onChange={(event) => setPipelineKnowledgeIntent(event.target.value)} placeholder="例如：重点沉淀 HARQ 超时的定位路径与回归验证方法" />
+              <small>此目标只会引导模型优先发现相关候选主题，不会作为会话事实、证据或确认结论。</small>
+            </label>
             <div className="switch-row"><div><strong>重新生成并覆盖知识</strong><small>关闭时会安全复用现有 Issue Card，避免重复 QA</small></div><input type="checkbox" checked={pipelineOverwrite} onChange={(event) => setPipelineOverwrite(event.target.checked)} aria-label="重新生成并覆盖知识" /></div>
             <div className="switch-row"><div><strong>完成后重建索引</strong><small>让新知识立即可被搜索与 MCP 调用</small></div><input type="checkbox" checked={pipelineReindex} onChange={(event) => setPipelineReindex(event.target.checked)} aria-label="完成后重建索引" /></div>
             <div className="modal-actions"><button onClick={() => setModal(false)}>取消</button><button className="primary-button" onClick={startPipeline}>启动流水线 <span>→</span></button></div>
@@ -2511,6 +2585,7 @@ export default function Home() {
             <footer>
               <button className="danger-button" onClick={() => void deleteKnowledge()}>删除</button>
               <span />
+              {!editingKnowledge && <button onClick={() => void downloadKnowledgeExport([knowledgeDetail.id], "selected")} disabled={Boolean(knowledgeExporting)}>下载 Markdown</button>}
               {!editingKnowledge && <button onClick={() => void regenerateKnowledgeQa()} disabled={!apiConnected}>重新生成 QA</button>}
               {!editingKnowledge && <button onClick={() => {
                 const source = [...sessionItems, ...hiddenSessionItems].find((item) => item.id === knowledgeDetail.source_session);
